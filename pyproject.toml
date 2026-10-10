@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arena-api"
+version = "0.2.0"
+description = "Typed sync/async client for Gradio and current Next.js Arena streaming frontends"
+requires-python = ">=3.10"
+dependencies = ["curl_cffi>=0.7.4"]
+
+[tool.setuptools.packages.find]
+include = ["arena_api*"]

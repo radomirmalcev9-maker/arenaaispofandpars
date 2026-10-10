@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: arena-api
+Version: 0.1.0
+Summary: Unofficial cookie-authenticated client for Gradio-based Arena frontends
+Requires-Python: >=3.10
+Requires-Dist: curl_cffi>=0.7.4
