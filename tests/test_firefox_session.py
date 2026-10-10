@@ -1,0 +1,531 @@
+from __future__ import annotations
+
+import io
+import os
+import sqlite3
+import time
+import types
+from pathlib import Path
+
+import pytest
+
+from arena_api.auth.firefox_session import (
+    DEFAULT_COOKIE_DOMAINS,
+    FirefoxSessionError,
+    FirefoxSessionManager,
+    cookies_from_rookiepy,
+    read_firefox_cookies,
+)
+
+FUTURE = int(time.time()) + 86_400
+PAST = int(time.time()) - 86_400
+
+
+def write_cookie_database(profile: Path, rows: list[tuple]) -> Path:
+    database = profile / "cookies.sqlite"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE moz_cookies (
+            id INTEGER PRIMARY KEY,
+            originAttributes TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL,
+            value TEXT NOT NULL,
+            host TEXT NOT NULL,
+            path TEXT NOT NULL DEFAULT '/',
+            expiry INTEGER NOT NULL,
+            lastAccessed INTEGER NOT NULL,
+            creationTime INTEGER NOT NULL,
+            isSecure INTEGER NOT NULL,
+            isHttpOnly INTEGER NOT NULL,
+            inBrowserElement INTEGER NOT NULL DEFAULT 0,
+            sameSite INTEGER NOT NULL DEFAULT 0,
+            rawSameSite INTEGER NOT NULL DEFAULT 0,
+            schemeMap INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    connection.executemany(
+        "INSERT INTO moz_cookies"
+        " (name, value, host, path, expiry, lastAccessed, creationTime,"
+        " isSecure, isHttpOnly)"
+        " VALUES (?, ?, ?, '/', ?, 0, 0, ?, ?)",
+        rows,
+    )
+    connection.commit()
+    connection.close()
+    return database
+
+
+def make_profile_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Create two profile directories: one default-release, one default."""
+    release = tmp_path / "abcd1234.default-release"
+    plain = tmp_path / "wxyz9876.default"
+    release.mkdir()
+    plain.mkdir()
+    return tmp_path, release, plain
+
+
+def use_rookiepy(manager: FirefoxSessionManager, firefox) -> None:
+    """Point the manager at a stand-in rookiepy module (instance-local stub)."""
+    module = types.SimpleNamespace(firefox=firefox)
+    manager._rookiepy_module = lambda: module
+
+
+def test_default_domains() -> None:
+    manager = FirefoxSessionManager(interactive=False)
+    assert DEFAULT_COOKIE_DOMAINS == ("arena.ai", "lmarena.ai")
+    assert manager.domains == DEFAULT_COOKIE_DOMAINS
+
+
+def test_domain_normalization() -> None:
+    manager = FirefoxSessionManager(
+        domains=[".Arena.ai", "arena.ai", "", "lmarena.ai"], interactive=False
+    )
+    assert manager.domains == ("arena.ai", "lmarena.ai")
+    with pytest.raises(ValueError):
+        FirefoxSessionManager(domains=["", "."], interactive=False)
+    with pytest.raises(ValueError):
+        manager.load_cookies(domains=[])
+
+
+def test_sqlite_fallback_reads_only_requested_domains(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    write_cookie_database(
+        release,
+        [
+            ("session", "s3cret", "arena.ai", FUTURE, 0, 1),
+            ("cf_clearance", "cf-value", ".arena.ai", FUTURE, 1, 1),
+            ("stale", "expired", ".arena.ai", PAST, 0, 0),
+            ("sub_cookie", "v", "chat.arena.ai", FUTURE, 0, 0),
+            ("session_cookie", "v", "arena.ai", 0, 0, 0),
+            ("unrelated", "v", "notarena.ai", FUTURE, 0, 0),
+            ("lookalike", "v", "arena.ai.evil.example", FUTURE, 0, 0),
+            ("dash", "v", "evil-arena.ai", FUTURE, 0, 0),
+            ("other_site", "v", "lmarena.ai", FUTURE, 0, 0),
+        ],
+    )
+    manager = FirefoxSessionManager(
+        profiles_root=root, interactive=False, max_cookie_attempts=1
+    )
+    manager._rookiepy_module = lambda: None
+    assert manager.load_cookies(domains=["arena.ai"]) == {
+        "session": "s3cret",
+        "cf_clearance": "cf-value",
+        "sub_cookie": "v",
+        "session_cookie": "v",
+    }
+
+
+def test_sqlite_snapshot_tolerates_wal_sidecars(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    database = write_cookie_database(
+        release, [("session", "with-wal", "arena.ai", FUTURE, 0, 1)]
+    )
+    # A running Firefox keeps a WAL; the snapshot copy must include it.
+    (release / "cookies.sqlite-wal").write_bytes(b"")
+    (release / "cookies.sqlite-shm").write_bytes(b"")
+    assert read_firefox_cookies(database, ["arena.ai"]) == {"session": "with-wal"}
+
+
+def test_earlier_domain_wins_on_name_collision(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    write_cookie_database(
+        release,
+        [
+            ("session", "arena-value", "arena.ai", FUTURE, 0, 1),
+            ("session", "lm-value", "lmarena.ai", FUTURE, 0, 1),
+        ],
+    )
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    manager._rookiepy_module = lambda: None
+    assert manager.load_cookies() == {"session": "arena-value"}
+
+
+def test_rookiepy_records_are_preferred(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    write_cookie_database(release, [("session", "sqlite", "arena.ai", FUTURE, 0, 1)])
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    use_rookiepy(
+        manager,
+        lambda domains: [
+            {
+                "domain": ".arena.ai",
+                "path": "/",
+                "secure": True,
+                "expires": FUTURE,
+                "name": "session",
+                "value": "via-rookiepy",
+                "http_only": True,
+            }
+        ]
+        if domains == ["arena.ai"]
+        else [],
+    )
+    assert manager.load_cookies(domains=["arena.ai"]) == {"session": "via-rookiepy"}
+
+
+def test_rookiepy_lock_falls_back_to_sqlite(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    write_cookie_database(
+        release, [("session", "unlocked", "arena.ai", FUTURE, 0, 1)]
+    )
+    manager = FirefoxSessionManager(
+        profiles_root=root,
+        interactive=False,
+        max_cookie_attempts=2,
+        lock_retry_delay=0,
+    )
+
+    def locked(domains):
+        raise RuntimeError("database is locked")
+
+    use_rookiepy(manager, locked)
+    assert manager.load_cookies(domains=["arena.ai"]) == {"session": "unlocked"}
+
+
+def test_rookiepy_lock_retries_then_succeeds() -> None:
+    manager = FirefoxSessionManager(
+        interactive=False, max_cookie_attempts=2, lock_retry_delay=0
+    )
+    calls = {"count": 0}
+
+    def flaky(domains):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("database is locked")
+        return [
+            {
+                "domain": "arena.ai",
+                "path": "/",
+                "secure": False,
+                "expires": FUTURE,
+                "name": "session",
+                "value": "second-try",
+                "http_only": False,
+            }
+        ]
+
+    use_rookiepy(manager, flaky)
+    assert manager.load_cookies(domains=["arena.ai"]) == {"session": "second-try"}
+    assert calls["count"] == 2
+
+
+def test_rookiepy_failure_falls_back_to_sqlite(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    write_cookie_database(
+        release, [("session", "fallback", "arena.ai", FUTURE, 0, 1)]
+    )
+    manager = FirefoxSessionManager(
+        profiles_root=root, interactive=False, max_cookie_attempts=1
+    )
+
+    def broken(domains):
+        raise RuntimeError("Can't find cookies file")
+
+    use_rookiepy(manager, broken)
+    assert manager.load_cookies(domains=["arena.ai"]) == {"session": "fallback"}
+
+
+def test_missing_profile_and_database_raise(tmp_path) -> None:
+    empty_root = tmp_path / "empty"
+    empty_root.mkdir()
+    with pytest.raises(FirefoxSessionError, match="profiles directory not found"):
+        FirefoxSessionManager(
+            profiles_root=tmp_path / "missing", interactive=False
+        ).load_cookies()
+    manager = FirefoxSessionManager(
+        profiles_root=empty_root, interactive=False, max_cookie_attempts=1
+    )
+    manager._rookiepy_module = lambda: None
+    with pytest.raises(FirefoxSessionError, match="No Firefox profile found"):
+        manager.load_cookies()
+
+    root, release, _ = make_profile_tree(tmp_path)
+    with pytest.raises(FirefoxSessionError, match="cookie database not found"):
+        FirefoxSessionManager(
+            profiles_root=root, profile_name="abcd1234.default-release"
+        ).cookie_database_path()  # no cookies.sqlite written for this profile
+
+
+def test_profile_discovery_prefers_install_section(tmp_path) -> None:
+    root, release, plain = make_profile_tree(tmp_path)
+    (root / "profiles.ini").write_text(
+        "[Install308B0890AAB1A44]\n"
+        "Default=wxyz9876.default\n"
+        "Locked=1\n\n"
+        "[Profile1]\n"
+        "Name=default\n"
+        "IsRelative=1\n"
+        "Path=abcd1234.default-release\n"
+        "Default=1\n",
+        encoding="utf-8",
+    )
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    assert manager.profile_path() == plain
+
+
+def test_profile_discovery_uses_flagged_default_without_install_section(
+    tmp_path,
+) -> None:
+    root, release, plain = make_profile_tree(tmp_path)
+    (root / "profiles.ini").write_text(
+        "[Profile0]\n"
+        "Name=default-release\n"
+        "IsRelative=1\n"
+        "Path=abcd1234.default-release\n"
+        "Default=1\n",
+        encoding="utf-8",
+    )
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    assert manager.profile_path() == release
+
+
+def test_profile_discovery_prefers_default_release_hint(tmp_path) -> None:
+    root, release, plain = make_profile_tree(tmp_path)
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    assert manager.profile_path() == release
+
+
+def test_profile_discovery_falls_back_to_newest_database(tmp_path) -> None:
+    root = tmp_path
+    old = root / "aaaa.custom-profile"
+    new = root / "bbbb.another-profile"
+    old.mkdir()
+    new.mkdir()
+    write_cookie_database(old, [("a", "1", "arena.ai", FUTURE, 0, 0)])
+    write_cookie_database(new, [("b", "2", "arena.ai", FUTURE, 0, 0)])
+    stamp = time.time() + 100
+    os.utime(new / "cookies.sqlite", (stamp, stamp))
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    assert manager.profile_path() == new
+
+
+def test_profile_name_override(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    manager = FirefoxSessionManager(
+        profiles_root=root, profile_name="abcd1234.default-release", interactive=False
+    )
+    assert manager.profile_path() == release
+    with pytest.raises(FirefoxSessionError, match="profile not found"):
+        FirefoxSessionManager(
+            profiles_root=root, profile_name="missing.profile"
+        ).profile_path()
+
+
+def test_cookie_database_override(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    database = write_cookie_database(
+        release, [("session", "direct", "arena.ai", FUTURE, 0, 1)]
+    )
+    manager = FirefoxSessionManager(
+        cookie_database=database, interactive=False, max_cookie_attempts=1
+    )
+    manager._rookiepy_module = lambda: None
+    assert manager.load_cookies(domains=["arena.ai"]) == {"session": "direct"}
+    with pytest.raises(FirefoxSessionError, match="cookie database not found"):
+        FirefoxSessionManager(
+            cookie_database=tmp_path / "elsewhere.sqlite"
+        ).cookie_database_path()
+
+
+def test_user_agent_reads_version_from_profile(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    (release / "compatibility.ini").write_text(
+        "[Compatibility]\nLastVersion=141.0/20250825133129\n", encoding="utf-8"
+    )
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    agent = manager.user_agent()
+    assert "Firefox/141.0" in agent
+    assert "rv:109.0" in agent  # Firefox freezes the Gecko trail version.
+    assert agent.startswith("Mozilla/5.0 (")
+
+    override = FirefoxSessionManager(
+        profiles_root=root, firefox_version="137.0.1", interactive=False
+    )
+    assert "Firefox/137.0.1" in override.user_agent()
+
+
+def test_firefox_headers_fetch_and_navigation_shapes(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    (release / "compatibility.ini").write_text(
+        "[Compatibility]\nLastVersion=141.0/20250825133129\n", encoding="utf-8"
+    )
+    manager = FirefoxSessionManager(
+        profiles_root=root, language="ru-RU", interactive=False
+    )
+    headers = manager.firefox_headers()
+    assert headers["User-Agent"].endswith("Firefox/141.0")
+    assert headers["Accept-Language"] == "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3"
+    assert headers["Sec-GPC"] == "1"
+    assert headers["Sec-Fetch-Dest"] == "empty"
+    assert headers["Sec-Fetch-Mode"] == "cors"
+    assert headers["Sec-Fetch-Site"] == "same-origin"
+    assert "Accept-Encoding" not in headers  # negotiated by the HTTP backend
+    assert "Sec-Fetch-User" not in headers
+
+    navigation = manager.firefox_headers(navigation=True)
+    assert navigation["Sec-Fetch-Dest"] == "document"
+    assert navigation["Sec-Fetch-Mode"] == "navigate"
+    assert navigation["Sec-Fetch-Site"] == "none"
+    assert navigation["Sec-Fetch-User"] == "?1"
+    assert navigation["Upgrade-Insecure-Requests"] == "1"
+    assert navigation["Accept"].startswith("text/html")
+
+
+def test_accept_language_from_prefs_js(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    (release / "prefs.js").write_text(
+        'user_pref("intl.accept_languages", "de, en-US, en");\n', encoding="utf-8"
+    )
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    assert manager.accept_language() == "de, en-US, en"
+
+
+def test_to_curl_cffi_groups_by_domain(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    write_cookie_database(
+        release,
+        [
+            ("session", "arena-value", "arena.ai", FUTURE, 0, 1),
+            ("other", "lm-value", "lmarena.ai", FUTURE, 0, 0),
+        ],
+    )
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    manager._rookiepy_module = lambda: None
+    grouped = manager.to_curl_cffi()
+    assert grouped == {
+        "arena.ai": {"session": "arena-value"},
+        "lmarena.ai": {"other": "lm-value"},
+    }
+
+
+def test_refresh_session_prints_guidance_and_reloads(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    write_cookie_database(
+        release, [("session", "fresh-value", "arena.ai", FUTURE, 0, 1)]
+    )
+    output = io.StringIO()
+    prompts: list[str] = []
+    manager = FirefoxSessionManager(
+        profiles_root=root,
+        interactive=True,
+        prompt=prompts.append,
+        output=output,
+        max_cookie_attempts=1,
+    )
+    manager._rookiepy_module = lambda: None
+    cookies = manager.refresh_session(RuntimeError("HTTP 403"))
+    assert cookies == {"session": "fresh-value"}
+    assert prompts == [""]  # waited for Enter
+    text = output.getvalue()
+    assert "Сессия устарела. Откройте arena.ai в Firefox" in text
+    assert "нажмите Enter" in text
+    assert "HTTP 403" in text
+
+
+def test_refresh_session_noninteractive_does_not_prompt(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    write_cookie_database(
+        release, [("session", "value", "arena.ai", FUTURE, 0, 1)]
+    )
+    output = io.StringIO()
+
+    def fail(_: str) -> str:
+        raise AssertionError("prompt must not be called")
+
+    manager = FirefoxSessionManager(
+        profiles_root=root,
+        interactive=False,
+        prompt=fail,
+        output=output,
+        max_cookie_attempts=1,
+    )
+    manager._rookiepy_module = lambda: None
+    assert manager.refresh_session() == {"session": "value"}
+
+
+def test_refresh_session_returns_none_without_cookies(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    write_cookie_database(
+        release, [("session", "gone", "other.example", FUTURE, 0, 0)]
+    )
+    output = io.StringIO()
+    manager = FirefoxSessionManager(
+        profiles_root=root,
+        interactive=False,
+        output=output,
+        max_cookie_attempts=1,
+    )
+    manager._rookiepy_module = lambda: None
+    assert manager.refresh_session() is None
+    assert "нет cookie" in output.getvalue()
+
+
+def test_refresh_session_survives_keyboard_interrupt(tmp_path) -> None:
+    manager = FirefoxSessionManager(interactive=False)
+
+    def interrupted(_: str) -> str:
+        raise KeyboardInterrupt
+
+    manager.interactive = True
+    manager._prompt = interrupted
+    assert manager.refresh_session() is None
+
+
+def test_cookies_from_rookiepy_filters_bad_and_expired_records() -> None:
+    records = [
+        {
+            "domain": "arena.ai",
+            "path": "/",
+            "secure": False,
+            "expires": FUTURE,
+            "name": "good",
+            "value": "1",
+            "http_only": False,
+        },
+        {"name": "no-value", "value": None, "expires": None},
+        {"name": "", "value": "x", "expires": None},
+        "not-a-mapping",
+        {
+            "domain": "arena.ai",
+            "path": "/",
+            "secure": False,
+            "expires": PAST,
+            "name": "expired",
+            "value": "2",
+            "http_only": False,
+        },
+        {
+            "domain": "arena.ai",
+            "path": "/",
+            "secure": False,
+            "expires": None,
+            "name": "session-cookie",
+            "value": "3",
+            "http_only": False,
+        },
+        {
+            "domain": "arena.ai",
+            "path": "/",
+            "secure": False,
+            "expires": "not-a-number",
+            "name": "weird-expiry",
+            "value": "4",
+            "http_only": False,
+        },
+    ]
+    assert cookies_from_rookiepy(records) == {
+        "good": "1",
+        "session-cookie": "3",
+        "weird-expiry": "4",
+    }
+    assert cookies_from_rookiepy(None) == {}
+    assert cookies_from_rookiepy("nope") == {}
+
+
+def test_manager_validates_constructor_arguments() -> None:
+    with pytest.raises(ValueError):
+        FirefoxSessionManager(max_cookie_attempts=0)
+    with pytest.raises(ValueError):
+        FirefoxSessionManager(lock_retry_delay=-1)

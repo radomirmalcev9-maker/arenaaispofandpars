@@ -9,10 +9,17 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, TypeAlias
+from urllib.parse import urlparse
 
 import httpx
 
+from .auth.firefox_session import (
+    FirefoxSessionError,
+    FirefoxSessionManager,
+    SessionManager,
+)
 from .constants import (
     CONFIG_PATH,
     DEFAULT_BASE_URL,
@@ -21,7 +28,12 @@ from .constants import (
     QUEUE_DATA_PATH,
     QUEUE_JOIN_PATH,
 )
-from .exceptions import ModelUnavailableError, ProtocolError, QueueTimeoutError
+from .exceptions import (
+    AuthenticationError,
+    ModelUnavailableError,
+    ProtocolError,
+    QueueTimeoutError,
+)
 from .models import (
     BattleResponse,
     BattleStreamChunk,
@@ -43,6 +55,67 @@ ChatPayloadFactory = Callable[
 BattlePayloadFactory = Callable[
     [str, str | None, str | None, GenerationConfig], Sequence[Any]
 ]
+SessionSource: TypeAlias = "str | SessionManager | None"
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedSessionSource:
+    """Materialized session source: cookies, headers, and a refresh hook."""
+
+    manager: SessionManager
+    cookies: dict[str, str]
+    headers: dict[str, str]
+
+
+def _base_host(base_url: str) -> str | None:
+    return urlparse(base_url).hostname
+
+
+def _resolve_session_source(
+    session_source: SessionSource, base_url: str
+) -> _ResolvedSessionSource | None:
+    """Turn ``session_source`` into cookies, headers, and a refresh hook.
+
+    ``"firefox"`` builds a :class:`FirefoxSessionManager` for the base URL's
+    host; an object implementing :class:`~arena_api.auth.SessionManager` (any
+    ``FirefoxSessionManager`` instance) is used as-is, which keeps tests and
+    custom backends injectable.
+    """
+    if session_source is None:
+        return None
+    if isinstance(session_source, str):
+        if session_source.strip().casefold() != "firefox":
+            raise ValueError(
+                f"Unsupported session_source {session_source!r}; "
+                "only 'firefox' is currently available."
+            )
+        host = _base_host(base_url)
+        manager: SessionManager = FirefoxSessionManager(
+            domains=(host,) if host else None
+        )
+    elif isinstance(session_source, SessionManager):
+        manager = session_source
+    else:
+        raise TypeError(
+            "session_source must be 'firefox', a SessionManager instance, or None."
+        )
+    site = _base_host(base_url) or "arena.ai"
+    try:
+        cookies = manager.load_cookies()
+    except FirefoxSessionError as exc:
+        raise AuthenticationError(
+            f"Could not read the Firefox session: {exc}"
+        ) from exc
+    if not cookies:
+        raise AuthenticationError(
+            f"No cookies for {site} were found in the local Firefox profile. "
+            f"Open https://{site} in Firefox, sign in, and start the client again."
+        )
+    return _ResolvedSessionSource(
+        manager=manager,
+        cookies=cookies,
+        headers=manager.firefox_headers(),
+    )
 
 
 _BATTLE_MARKERS = ("battle", "side_by_side", "side-by-side")
@@ -414,8 +487,13 @@ class ArenaClient(_ArenaClientMixin):
 
     Cookies are optional for publicly accessible routes. For an authenticated
     session, supply your own cookie mapping, Cookie header, or cookies.json
-    export. The client will surface browser challenges instead of bypassing
-    them.
+    export — or pass ``session_source="firefox"`` to reuse the signed-in
+    session of the local Firefox profile (see
+    :class:`arena_api.auth.FirefoxSessionManager`). When the session goes
+    stale, the client prints guidance, waits for you to re-verify in Firefox,
+    re-reads the profile, and retries the request transparently (up to
+    ``max_auth_refreshes`` times). Browser challenges are never solved or
+    bypassed here.
     """
 
     def __init__(
@@ -423,6 +501,7 @@ class ArenaClient(_ArenaClientMixin):
         *,
         base_url: str = DEFAULT_BASE_URL,
         cookies: CookieInput = None,
+        session_source: SessionSource = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
@@ -432,15 +511,30 @@ class ArenaClient(_ArenaClientMixin):
         chat_payload_factory: ChatPayloadFactory | None = None,
         battle_payload_factory: BattlePayloadFactory | None = None,
         http_transport: httpx.BaseTransport | None = None,
+        max_auth_refreshes: int = 2,
     ) -> None:
+        session = _resolve_session_source(session_source, base_url)
+        merged_headers: dict[str, str] = {}
+        if session is not None:
+            merged_headers.update(session.headers)
+        if headers:
+            merged_headers.update(headers)
         self.transport = ArenaTransport(
             base_url,
             cookies=cookies,
-            headers=headers,
+            session_cookies=session.cookies if session is not None else None,
+            headers=merged_headers or None,
             timeout=timeout,
             http2=http2,
             verify=verify,
             http_transport=http_transport,
+            session_refresher=(
+                session.manager.refresh_session if session is not None else None
+            ),
+            max_auth_refreshes=max_auth_refreshes,
+        )
+        self.session_manager: SessionManager | None = (
+            session.manager if session is not None else None
         )
         self.chat_fn_index = chat_fn_index
         self.battle_fn_index = battle_fn_index
@@ -637,13 +731,19 @@ class ArenaClient(_ArenaClientMixin):
 
 
 class AsyncArenaClient(_ArenaClientMixin):
-    """Async client with parity to :class:`ArenaClient`."""
+    """Async client with parity to :class:`ArenaClient`.
+
+    Supports the same ``session_source="firefox"`` option. The interactive
+    refresh (console message + waiting for Enter) runs in a worker thread so
+    the event loop keeps serving other tasks while you re-verify in Firefox.
+    """
 
     def __init__(
         self,
         *,
         base_url: str = DEFAULT_BASE_URL,
         cookies: CookieInput = None,
+        session_source: SessionSource = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
@@ -653,15 +753,30 @@ class AsyncArenaClient(_ArenaClientMixin):
         chat_payload_factory: ChatPayloadFactory | None = None,
         battle_payload_factory: BattlePayloadFactory | None = None,
         http_transport: httpx.AsyncBaseTransport | None = None,
+        max_auth_refreshes: int = 2,
     ) -> None:
+        session = _resolve_session_source(session_source, base_url)
+        merged_headers: dict[str, str] = {}
+        if session is not None:
+            merged_headers.update(session.headers)
+        if headers:
+            merged_headers.update(headers)
         self.transport = AsyncArenaTransport(
             base_url,
             cookies=cookies,
-            headers=headers,
+            session_cookies=session.cookies if session is not None else None,
+            headers=merged_headers or None,
             timeout=timeout,
             http2=http2,
             verify=verify,
             http_transport=http_transport,
+            session_refresher=(
+                session.manager.refresh_session if session is not None else None
+            ),
+            max_auth_refreshes=max_auth_refreshes,
+        )
+        self.session_manager: SessionManager | None = (
+            session.manager if session is not None else None
         )
         self.chat_fn_index = chat_fn_index
         self.battle_fn_index = battle_fn_index

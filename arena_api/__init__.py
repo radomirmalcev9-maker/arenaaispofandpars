@@ -1,9 +1,12 @@
 """Unofficial, cookie-authenticated sync/async clients for Arena frontends.
 
-This package uses caller-provided credentials and does not bypass browser
-verification challenges. See the project README for protocol caveats.
+This package uses caller-provided credentials — or, opt-in via
+``session_source="firefox"``, the signed-in session of your local Firefox
+profile — and does not bypass browser verification challenges. See the
+project README for protocol caveats.
 """
 
+from .auth import FirefoxSessionError, FirefoxSessionManager, SessionManager
 from .client import ArenaClient, AsyncArenaClient
 from .direct import (
     AsyncDirectArenaClient,
@@ -60,6 +63,8 @@ __all__ = [
     "Client",
     "DirectArenaClient",
     "DirectChatSession",
+    "FirefoxSessionError",
+    "FirefoxSessionManager",
     "GenerationConfig",
     "Message",
     "ModelInfo",
@@ -69,6 +74,7 @@ __all__ = [
     "QueueTimeoutError",
     "RateLimitError",
     "SSEParser",
+    "SessionManager",
     "StreamChunk",
     "normalize_cookies",
     "parse_cookie_header",
