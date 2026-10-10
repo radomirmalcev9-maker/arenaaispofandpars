@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 class ArenaError(Exception):
-    """Base exception for this package."""
+    """Base exception for client, transport, and protocol failures."""
 
 
 class AuthenticationError(ArenaError):
@@ -12,26 +12,29 @@ class AuthenticationError(ArenaError):
 
 
 class ChallengeRequiredError(AuthenticationError):
-    """The server returned an interactive browser challenge.
+    """The service returned a browser verification or anti-bot challenge.
 
-    This package intentionally does not attempt to solve CAPTCHAs or browser
-    challenges.  Refresh the session in a normal browser and supply its
-    exported cookies instead.
+    The client intentionally does not solve, automate, or bypass challenges.
+    Refresh or verify the session in a normal browser, then provide the
+    resulting credentials through the documented client inputs.
     """
 
 
 class QueueTimeoutError(ArenaError):
-    """The Gradio queue did not produce a terminal event in time."""
+    """The queue or stream did not complete before its configured timeout."""
 
 
 class ModelUnavailableError(ArenaError):
-    """The requested model or UI endpoint is not currently available."""
+    """A model, callback, or model-list endpoint is not currently available."""
 
 
 class RateLimitError(ArenaError):
-    """Arena rejected the request because of a rate limit."""
+    """The service rejected a request because of a rate limit."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class ProtocolError(ArenaError):
-    """A server response did not conform to the expected Gradio protocol."""
-
+    """A response did not match the expected Arena/Gradio protocol."""

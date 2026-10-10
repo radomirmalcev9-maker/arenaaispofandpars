@@ -1,42 +1,65 @@
-"""Client for Arena's current Next.js Direct Chat data-stream protocol.
+"""Client for the Arena Next.js Direct Chat streaming frontend.
 
-The browser page supplies a short-lived verification assertion for each
-generation.  This module accepts that assertion from the caller, but never
-attempts to create, replay, or solve one.
+These routes are undocumented and can change at any time. This adapter accepts
+only verification assertions explicitly supplied by the caller; it does not
+mint, replay, solve, or bypass browser verification tokens or anti-bot checks.
 """
 
 from __future__ import annotations
 
-import asyncio
+import codecs
+import html
 import json
 import re
 import secrets
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from html.parser import HTMLParser
 from typing import Any
 
-from .constants import DEFAULT_BASE_URL, DEFAULT_QUEUE_TIMEOUT
-from .exceptions import ArenaError, ModelUnavailableError, ProtocolError, QueueTimeoutError
-from .models import GenerationConfig, Message, ModelInfo, StreamChunk
-from .transport import ArenaTransport, AsyncArenaTransport, _raise_for_status
+import httpx
 
-DIRECT_PAGE_PATH = "/text/direct?model_a=max"
-DIRECT_STREAM_PATH = "/nextjs-api/stream/create-evaluation"
+from .constants import (
+    DEFAULT_BASE_URL,
+    DEFAULT_QUEUE_TIMEOUT,
+    DEFAULT_TIMEOUT,
+    DIRECT_PAGE_PATH,
+    DIRECT_STREAM_PATH,
+)
+from .exceptions import ModelUnavailableError, ProtocolError, QueueTimeoutError
+from .models import GenerationConfig, Message, ModelInfo, StreamChunk
+from .transport import (
+    ArenaTransport,
+    AsyncArenaTransport,
+    CookieInput,
+    SSEParser,
+    _raise_if_challenge_page,
+)
+
 VerificationToken = str | Callable[[], str]
 
-# The initial model list is rendered as a JSON value inside Next's escaped
-# flight payload.  Matching only the stable fields tolerates unrelated UI data.
-_MODEL_RE = re.compile(
-    r'\\"id\\":\\"(?P<id>[0-9a-f-]{36})\\".*?'
-    r'\\"publicName\\":\\"(?P<name>(?:[^"\\\\]|\\\\.)*)\\"',
+_UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+_FIELD_QUOTE = r"(?:\\+)?\""
+_ID_FIELD_RE = re.compile(
+    rf"{_FIELD_QUOTE}(?:id|modelId|model_id){_FIELD_QUOTE}\s*:\s*"
+    rf"{_FIELD_QUOTE}(?P<value>{_UUID}){_FIELD_QUOTE}",
+    re.IGNORECASE,
+)
+_NAME_FIELD_RE = re.compile(
+    rf"{_FIELD_QUOTE}(?:publicName|public_name|displayName|display_name|name){_FIELD_QUOTE}\s*:\s*"
+    rf"{_FIELD_QUOTE}(?P<value>(?:\\.|[^\"\\])*){_FIELD_QUOTE}",
+    re.IGNORECASE,
+)
+_NEXT_FLIGHT_RE = re.compile(
+    r"__next_f\.push\(\[\s*\d+\s*,\s*(\"(?:\\.|[^\"\\])*\")\s*\]\)",
     re.DOTALL,
 )
 
 
 def uuid7() -> str:
-    """Generate a UUIDv7 on Python versions predating ``uuid.uuid7``."""
-    millis = int(time.time_ns() // 1_000_000)
+    """Generate a standards-shaped UUIDv7 on Python versions before 3.14."""
+    millis = time.time_ns() // 1_000_000
     value = (millis & ((1 << 48) - 1)) << 80
     value |= 0x7 << 76
     value |= secrets.randbits(12) << 64
@@ -46,110 +69,468 @@ def uuid7() -> str:
 
 
 class AIDataStreamParser:
-    """Incremental decoder for Vercel AI data-stream records (``a0:``, ``ad:``).
+    """Incremental decoder for newline-delimited AI data-stream records.
 
-    Records are newline delimited rather than SSE records; arbitrary byte
-    boundaries and malformed nonessential metadata are handled safely.
+    Arena has used prefixed records such as ``a0:`` and ``ad:``; the parser
+    also accepts the Vercel AI SDK's common ``0:`` text and ``d:`` finish
+    records. UTF-8 sequences split between network reads are preserved.
     """
 
     def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._buffer = ""
+        self._closed = False
 
     def feed(self, wire: bytes | str) -> list[tuple[str, Any]]:
-        self._buffer += wire.decode("utf-8", "replace") if isinstance(wire, bytes) else wire
+        if self._closed:
+            raise RuntimeError("cannot feed a closed AIDataStreamParser")
+        self._buffer += (
+            self._decoder.decode(wire, final=False) if isinstance(wire, bytes) else wire
+        )
         events: list[tuple[str, Any]] = []
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            parsed = self._line(line.rstrip("\r"))
-            if parsed is not None:
-                events.append(parsed)
+            record = self._parse_line(line.rstrip("\r"))
+            if record is not None:
+                events.append(record)
         return events
 
     def close(self) -> list[tuple[str, Any]]:
-        line, self._buffer = self._buffer, ""
-        parsed = self._line(line.rstrip("\r"))
-        return [] if parsed is None else [parsed]
+        if self._closed:
+            return []
+        self._buffer += self._decoder.decode(b"", final=True)
+        events: list[tuple[str, Any]] = []
+        if self._buffer:
+            record = self._parse_line(self._buffer.rstrip("\r"))
+            if record is not None:
+                events.append(record)
+        self._buffer = ""
+        self._closed = True
+        return events
 
     @staticmethod
-    def _line(line: str) -> tuple[str, Any] | None:
+    def _parse_line(line: str) -> tuple[str, Any] | None:
         if not line:
             return None
-        kind, colon, payload = line.partition(":")
-        if not colon:
-            return ("unknown", line)
+        if line.strip() == "[DONE]":
+            return "ad", True
+        kind, separator, payload = line.partition(":")
+        if not separator:
+            return "unknown", line
         try:
             return kind, json.loads(payload)
         except json.JSONDecodeError:
             return kind, payload
 
 
-def _models_from_direct_page(page: str) -> list[ModelInfo]:
+class _ScriptCollector(HTMLParser):
+    """Collect script element bodies without requiring an HTML dependency."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.scripts: list[str] = []
+        self._current: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "script":
+            self._current = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            self._current.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._current is not None:
+            self.scripts.append("".join(self._current))
+            self._current = None
+
+
+def _walk_models(value: Any, models: dict[str, ModelInfo]) -> None:
+    if isinstance(value, Mapping):
+        model_id = next(
+            (
+                value.get(key)
+                for key in ("id", "modelId", "model_id")
+                if value.get(key) is not None
+            ),
+            None,
+        )
+        display = next(
+            (
+                value.get(key)
+                for key in (
+                    "publicName",
+                    "public_name",
+                    "displayName",
+                    "display_name",
+                    "name",
+                )
+                if value.get(key) is not None
+            ),
+            None,
+        )
+        if model_id is not None and display is not None:
+            model_id = str(model_id)
+            models.setdefault(
+                model_id,
+                ModelInfo(
+                    id=model_id,
+                    display_name=str(display),
+                    available=bool(value.get("available", value.get("active", True))),
+                    metadata=dict(value),
+                ),
+            )
+        for child in value.values():
+            _walk_models(child, models)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _walk_models(child, models)
+
+
+def _decode_json_string(value: str) -> str:
+    try:
+        return str(json.loads('"' + value + '"'))
+    except (json.JSONDecodeError, TypeError):
+        return html.unescape(value.replace(r"\"", '"').replace(r"\\", "\\"))
+
+
+def _models_from_markup(markup: str) -> list[ModelInfo]:
+    """Extract model records from Next.js JSON and escaped flight payloads."""
     result: dict[str, ModelInfo] = {}
-    for match in _MODEL_RE.finditer(page):
-        name = json.loads('"' + match.group("name") + '"')
-        model_id = match.group("id")
-        result[model_id] = ModelInfo(id=model_id, display_name=name, metadata={"public_name": name})
-    if not result:
-        raise ProtocolError("Could not locate initialModels in Arena's Direct Chat page.")
-    return sorted(result.values(), key=lambda item: (item.display_name or item.id).casefold())
+    collector = _ScriptCollector()
+    collector.feed(markup)
+
+    candidates = [markup, html.unescape(markup), *collector.scripts]
+    for match in _NEXT_FLIGHT_RE.finditer(markup):
+        try:
+            candidates.append(json.loads(match.group(1)))
+        except json.JSONDecodeError:
+            continue
+
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        _walk_models(_try_json(candidate), result)
+        # Next.js may serialize model objects inside a string rather than a
+        # standalone JSON script; scan object starts without relying on a fixed
+        # React/Next payload version.
+        position = 0
+        while True:
+            start = candidate.find("{", position)
+            if start < 0:
+                break
+            try:
+                value, end = decoder.raw_decode(candidate, start)
+            except json.JSONDecodeError:
+                position = start + 1
+            else:
+                _walk_models(value, result)
+                position = max(end, start + 1)
+
+    # Use regex only as a last-resort fallback; parsing JSON first avoids a
+    # loosely matched escaped string overriding a structured model record.
+    for candidate in candidates:
+        _regex_models(candidate, result)
+
+    return sorted(
+        result.values(), key=lambda item: (item.display_name or item.id).casefold()
+    )
+
+
+def _try_json(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _regex_models(candidate: str, result: dict[str, ModelInfo]) -> None:
+    for id_match in _ID_FIELD_RE.finditer(candidate):
+        next_id = _ID_FIELD_RE.search(candidate, id_match.end())
+        limit = (
+            next_id.start()
+            if next_id is not None
+            else min(len(candidate), id_match.end() + 1200)
+        )
+        segment = candidate[id_match.end() : limit]
+        name_match = _NAME_FIELD_RE.search(segment)
+        if name_match is None:
+            # Some serializers place the public name before the UUID.
+            previous_id = candidate.rfind(
+                '"id"', max(0, id_match.start() - 1200), id_match.start()
+            )
+            before = candidate[
+                max(previous_id, id_match.start() - 1200) : id_match.start()
+            ]
+            name_match = None
+            for candidate_name in _NAME_FIELD_RE.finditer(before):
+                name_match = candidate_name
+        if name_match is None:
+            continue
+        name = _decode_json_string(name_match.group("value"))
+        model_id = id_match.group("value")
+        result.setdefault(
+            model_id,
+            ModelInfo(id=model_id, display_name=name, metadata={"public_name": name}),
+        )
+
+
+def _is_text_frame(kind: str) -> bool:
+    return kind in {"0", "a0", "text", "text_delta", "text-delta", "message"}
+
+
+def _is_done_frame(kind: str, value: Any) -> bool:
+    if kind in {
+        "ad",
+        "d",
+        "done",
+        "finish",
+        "finished",
+        "complete",
+        "completed",
+        "process_completed",
+    }:
+        return True
+    if isinstance(value, Mapping):
+        if value.get("finished") is True or value.get("done") is True:
+            return True
+        return str(value.get("type", "")).casefold() in {
+            "finish",
+            "finished",
+            "completed",
+            "message_end",
+            "finish_message",
+        }
+    return False
+
+
+def _update_direct_text(
+    kind: str, value: Any, previous: str
+) -> tuple[str, StreamChunk | None, bool]:
+    if kind in {"3", "error"} or (isinstance(value, Mapping) and value.get("error")):
+        detail = value.get("error", value) if isinstance(value, Mapping) else value
+        raise ProtocolError(f"Arena Direct Chat stream reported an error: {detail}")
+
+    text_value: Any = value
+    if isinstance(value, Mapping):
+        text_value = next(
+            (
+                value.get(key)
+                for key in ("delta", "text", "content")
+                if isinstance(value.get(key), str)
+            ),
+            None,
+        )
+        if text_value is None and _is_text_frame(kind):
+            text_value = value.get("value")
+    if text_value is None and kind == "message" and isinstance(value, str):
+        text_value = value
+
+    current = previous
+    chunk: StreamChunk | None = None
+    if _is_text_frame(kind) and isinstance(text_value, str):
+        current = (
+            text_value if text_value.startswith(previous) else previous + text_value
+        )
+        delta = current[len(previous) :]
+        if delta:
+            chunk = StreamChunk(
+                text=current, delta=delta, event="text", raw={kind: value}
+            )
+    finished = _is_done_frame(kind, value)
+    if finished:
+        chunk = StreamChunk(
+            text=current, delta="", event="completed", finished=True, raw={kind: value}
+        )
+    return current, chunk, finished
+
+
+def _records_from_sse_event(event_name: str, data: str) -> list[tuple[str, Any]]:
+    if data.strip() == "[DONE]":
+        return [("ad", True)]
+    try:
+        value: Any = json.loads(data)
+    except json.JSONDecodeError:
+        value = data
+    if isinstance(value, Mapping):
+        kind = str(value.get("type", event_name or "message"))
+        if (
+            "delta" in value
+            or "text" in value
+            or "content" in value
+            or value.get("done")
+        ):
+            return [(kind, value)]
+        if value.get("error"):
+            return [("error", value)]
+    return [(event_name or "message", value)]
+
+
+def _check_direct_prefix(wire: bytes, response: httpx.Response) -> None:
+    prefix = wire[:4096].decode("utf-8", "replace")
+    if prefix.lstrip().lower().startswith(("<!doctype html", "<html")):
+        _raise_if_challenge_page(prefix, response.headers)
+        raise ProtocolError("Direct Chat expected a stream but received HTML.")
+
+
+def _iter_response_records(response: httpx.Response) -> Iterator[tuple[str, Any]]:
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/event-stream" in content_type:
+        sse_parser = SSEParser()
+        first_chunk = True
+        for wire in response.iter_bytes():
+            if first_chunk:
+                _check_direct_prefix(wire, response)
+                first_chunk = False
+            for event_name, data in sse_parser.feed(wire):
+                yield from _records_from_sse_event(event_name, data)
+        for event_name, data in sse_parser.close():
+            yield from _records_from_sse_event(event_name, data)
+        return
+    ai_parser = AIDataStreamParser()
+    first_chunk = True
+    for wire in response.iter_bytes():
+        if first_chunk:
+            _check_direct_prefix(wire, response)
+            first_chunk = False
+        yield from ai_parser.feed(wire)
+    yield from ai_parser.close()
+
+
+async def _aiter_response_records(
+    response: httpx.Response,
+) -> AsyncIterator[tuple[str, Any]]:
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/event-stream" in content_type:
+        sse_parser = SSEParser()
+        first_chunk = True
+        async for wire in response.aiter_bytes():
+            if first_chunk:
+                _check_direct_prefix(wire, response)
+                first_chunk = False
+            for event_name, data in sse_parser.feed(wire):
+                for item in _records_from_sse_event(event_name, data):
+                    yield item
+        for event_name, data in sse_parser.close():
+            for item in _records_from_sse_event(event_name, data):
+                yield item
+        return
+    ai_parser = AIDataStreamParser()
+    first_chunk = True
+    async for wire in response.aiter_bytes():
+        if first_chunk:
+            _check_direct_prefix(wire, response)
+            first_chunk = False
+        for item in ai_parser.feed(wire):
+            yield item
+    for item in ai_parser.close():
+        yield item
 
 
 class _DirectMixin:
     verification_token: VerificationToken | None
     _models: list[ModelInfo] | None
+    conversation_id: str | None
+    direct_page_path: str
+    direct_stream_path: str
 
     def _token(self, supplied: str | None) -> str:
-        token = supplied if supplied is not None else self.verification_token
-        token = token() if callable(token) else token
+        token: VerificationToken | None = (
+            supplied if supplied is not None else self.verification_token
+        )
+        if callable(token):
+            token = token()
         if not isinstance(token, str) or not token.strip():
             raise ProtocolError(
-                "Arena Direct Chat requires a fresh browser-provided verification token for this request."
+                "Arena Direct Chat requires a fresh verification assertion supplied by the caller."
             )
         return token
 
     @staticmethod
-    def _request_body(prompt: str, model_id: str, token: str, conversation_id: str | None) -> dict[str, Any]:
-        chat_id = conversation_id or uuid7()
-        return {
-            "id": chat_id,
+    def _request_body(
+        prompt: str,
+        model_id: str,
+        token: str,
+        conversation_id: str,
+        config: GenerationConfig,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "id": conversation_id,
             "mode": "direct-battle",
             "modelAId": model_id,
             "userMessageId": uuid7(),
             "modelAMessageId": uuid7(),
-            "userMessage": {"content": prompt, "experimental_attachments": [], "metadata": {}},
+            "userMessage": {
+                "content": prompt,
+                "experimental_attachments": [],
+                "metadata": {},
+            },
             "modality": "chat",
             "recaptchaV3Token": token,
         }
+        parameters = config.model_parameters()
+        if parameters:
+            body["generationConfig"] = parameters
+        return body
 
-    def _resolve_model(self, model: str | None, known: list[ModelInfo]) -> str:
+    @staticmethod
+    def _resolve_model(model: str | None, known: list[ModelInfo]) -> str:
         if model is None:
-            raise ModelUnavailableError("Pass a model id or a model public name from get_models().")
+            raise ModelUnavailableError(
+                "Pass a model id or display name returned by get_models()."
+            )
+        folded = model.casefold()
         for item in known:
-            if model in (item.id, item.display_name) or model.casefold() == (item.display_name or "").casefold():
+            if (
+                model == item.id
+                or model == item.display_name
+                or folded == (item.display_name or "").casefold()
+            ):
+                if not item.available:
+                    raise ModelUnavailableError(
+                        f"Model {model!r} is currently unavailable."
+                    )
                 return item.id
-        raise ModelUnavailableError("Model %r is not present in the current Direct Chat model list." % model)
+        raise ModelUnavailableError(
+            f"Model {model!r} was not found in the current Direct Chat model list."
+        )
 
 
 class DirectArenaClient(_DirectMixin):
-    """Blocking client for the current Arena Direct Chat page.
+    """Blocking client for the current Arena Direct Chat frontend."""
 
-    ``verification_token`` may be a string or a callback returning a new token.
-    It is intentionally never persisted by this class.
-    """
-
-    def __init__(self, *, base_url: str = DEFAULT_BASE_URL, cookies: Any = None,
-                 headers: Mapping[str, str] | None = None,
-                 verification_token: VerificationToken | None = None,
-                 impersonate: str = "chrome124") -> None:
-        self.transport = ArenaTransport(base_url, cookies=cookies, headers=headers, impersonate=impersonate)
+    def __init__(
+        self,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        cookies: CookieInput = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        http2: bool = True,
+        verify: bool | str = True,
+        verification_token: VerificationToken | None = None,
+        direct_page_path: str = DIRECT_PAGE_PATH,
+        direct_stream_path: str = DIRECT_STREAM_PATH,
+        http_transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self.transport = ArenaTransport(
+            base_url,
+            cookies=cookies,
+            headers=headers,
+            timeout=timeout,
+            http2=http2,
+            verify=verify,
+            http_transport=http_transport,
+        )
         self.verification_token = verification_token
+        self.direct_page_path = direct_page_path
+        self.direct_stream_path = direct_stream_path
         self._models = None
         self.conversation_id: str | None = None
 
-    def __enter__(self) -> "DirectArenaClient":
+    def __enter__(self) -> DirectArenaClient:  # noqa: PYI034 - Self is not in typing until Python 3.11
         return self
 
-    def __exit__(self, *_: Any) -> None:
+    def __exit__(self, *_: object) -> None:
         self.close()
 
     def close(self) -> None:
@@ -157,112 +538,212 @@ class DirectArenaClient(_DirectMixin):
 
     def get_models(self, *, refresh: bool = False) -> list[ModelInfo]:
         if refresh or self._models is None:
-            self._models = _models_from_direct_page(self.transport.get_text(DIRECT_PAGE_PATH))
+            self._models = _models_from_markup(
+                self.transport.get_text(self.direct_page_path)
+            )
+            if not self._models:
+                raise ProtocolError(
+                    "Could not find model metadata in Arena's Direct Chat page."
+                )
         return list(self._models)
 
-    def stream(self, prompt: str, *, model: str | None = None,
-               verification_token: str | None = None,
-               config: GenerationConfig | None = None) -> Iterator[StreamChunk]:
-        config = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
+    def stream(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        verification_token: str | None = None,
+        config: GenerationConfig | None = None,
+        conversation_id: str | None = None,
+    ) -> Iterator[StreamChunk]:
+        generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
         model_id = self._resolve_model(model, self.get_models())
-        body = self._request_body(prompt, model_id, self._token(verification_token), self.conversation_id)
-        self.conversation_id = body["id"]
-        last_activity, text = time.monotonic(), ""
-        encoded = json.dumps(body, separators=(",", ":"))
-        with self.transport.session.stream(
-            "POST", self.transport.url(DIRECT_STREAM_PATH), data=encoded,
-            headers={"content-type": "text/plain;charset=UTF-8", "accept": "text/plain, */*"},
-            timeout=config.queue_timeout,
+        token = self._token(verification_token)
+        chat_id = conversation_id or self.conversation_id or uuid7()
+        if conversation_id is None:
+            self.conversation_id = chat_id
+        body = self._request_body(prompt, model_id, token, chat_id, generation)
+        finished = False
+        text = ""
+        deadline = time.monotonic() + generation.queue_timeout
+        with self.transport.stream_request(
+            "POST",
+            self.direct_stream_path,
+            headers={
+                "content-type": "text/plain;charset=UTF-8",
+                "accept": "text/plain, text/event-stream, */*",
+            },
+            content=json.dumps(body, separators=(",", ":")),
+            timeout=httpx.Timeout(generation.queue_timeout),
         ) as response:
-            _raise_for_status(response.status_code, response.text)
-            parser = AIDataStreamParser()
-            for wire in response.iter_content(chunk_size=1024):
-                if time.monotonic() - last_activity > config.queue_timeout:
-                    raise QueueTimeoutError("No Direct Chat stream data received before timeout.")
-                if not wire:
-                    continue
-                last_activity = time.monotonic()
-                for kind, value in parser.feed(wire):
-                    if kind == "a0" and isinstance(value, str):
-                        text += value
-                        yield StreamChunk(text=text, delta=value, event="text", raw={kind: value})
-                    elif kind == "ad":
-                        yield StreamChunk(text=text, delta="", event="completed", finished=True, raw={kind: value})
-                        return
-            for kind, value in parser.close():
-                if kind == "a0" and isinstance(value, str):
-                    text += value
-                    yield StreamChunk(text=text, delta=value, event="text", raw={kind: value})
-                elif kind == "ad":
-                    yield StreamChunk(text=text, delta="", event="completed", finished=True, raw={kind: value})
+            for kind, value in _iter_response_records(response):
+                if time.monotonic() >= deadline:
+                    raise QueueTimeoutError(
+                        "Direct Chat stream exceeded its configured timeout."
+                    )
+                text, chunk, done = _update_direct_text(kind, value, text)
+                if chunk is not None:
+                    yield chunk
+                if done:
+                    finished = True
                     return
-        raise ProtocolError("Arena Direct Chat stream ended without a completion record.")
+        if not finished:
+            raise ProtocolError(
+                "Arena Direct Chat stream ended without a completion record."
+            )
 
-    def complete(self, prompt: str, **kwargs: Any) -> str:
-        return "".join(chunk.delta for chunk in self.stream(prompt, **kwargs))
+    def complete(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        verification_token: str | None = None,
+        config: GenerationConfig | None = None,
+        conversation_id: str | None = None,
+    ) -> str:
+        return "".join(
+            chunk.delta
+            for chunk in self.stream(
+                prompt,
+                model=model,
+                verification_token=verification_token,
+                config=config,
+                conversation_id=conversation_id,
+            )
+        )
 
-    def chat(self, *, model: str, config: GenerationConfig | None = None) -> "DirectChatSession":
+    def chat(
+        self,
+        *,
+        model: str,
+        config: GenerationConfig | None = None,
+    ) -> DirectChatSession:
         return DirectChatSession(self, model=model, config=config)
 
 
+def _copy_messages(history: Sequence[Message] | None) -> list[Message]:
+    if not history:
+        return []
+    return [
+        Message(role=item.role, content=item.content, id=item.id) for item in history
+    ]
+
+
 class DirectChatSession:
-    """Client-side multi-turn state for Direct Chat.
+    """Multi-turn Direct Chat state; each session owns its conversation UUID."""
 
-    Arena owns the opaque conversation id; this class additionally maintains a
-    typed local transcript suitable for applications and retries.
-    """
-
-    def __init__(self, client: DirectArenaClient, *, model: str,
-                 config: GenerationConfig | None = None) -> None:
+    def __init__(
+        self,
+        client: DirectArenaClient,
+        *,
+        model: str,
+        config: GenerationConfig | None = None,
+        history: Sequence[Message] | None = None,
+    ) -> None:
         self.client = client
         self.model = model
         self.config = config or GenerationConfig()
-        self.history: list[Message] = []
-        self.turn_id = 0
-        self.parent_message_id: str | None = None
+        self.history = _copy_messages(history)
+        self.turn_id = sum(item.role == "assistant" for item in self.history)
+        self.parent_message_id = next(
+            (item.id for item in reversed(self.history) if item.role == "assistant"),
+            None,
+        )
+        self.conversation_id: str | None = None
 
-    def stream_message(self, content: str, *, verification_token: str | None = None) -> Iterator[StreamChunk]:
-        user = Message("user", content, uuid7())
+    def stream_message(
+        self, content: str, *, verification_token: str | None = None
+    ) -> Iterator[StreamChunk]:
+        user = Message("user", content, uuid.uuid4().hex)
         self.history.append(user)
+        prior_conversation_id = self.conversation_id
+        self.conversation_id = self.conversation_id or uuid7()
         collected: list[str] = []
+        committed = False
         try:
-            for chunk in self.client.stream(content, model=self.model,
-                                            verification_token=verification_token, config=self.config):
+            for chunk in self.client.stream(
+                content,
+                model=self.model,
+                verification_token=verification_token,
+                config=self.config,
+                conversation_id=self.conversation_id,
+            ):
                 if chunk.delta:
                     collected.append(chunk.delta)
+                if chunk.finished:
+                    assistant = Message(
+                        "assistant", "".join(collected), uuid.uuid4().hex
+                    )
+                    self.history.append(assistant)
+                    self.turn_id += 1
+                    self.parent_message_id = assistant.id
+                    committed = True
                 yield chunk
-        except Exception:
-            self.history.pop()
-            raise
-        assistant = Message("assistant", "".join(collected), uuid7())
-        self.history.append(assistant)
-        self.turn_id += 1
-        self.parent_message_id = assistant.id
+            if not committed:
+                raise ProtocolError(
+                    "Direct Chat stream ended without a completion chunk."
+                )
+        finally:
+            if not committed:
+                for index in range(len(self.history) - 1, -1, -1):
+                    if self.history[index] is user:
+                        del self.history[index]
+                        break
+                self.conversation_id = prior_conversation_id
 
-    def send_message(self, content: str, *, verification_token: str | None = None) -> str:
-        return "".join(chunk.delta for chunk in self.stream_message(content, verification_token=verification_token))
+    def send_message(
+        self, content: str, *, verification_token: str | None = None
+    ) -> str:
+        return "".join(
+            chunk.delta
+            for chunk in self.stream_message(
+                content, verification_token=verification_token
+            )
+        )
 
     def clear(self) -> None:
         self.history.clear()
         self.turn_id = 0
         self.parent_message_id = None
-        self.client.conversation_id = None
+        self.conversation_id = None
 
 
 class AsyncDirectArenaClient(_DirectMixin):
-    """Async equivalent of :class:`DirectArenaClient`."""
+    """Async client for the same Direct Chat frontend."""
 
-    def __init__(self, **kwargs: Any) -> None:
-        base_url = kwargs.pop("base_url", DEFAULT_BASE_URL)
-        self.verification_token = kwargs.pop("verification_token", None)
-        self.transport = AsyncArenaTransport(base_url, **kwargs)
+    def __init__(
+        self,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        cookies: CookieInput = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        http2: bool = True,
+        verify: bool | str = True,
+        verification_token: VerificationToken | None = None,
+        direct_page_path: str = DIRECT_PAGE_PATH,
+        direct_stream_path: str = DIRECT_STREAM_PATH,
+        http_transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.transport = AsyncArenaTransport(
+            base_url,
+            cookies=cookies,
+            headers=headers,
+            timeout=timeout,
+            http2=http2,
+            verify=verify,
+            http_transport=http_transport,
+        )
+        self.verification_token = verification_token
+        self.direct_page_path = direct_page_path
+        self.direct_stream_path = direct_stream_path
         self._models = None
         self.conversation_id: str | None = None
 
-    async def __aenter__(self) -> "AsyncDirectArenaClient":
+    async def __aenter__(self) -> AsyncDirectArenaClient:  # noqa: PYI034 - Self is not in typing until Python 3.11
         return self
 
-    async def __aexit__(self, *_: Any) -> None:
+    async def __aexit__(self, *_: object) -> None:
         await self.aclose()
 
     async def aclose(self) -> None:
@@ -270,38 +751,168 @@ class AsyncDirectArenaClient(_DirectMixin):
 
     async def get_models(self, *, refresh: bool = False) -> list[ModelInfo]:
         if refresh or self._models is None:
-            self._models = _models_from_direct_page(await self.transport.get_text(DIRECT_PAGE_PATH))
+            self._models = _models_from_markup(
+                await self.transport.get_text(self.direct_page_path)
+            )
+            if not self._models:
+                raise ProtocolError(
+                    "Could not find model metadata in Arena's Direct Chat page."
+                )
         return list(self._models)
 
-    async def astream(self, prompt: str, *, model: str | None = None,
-                      verification_token: str | None = None,
-                      config: GenerationConfig | None = None) -> AsyncIterator[StreamChunk]:
-        config = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
+    async def astream(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        verification_token: str | None = None,
+        config: GenerationConfig | None = None,
+        conversation_id: str | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
         model_id = self._resolve_model(model, await self.get_models())
-        body = self._request_body(prompt, model_id, self._token(verification_token), self.conversation_id)
-        self.conversation_id = body["id"]
-        parser, text, last_activity = AIDataStreamParser(), "", time.monotonic()
-        encoded = json.dumps(body, separators=(",", ":"))
-        async with self.transport.session.stream(
-            "POST", self.transport.url(DIRECT_STREAM_PATH), data=encoded,
-            headers={"content-type": "text/plain;charset=UTF-8", "accept": "text/plain, */*"},
-            timeout=config.queue_timeout,
+        token = self._token(verification_token)
+        chat_id = conversation_id or self.conversation_id or uuid7()
+        if conversation_id is None:
+            self.conversation_id = chat_id
+        body = self._request_body(prompt, model_id, token, chat_id, generation)
+        text = ""
+        deadline = time.monotonic() + generation.queue_timeout
+        async with self.transport.stream_request(
+            "POST",
+            self.direct_stream_path,
+            headers={
+                "content-type": "text/plain;charset=UTF-8",
+                "accept": "text/plain, text/event-stream, */*",
+            },
+            content=json.dumps(body, separators=(",", ":")),
+            timeout=httpx.Timeout(generation.queue_timeout),
         ) as response:
-            _raise_for_status(response.status_code, response.text)
-            async for wire in response.aiter_content(chunk_size=1024):
-                if time.monotonic() - last_activity > config.queue_timeout:
-                    raise QueueTimeoutError("No Direct Chat stream data received before timeout.")
-                if not wire:
-                    continue
-                last_activity = time.monotonic()
-                for kind, value in parser.feed(wire):
-                    if kind == "a0" and isinstance(value, str):
-                        text += value
-                        yield StreamChunk(text=text, delta=value, event="text", raw={kind: value})
-                    elif kind == "ad":
-                        yield StreamChunk(text=text, delta="", event="completed", finished=True, raw={kind: value})
-                        return
-        raise ProtocolError("Arena Direct Chat stream ended without a completion record.")
+            async for kind, value in _aiter_response_records(response):
+                if time.monotonic() >= deadline:
+                    raise QueueTimeoutError(
+                        "Direct Chat stream exceeded its configured timeout."
+                    )
+                text, chunk, done = _update_direct_text(kind, value, text)
+                if chunk is not None:
+                    yield chunk
+                if done:
+                    return
+        raise ProtocolError(
+            "Arena Direct Chat stream ended without a completion record."
+        )
 
-    async def acomplete(self, prompt: str, **kwargs: Any) -> str:
-        return "".join([part.delta async for part in self.astream(prompt, **kwargs)])
+    async def acomplete(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        verification_token: str | None = None,
+        config: GenerationConfig | None = None,
+        conversation_id: str | None = None,
+    ) -> str:
+        return "".join(
+            [
+                chunk.delta
+                async for chunk in self.astream(
+                    prompt,
+                    model=model,
+                    verification_token=verification_token,
+                    config=config,
+                    conversation_id=conversation_id,
+                )
+            ]
+        )
+
+    def chat(
+        self,
+        *,
+        model: str,
+        config: GenerationConfig | None = None,
+    ) -> AsyncDirectChatSession:
+        return AsyncDirectChatSession(self, model=model, config=config)
+
+
+class AsyncDirectChatSession:
+    """Async multi-turn Direct Chat state."""
+
+    def __init__(
+        self,
+        client: AsyncDirectArenaClient,
+        *,
+        model: str,
+        config: GenerationConfig | None = None,
+        history: Sequence[Message] | None = None,
+    ) -> None:
+        self.client = client
+        self.model = model
+        self.config = config or GenerationConfig()
+        self.history = _copy_messages(history)
+        self.turn_id = sum(item.role == "assistant" for item in self.history)
+        self.parent_message_id = next(
+            (item.id for item in reversed(self.history) if item.role == "assistant"),
+            None,
+        )
+        self.conversation_id: str | None = None
+
+    async def stream_message(
+        self,
+        content: str,
+        *,
+        verification_token: str | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        user = Message("user", content, uuid.uuid4().hex)
+        self.history.append(user)
+        prior_conversation_id = self.conversation_id
+        self.conversation_id = self.conversation_id or uuid7()
+        collected: list[str] = []
+        committed = False
+        try:
+            async for chunk in self.client.astream(
+                content,
+                model=self.model,
+                verification_token=verification_token,
+                config=self.config,
+                conversation_id=self.conversation_id,
+            ):
+                if chunk.delta:
+                    collected.append(chunk.delta)
+                if chunk.finished:
+                    assistant = Message(
+                        "assistant", "".join(collected), uuid.uuid4().hex
+                    )
+                    self.history.append(assistant)
+                    self.turn_id += 1
+                    self.parent_message_id = assistant.id
+                    committed = True
+                yield chunk
+            if not committed:
+                raise ProtocolError(
+                    "Direct Chat stream ended without a completion chunk."
+                )
+        finally:
+            if not committed:
+                for index in range(len(self.history) - 1, -1, -1):
+                    if self.history[index] is user:
+                        del self.history[index]
+                        break
+                self.conversation_id = prior_conversation_id
+
+    async def send_message(
+        self, content: str, *, verification_token: str | None = None
+    ) -> str:
+        return "".join(
+            [
+                chunk.delta
+                async for chunk in self.stream_message(
+                    content,
+                    verification_token=verification_token,
+                )
+            ]
+        )
+
+    def clear(self) -> None:
+        self.history.clear()
+        self.turn_id = 0
+        self.parent_message_id = None
+        self.conversation_id = None
