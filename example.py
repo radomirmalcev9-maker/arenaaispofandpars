@@ -13,19 +13,21 @@ def main() -> None:
     cookie_file = os.environ.get("ARENA_COOKIES_FILE")
     base_url = os.environ.get("ARENA_BASE_URL", "https://arena.ai")
     if not cookie and not cookie_file:
-        raise SystemExit("Set ARENA_COOKIE or ARENA_COOKIES_FILE to your local browser export.")
+        raise SystemExit(
+            "Set ARENA_COOKIE or ARENA_COOKIES_FILE to your own cookie export."
+        )
 
-    # If Arena changed its UI, inspect https://arena.ai/config and pass the
-    # discovered queued callback as chat_fn_index=... here.
-    # `ARENA_COOKIES_FILE` accepts both a DevTools JSON export containing a
-    # `cookie` field and a standard cookies.json array.
-    # Point this at the queued Gradio/API host, if Arena's frontend delegates
-    # chat traffic to a distinct origin (discover it in Network → Fetch/XHR).
+    # If the frontend has changed, inspect arena.config() and pass the callback
+    # index and a chat_payload_factory matching that authorized callback schema.
     with ArenaClient(base_url=base_url, cookies=cookie_file or cookie) as arena:
-        print("Known models:", ", ".join(model.id for model in arena.get_models()[:10]))
+        models = arena.get_models()
+        print("Known model choices:", ", ".join(model.id for model in models[:10]))
         print("Chat queue endpoint:", arena.get_endpoint("chat").fn_index)
 
-        response = arena.complete("Reply with exactly one short greeting.")
+        response = arena.complete(
+            "Reply with exactly one short greeting.",
+            config=GenerationConfig(queue_timeout=120),
+        )
         print("Single response:", response)
 
         print("Streaming: ", end="", flush=True)
@@ -42,4 +44,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

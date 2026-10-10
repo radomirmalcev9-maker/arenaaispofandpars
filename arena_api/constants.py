@@ -1,24 +1,29 @@
-"""Protocol defaults for Gradio-powered Arena deployments."""
+"""Public protocol defaults.
+
+Arena's frontends are not a stable API. These values describe common Gradio
+routes and may need to be overridden for a deployment you are authorized to
+use.
+"""
 
 from __future__ import annotations
 
 DEFAULT_BASE_URL = "https://arena.ai"
 DEFAULT_TIMEOUT = 45.0
 DEFAULT_QUEUE_TIMEOUT = 180.0
-CHROME_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-DEFAULT_HEADERS = {
+
+# Be transparent about this being a library client. Callers may supply their own
+# static headers when a deployment requires additional request context.
+DEFAULT_HEADERS: dict[str, str] = {
     "accept": "text/event-stream, application/json, text/plain, */*",
-    "accept-language": "en-US,en;q=0.9",
-    "origin": "https://arena.ai",
-    "referer": "https://arena.ai/",
-    "user-agent": CHROME_USER_AGENT,
+    "user-agent": "arena-api/0.2.0",
 }
 
-# Gradio has used both variants across releases.
+CONFIG_PATH = "/config"
 QUEUE_JOIN_PATH = "/queue/join"
 QUEUE_DATA_PATH = "/queue/data"
-CONFIG_PATH = "/config"
 
+# Unofficial Direct Chat routes observed in the Next.js frontend. They are
+# deliberately isolated from the Gradio adapter because the frontend protocol
+# can change without notice.
+DIRECT_PAGE_PATH = "/text/direct?model_a=max"
+DIRECT_STREAM_PATH = "/nextjs-api/stream/create-evaluation"

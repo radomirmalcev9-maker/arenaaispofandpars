@@ -1,8 +1,7 @@
-"""Current Arena Direct Chat example.
+"""Run once with your own current Arena session and assertion.
 
-Set ARENA_VERIFICATION_TOKEN to a fresh verification assertion obtained through
-your normal browser session.  Arena expires it frequently, so production code
-should pass a callback that supplies a fresh user-provided value per request.
+ARENA_VERIFICATION_TOKEN must be supplied by the caller through its normal
+authorized browser flow. The library does not retrieve or solve it.
 """
 
 from __future__ import annotations
@@ -16,28 +15,22 @@ from arena_api import DirectArenaClient
 def main() -> None:
     token = os.environ.get("ARENA_VERIFICATION_TOKEN")
     if not token:
-        raise SystemExit("Set ARENA_VERIFICATION_TOKEN to a fresh browser-provided verification token.")
+        raise SystemExit("Set ARENA_VERIFICATION_TOKEN to a caller-provided assertion.")
 
     with DirectArenaClient(
         cookies=os.environ.get("ARENA_COOKIE"),
         verification_token=token,
     ) as arena:
         models = arena.get_models()
-        print("Available models:", len(models))
-        model = next(item.display_name for item in models if item.display_name == "Max")
+        if not models:
+            raise SystemExit("No Direct Chat models were found in the current page.")
+        model = models[0].display_name or models[0].id
+        print("Available models:", len(models), "— selected:", model)
 
-        print("Single response:", arena.complete("Reply with one greeting.", model=model))
-
-        print("Streaming: ", end="", flush=True)
-        for chunk in arena.stream("Count one, two, three.", model=model):
+        for chunk in arena.stream("Reply with one short greeting.", model=model):
             sys.stdout.write(chunk.delta)
             sys.stdout.flush()
         print()
-
-        chat = arena.chat(model=model)
-        print("Turn 1:", chat.send_message("My name is Ada."))
-        print("Turn 2:", chat.send_message("What name did I give you?"))
-        print("Stored turns:", chat.turn_id)
 
 
 if __name__ == "__main__":

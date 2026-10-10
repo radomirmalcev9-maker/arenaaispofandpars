@@ -1,122 +1,457 @@
-"""Synchronous and asynchronous Arena clients."""
+"""Synchronous and asynchronous clients for Gradio-style Arena frontends.
+
+The Gradio callback schema is deployment-specific. The built-in payload is a
+small conventional default; use ``chat_payload_factory`` or
+``stream_queue()`` when the selected frontend has different callback inputs.
+"""
 
 from __future__ import annotations
 
 import secrets
-from collections.abc import AsyncIterator, Iterator, Mapping
-from typing import Any
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
-from .constants import CONFIG_PATH, DEFAULT_BASE_URL, DEFAULT_QUEUE_TIMEOUT, QUEUE_DATA_PATH, QUEUE_JOIN_PATH
+import httpx
+
+from .constants import (
+    CONFIG_PATH,
+    DEFAULT_BASE_URL,
+    DEFAULT_QUEUE_TIMEOUT,
+    DEFAULT_TIMEOUT,
+    QUEUE_DATA_PATH,
+    QUEUE_JOIN_PATH,
+)
 from .exceptions import ModelUnavailableError, ProtocolError, QueueTimeoutError
-from .models import BattleResponse, GenerationConfig, ModelInfo, QueueEndpoint, StreamChunk
-from .transport import ArenaTransport, AsyncArenaTransport
+from .models import (
+    BattleResponse,
+    BattleStreamChunk,
+    GenerationConfig,
+    Message,
+    ModelInfo,
+    QueueEndpoint,
+    StreamChunk,
+)
+from .transport import ArenaTransport, AsyncArenaTransport, CookieInput
+
+if TYPE_CHECKING:
+    from .session import AsyncChatSession, ChatSession
+
+
+ChatPayloadFactory = Callable[
+    [str, str | None, GenerationConfig, Sequence[Message]], Sequence[Any]
+]
+BattlePayloadFactory = Callable[
+    [str, str | None, str | None, GenerationConfig], Sequence[Any]
+]
+
+
+_BATTLE_MARKERS = ("battle", "side_by_side", "side-by-side")
+_CHAT_MARKERS = ("chat", "add_text", "send_message", "submit")
 
 
 def _session_hash() -> str:
+    """Return a fresh random Gradio queue identifier."""
     return secrets.token_hex(16)
 
 
 def _dependencies(config: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    return [item for item in config.get("dependencies", []) if isinstance(item, Mapping)]
+    raw = config.get("dependencies", [])
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [item for item in raw if isinstance(item, Mapping)]
 
 
-def _find_fn_index(config: Mapping[str, Any], purpose: str) -> int:
-    """Locate a queue function from Gradio's public config, despite version drift."""
-    words = {
-        "chat": ("add_text", "send_message", "chat"),
-        "battle": ("add_text", "send_message", "battle"),
-    }[purpose]
-    matches: list[tuple[int, Mapping[str, Any]]] = []
-    for index, dep in enumerate(_dependencies(config)):
-        name = str(dep.get("api_name", "")).lower()
-        target = " ".join(map(str, dep.get("targets", []))).lower()
-        if any(word in name or word in target for word in words):
-            matches.append((index, dep))
-    if not matches:
-        raise ModelUnavailableError(
-            "The current Arena UI does not expose a discoverable %s endpoint. "
-            "Pass its fn_index explicitly from /config." % purpose
+def _dependency_text(dependency: Mapping[str, Any]) -> str:
+    values: list[str] = []
+    for key in ("api_name", "trigger_mode", "label", "name"):
+        value = dependency.get(key)
+        if isinstance(value, (str, int)):
+            values.append(str(value))
+    targets = dependency.get("targets", [])
+    if isinstance(targets, (list, tuple)):
+        values.extend(str(item) for item in targets if isinstance(item, str))
+    return " ".join(values).casefold()
+
+
+def _find_endpoint(config: Mapping[str, Any], purpose: str) -> QueueEndpoint:
+    if purpose not in {"chat", "battle"}:
+        raise ValueError("purpose must be 'chat' or 'battle'")
+    dependencies = _dependencies(config)
+    candidates: list[tuple[int, QueueEndpoint]] = []
+    for index, dependency in enumerate(dependencies):
+        if dependency.get("queue", True) is False:
+            continue
+        text = _dependency_text(dependency)
+        is_battle = any(marker in text for marker in _BATTLE_MARKERS)
+        if purpose == "battle":
+            if not is_battle:
+                continue
+            score = (
+                2
+                if any(
+                    marker in text
+                    for marker in ("battle", "side_by_side", "side-by-side")
+                )
+                else 1
+            )
+        else:
+            # Avoid accidentally routing a normal chat request to a battle
+            # dependency merely because it contains a generic "submit" target.
+            if is_battle or not any(marker in text for marker in _CHAT_MARKERS):
+                continue
+            score = 2 if "chat" in text or "send_message" in text else 1
+        api_name = dependency.get("api_name")
+        endpoint = QueueEndpoint(
+            fn_index=int(dependency.get("fn_index", index)),
+            api_name=str(api_name) if api_name is not None else None,
+            queue=True,
         )
-    # A queued dependency is the one compatible with /queue/join.
-    for index, dep in matches:
-        if dep.get("queue", True):
-            return int(dep.get("fn_index", index))
-    return int(matches[0][1].get("fn_index", matches[0][0]))
+        candidates.append((score, endpoint))
+    if not candidates:
+        raise ModelUnavailableError(
+            f"No queued {purpose} callback was discoverable in /config. "
+            f"Pass {purpose}_fn_index explicitly after inspecting the authorized frontend config."
+        )
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _model_info(value: Any) -> ModelInfo | None:
+    if isinstance(value, Mapping):
+        model_id = next(
+            (
+                value.get(key)
+                for key in ("id", "model_id", "name", "value")
+                if value.get(key) is not None
+            ),
+            None,
+        )
+        if model_id is None:
+            return None
+        display = next(
+            (
+                value.get(key)
+                for key in (
+                    "display_name",
+                    "public_name",
+                    "publicName",
+                    "label",
+                    "title",
+                )
+                if value.get(key) is not None
+            ),
+            model_id,
+        )
+        available = value.get(
+            "available", value.get("active", value.get("enabled", True))
+        )
+        return ModelInfo(
+            id=str(model_id),
+            display_name=str(display),
+            available=bool(available),
+            metadata=dict(value),
+        )
+    if isinstance(value, (str, int)):
+        return ModelInfo(id=str(value), display_name=str(value))
+    return None
 
 
 def _models_from_config(config: Mapping[str, Any]) -> list[ModelInfo]:
-    """Read model selectors from a Gradio config without coupling to component ids."""
+    """Read explicit model metadata or model dropdown choices from /config."""
     models: dict[str, ModelInfo] = {}
-    for component in config.get("components", []):
+    for key in ("models", "model_list", "model_names"):
+        raw_models = config.get(key)
+        if isinstance(raw_models, (list, tuple)):
+            for value in raw_models:
+                info = _model_info(value)
+                if info is not None:
+                    models.setdefault(info.id, info)
+            if models:
+                break
+
+    components = config.get("components", [])
+    if isinstance(components, Mapping):
+        component_items = list(components.values())
+    elif isinstance(components, (list, tuple)):
+        component_items = list(components)
+    else:
+        component_items = []
+
+    for component in component_items:
         if not isinstance(component, Mapping):
             continue
         props = component.get("props", {})
-        choices = props.get("choices", []) if isinstance(props, Mapping) else []
-        if not isinstance(choices, list):
+        if not isinstance(props, Mapping):
+            continue
+        choices = props.get("choices", [])
+        if not isinstance(choices, (list, tuple)):
+            continue
+        descriptor = " ".join(
+            str(value)
+            for value in (
+                component.get("type"),
+                component.get("label"),
+                component.get("key"),
+                component.get("id"),
+                props.get("label"),
+                props.get("elem_id"),
+                props.get("name"),
+                props.get("info"),
+            )
+            if value is not None
+        ).casefold()
+        if "model" not in descriptor:
             continue
         for choice in choices:
-            if isinstance(choice, list) and choice:
-                ident = str(choice[0])
-                label = str(choice[1]) if len(choice) > 1 else ident
+            if isinstance(choice, (list, tuple)) and choice:
+                info = ModelInfo(
+                    id=str(choice[0]),
+                    display_name=str(choice[1]) if len(choice) > 1 else str(choice[0]),
+                )
+            elif isinstance(choice, Mapping):
+                info = _model_info(choice)
+                if info is None:
+                    continue
             else:
-                ident = label = str(choice)
-            if ident and ident != "None":
-                models.setdefault(ident, ModelInfo(id=ident, display_name=label))
-    return sorted(models.values(), key=lambda model: model.id.casefold())
+                info = _model_info(choice)
+                if info is None:
+                    continue
+            if info.id and info.id.casefold() not in {"none", "null"}:
+                models.setdefault(info.id, info)
+
+    return sorted(
+        models.values(), key=lambda item: (item.display_name or item.id).casefold()
+    )
+
+
+def _collect_text(value: Any, candidates: list[str]) -> None:
+    if isinstance(value, str):
+        candidates.append(value)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _collect_text(child, candidates)
+    elif isinstance(value, Mapping):
+        role = value.get("role")
+        content = value.get("content")
+        if role == "assistant" and isinstance(content, str):
+            candidates.append(content)
+            return
+        # Prefer conventional response fields over walking arbitrary metadata.
+        for key in ("text", "response", "content", "message"):
+            item = value.get(key)
+            if isinstance(item, str) and (key != "content" or role != "user"):
+                candidates.append(item)
+        for key, child in value.items():
+            if key not in {
+                "text",
+                "response",
+                "content",
+                "message",
+                "error",
+                "metadata",
+            }:
+                _collect_text(child, candidates)
 
 
 def _assistant_text(event: Any) -> str | None:
-    """Extract the latest assistant string from common Gradio output shapes."""
+    """Extract the latest assistant text from common Gradio output shapes."""
     if not isinstance(event, Mapping):
         return event if isinstance(event, str) else None
     if event.get("error"):
-        raise ProtocolError("Arena queue error: %s" % event["error"])
+        raise ProtocolError(f"Arena queue reported an error: {event['error']}")
     payload = event.get("output", event)
-    data = payload.get("data") if isinstance(payload, Mapping) else None
-    if not isinstance(data, list):
-        return None
-    candidates: list[str] = []
-
-    def visit(value: Any) -> None:
+    if not isinstance(payload, Mapping):
+        return payload if isinstance(payload, str) else None
+    for key in ("text", "response", "content"):
+        value = payload.get(key)
         if isinstance(value, str):
-            candidates.append(value)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
-        elif isinstance(value, Mapping):
-            # Gradio Chatbot's messages format.
-            if value.get("role") == "assistant" and isinstance(value.get("content"), str):
-                candidates.append(value["content"])
-            else:
-                for child in value.values():
-                    visit(child)
-    visit(data)
+            return value
+    data = payload.get("data")
+    candidates: list[str] = []
+    _collect_text(data, candidates)
     return candidates[-1] if candidates else None
 
 
+def _battle_texts(event: Any) -> tuple[str, str] | None:
+    if not isinstance(event, Mapping):
+        return None
+    payload = event.get("output", event)
+    if not isinstance(payload, Mapping):
+        return None
+    direct_pairs = (
+        ("left", "right"),
+        ("response_a", "response_b"),
+        ("model_a", "model_b"),
+    )
+    for left_key, right_key in direct_pairs:
+        left, right = payload.get(left_key), payload.get(right_key)
+        if isinstance(left, str) and isinstance(right, str):
+            return left, right
+    data = payload.get("data")
+    if not isinstance(data, (list, tuple)) or len(data) < 2:
+        return None
+    found: list[str] = []
+    for value in data:
+        text = _assistant_text({"output": {"data": [value]}})
+        if text is not None:
+            found.append(text)
+    return (found[-2], found[-1]) if len(found) >= 2 else None
+
+
 def _terminal(event: Any) -> bool:
-    return isinstance(event, Mapping) and event.get("msg") in {"process_completed", "process_failed"}
+    return isinstance(event, Mapping) and event.get("msg") in {
+        "process_completed",
+        "process_failed",
+        "queue_full",
+    }
 
 
-class ArenaClient:
-    """Blocking client for a Gradio Arena deployment.
+def _check_queue_event(event_name: str, event: Any) -> None:
+    if event_name.casefold() == "error":
+        detail = event.get("error", event) if isinstance(event, Mapping) else event
+        raise ProtocolError(f"Arena queue returned an error event: {detail}")
+    if not isinstance(event, Mapping):
+        return
+    msg = event.get("msg")
+    if msg == "process_failed":
+        detail = event.get("error") or event.get("output") or "generation failed"
+        raise ProtocolError(f"Arena queue failed: {detail}")
+    if msg == "queue_full":
+        raise QueueTimeoutError(
+            "Arena queue is full; retry after the current load subsides."
+        )
+    if event.get("error"):
+        raise ProtocolError(f"Arena queue reported an error: {event['error']}")
 
-    ``chat_fn_index`` and ``battle_fn_index`` are optional overrides. They are
-    intentionally public because Arena's UI deployment can change independently
-    of this package; inspect ``GET /config`` to update them when necessary.
+
+def _merge_text(previous: str, update: str) -> tuple[str, str]:
+    """Accept either cumulative snapshots or append-only token deltas."""
+    full = update if update.startswith(previous) else previous + update
+    return full, full[len(previous) :]
+
+
+class _ArenaClientMixin:
+    """Protocol helpers shared by the blocking and async clients."""
+
+    chat_fn_index: int | None
+    battle_fn_index: int | None
+    chat_payload_factory: ChatPayloadFactory | None
+    battle_payload_factory: BattlePayloadFactory | None
+    _config: Mapping[str, Any] | None
+
+    def _selected_endpoint(
+        self, purpose: str, config: Mapping[str, Any] | None = None
+    ) -> QueueEndpoint:
+        if purpose not in {"chat", "battle"}:
+            raise ValueError("purpose must be 'chat' or 'battle'")
+        explicit = self.chat_fn_index if purpose == "chat" else self.battle_fn_index
+        if explicit is not None:
+            if explicit < 0:
+                raise ValueError(f"{purpose}_fn_index must be non-negative")
+            return QueueEndpoint(fn_index=explicit)
+        if config is None:
+            raise ValueError(
+                "config is required when no explicit callback index is configured"
+            )
+        return _find_endpoint(config, purpose)
+
+    def _chat_data(
+        self,
+        prompt: str,
+        model: str | None,
+        config: GenerationConfig,
+        history: Sequence[Message],
+    ) -> list[Any]:
+        if self.chat_payload_factory is not None:
+            result = self.chat_payload_factory(prompt, model, config, tuple(history))
+            if isinstance(result, (str, bytes)):
+                raise TypeError(
+                    "chat_payload_factory must return a sequence of callback inputs"
+                )
+            return list(result)
+        options = config.model_parameters()
+        if history:
+            options.setdefault("history", [message.as_dict() for message in history])
+        data: list[Any] = [prompt]
+        if model is not None:
+            data.append(model)
+        data.extend((None, options))
+        return data
+
+    def _battle_data(
+        self,
+        prompt: str,
+        left_model: str | None,
+        right_model: str | None,
+        config: GenerationConfig,
+    ) -> list[Any]:
+        if self.battle_payload_factory is not None:
+            result = self.battle_payload_factory(
+                prompt, left_model, right_model, config
+            )
+            if isinstance(result, (str, bytes)):
+                raise TypeError(
+                    "battle_payload_factory must return a sequence of callback inputs"
+                )
+            return list(result)
+        return [prompt, left_model, right_model, None, config.model_parameters()]
+
+    @staticmethod
+    def _check_join(joined: Any) -> None:
+        if isinstance(joined, Mapping):
+            if joined.get("error"):
+                raise ProtocolError(
+                    f"Arena rejected the queue request: {joined['error']}"
+                )
+            if joined.get("msg") == "queue_full":
+                raise QueueTimeoutError(
+                    "Arena queue is full; retry after the current load subsides."
+                )
+
+
+class ArenaClient(_ArenaClientMixin):
+    """Synchronous client for a Gradio-powered Arena deployment.
+
+    Cookies are optional for publicly accessible routes. For an authenticated
+    session, supply your own cookie mapping, Cookie header, or cookies.json
+    export. The client will surface browser challenges instead of bypassing
+    them.
     """
 
-    def __init__(self, *, base_url: str = DEFAULT_BASE_URL, cookies: Any = None,
-                 headers: Mapping[str, str] | None = None, chat_fn_index: int | None = None,
-                 battle_fn_index: int | None = None, impersonate: str = "chrome124") -> None:
-        self.transport = ArenaTransport(base_url, cookies=cookies, headers=headers, impersonate=impersonate)
-        self.chat_fn_index, self.battle_fn_index = chat_fn_index, battle_fn_index
+    def __init__(
+        self,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        cookies: CookieInput = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        http2: bool = True,
+        verify: bool | str = True,
+        chat_fn_index: int | None = None,
+        battle_fn_index: int | None = None,
+        chat_payload_factory: ChatPayloadFactory | None = None,
+        battle_payload_factory: BattlePayloadFactory | None = None,
+        http_transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self.transport = ArenaTransport(
+            base_url,
+            cookies=cookies,
+            headers=headers,
+            timeout=timeout,
+            http2=http2,
+            verify=verify,
+            http_transport=http_transport,
+        )
+        self.chat_fn_index = chat_fn_index
+        self.battle_fn_index = battle_fn_index
+        self.chat_payload_factory = chat_payload_factory
+        self.battle_payload_factory = battle_payload_factory
         self._config: Mapping[str, Any] | None = None
 
-    def __enter__(self) -> "ArenaClient":
+    def __enter__(self) -> ArenaClient:  # noqa: PYI034 - Self is not in typing until Python 3.11
         return self
 
-    def __exit__(self, *_: Any) -> None:
+    def __exit__(self, *_: object) -> None:
         self.close()
 
     def close(self) -> None:
@@ -130,126 +465,218 @@ class ArenaClient:
             self._config = value
         return self._config
 
-    def get_models(self) -> list[ModelInfo]:
-        # Deployments increasingly provide an explicit endpoint; fall back to
-        # config scanning so old public Gradio spaces remain usable.
-        for path in ("/api/v1/models", "/models"):
-            try:
-                payload = self.transport.get_json(path)
-            except Exception:
-                continue
-            raw = payload.get("data", payload.get("models", [])) if isinstance(payload, Mapping) else payload
-            if isinstance(raw, list):
-                return [ModelInfo(id=str(x.get("id", x.get("name"))), display_name=x.get("display_name", x.get("name")), metadata=dict(x)) if isinstance(x, Mapping) else ModelInfo(id=str(x)) for x in raw]
-        return _models_from_config(self.config())
+    def get_models(self, *, refresh: bool = False) -> list[ModelInfo]:
+        return _models_from_config(self.config(refresh=refresh))
 
     def get_endpoint(self, purpose: str = "chat") -> QueueEndpoint:
-        """Return the selected queue endpoint for diagnostics or custom calls."""
-        return QueueEndpoint(fn_index=self._fn_index(purpose))
-
-    def _fn_index(self, purpose: str) -> int:
+        if purpose not in {"chat", "battle"}:
+            raise ValueError("purpose must be 'chat' or 'battle'")
         explicit = self.chat_fn_index if purpose == "chat" else self.battle_fn_index
-        return explicit if explicit is not None else _find_fn_index(self.config(), purpose)
+        config = None if explicit is not None else self.config()
+        return self._selected_endpoint(purpose, config)
 
-    def _queue(self, fn_index: int, data: list[Any], timeout: float) -> Iterator[tuple[str, Any]]:
+    def _queue(
+        self,
+        fn_index: int,
+        data: Sequence[Any],
+        timeout: float,
+    ) -> Iterator[tuple[str, Any]]:
+        if fn_index < 0:
+            raise ValueError("fn_index must be non-negative")
         session_hash = _session_hash()
-        joined = self.transport.post_json(QUEUE_JOIN_PATH, {"data": data, "fn_index": fn_index, "session_hash": session_hash})
-        if isinstance(joined, Mapping) and joined.get("error"):
-            raise ProtocolError("Arena queue rejected request: %s" % joined["error"])
+        joined = self.transport.post_json(
+            QUEUE_JOIN_PATH,
+            {"data": list(data), "fn_index": fn_index, "session_hash": session_hash},
+        )
+        self._check_join(joined)
         yielded = False
-        for item in self.transport.sse(QUEUE_DATA_PATH, params={"session_hash": session_hash}, timeout=timeout):
+        for event in self.transport.sse(
+            QUEUE_DATA_PATH,
+            params={"session_hash": session_hash},
+            timeout=timeout,
+        ):
             yielded = True
-            yield item
+            yield event
         if not yielded:
-            raise QueueTimeoutError("Queue stream closed without events.")
+            raise QueueTimeoutError("Queue stream closed without returning any events.")
 
-    @staticmethod
-    def _chat_payload(prompt: str, model: str | None, config: GenerationConfig) -> list[Any]:
-        # This is the standard Gradio chat call shape. `extra` lets callers
-        # supply deployment-specific dropdown/state fields without forked code.
-        data: list[Any] = [prompt]
-        if model is not None:
-            data.append(model)
-        data.append(None)  # multimodal attachment slot used by current Gradio UI
-        data.append(config.extra)
-        return data
-
-    def stream(self, prompt: str, *, model: str | None = None, config: GenerationConfig | None = None) -> Iterator[StreamChunk]:
-        config = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
-        previous = ""
-        for event_name, event in self._queue(self._fn_index("chat"), self._chat_payload(prompt, model, config), config.queue_timeout):
-            text = _assistant_text(event)
-            if text is None:
-                if _terminal(event):
-                    yield StreamChunk(text=previous, delta="", event="completed", finished=True, raw=event)
-                    return
-                continue
-            # Some queue versions send the full response; a few send deltas.
-            full = text if text.startswith(previous) else previous + text
-            delta = full[len(previous):]
-            previous = full
-            if delta:
-                yield StreamChunk(text=full, delta=delta, event=event_name, raw=event)
-            if _terminal(event):
-                yield StreamChunk(text=full, delta="", event="completed", finished=True, raw=event)
-                return
-
-    def stream_queue(self, data: list[Any], *, fn_index: int, timeout: float = DEFAULT_QUEUE_TIMEOUT) -> Iterator[tuple[str, Any]]:
-        """Run a deployment-specific callback without discarding raw Gradio events.
-
-        Use this escape hatch when an Arena UI revision changes its callback
-        argument order. It remains fully queue/SSE based and exposes no private
-        browser state beyond the session explicitly supplied to this client.
-        """
+    def stream_queue(
+        self,
+        data: Sequence[Any],
+        *,
+        fn_index: int,
+        timeout: float = DEFAULT_QUEUE_TIMEOUT,
+    ) -> Iterator[tuple[str, Any]]:
+        """Yield raw queue events for a callback with a custom input schema."""
         yield from self._queue(fn_index, data, timeout)
 
-    def complete(self, prompt: str, *, model: str | None = None, config: GenerationConfig | None = None) -> str:
-        return "".join(chunk.delta for chunk in self.stream(prompt, model=model, config=config))
+    def stream(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        config: GenerationConfig | None = None,
+        history: Sequence[Message] = (),
+    ) -> Iterator[StreamChunk]:
+        generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
+        endpoint = self._selected_endpoint(
+            "chat", None if self.chat_fn_index is not None else self.config()
+        )
+        data = self._chat_data(prompt, model, generation, history)
+        previous = ""
+        for event_name, event in self._queue(
+            endpoint.fn_index, data, generation.queue_timeout
+        ):
+            _check_queue_event(event_name, event)
+            update = _assistant_text(event)
+            if update is not None:
+                full, delta = _merge_text(previous, update)
+                previous = full
+                if delta:
+                    yield StreamChunk(
+                        text=full, delta=delta, event=event_name, raw=event
+                    )
+            if _terminal(event):
+                yield StreamChunk(
+                    text=previous, delta="", event="completed", finished=True, raw=event
+                )
+                return
+        raise QueueTimeoutError(
+            "Queue stream ended before a completion event was received."
+        )
 
-    def chat(self, *, model: str | None = None, config: GenerationConfig | None = None) -> "ChatSession":
+    def complete(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        config: GenerationConfig | None = None,
+    ) -> str:
+        return "".join(
+            chunk.delta for chunk in self.stream(prompt, model=model, config=config)
+        )
+
+    def chat(
+        self,
+        *,
+        model: str | None = None,
+        config: GenerationConfig | None = None,
+    ) -> ChatSession:
         from .session import ChatSession
+
         return ChatSession(self, model=model, config=config)
 
-    def battle(self, prompt: str, *, left_model: str | None = None, right_model: str | None = None,
-               config: GenerationConfig | None = None) -> BattleResponse:
-        config = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
-        texts: list[str] = []
-        data = [prompt, left_model, right_model, None, config.extra]
-        for _, event in self._queue(self._fn_index("battle"), data, config.queue_timeout):
-            payload = event.get("output", event) if isinstance(event, Mapping) else event
-            values = payload.get("data", []) if isinstance(payload, Mapping) else []
-            if isinstance(values, list):
-                found: list[str] = []
-                for value in values:
-                    text = _assistant_text({"output": {"data": [value]}})
-                    if text:
-                        found.append(text)
-                if len(found) >= 2:
-                    texts = found[-2:]
-        if len(texts) < 2:
-            raise ProtocolError("Battle queue did not yield two responses.")
-        return BattleResponse(texts[0], texts[1], left_model, right_model)
+    def stream_battle(
+        self,
+        prompt: str,
+        *,
+        left_model: str | None = None,
+        right_model: str | None = None,
+        config: GenerationConfig | None = None,
+    ) -> Iterator[BattleStreamChunk]:
+        generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
+        endpoint = self._selected_endpoint(
+            "battle", None if self.battle_fn_index is not None else self.config()
+        )
+        data = self._battle_data(prompt, left_model, right_model, generation)
+        left = right = ""
+        for event_name, event in self._queue(
+            endpoint.fn_index, data, generation.queue_timeout
+        ):
+            _check_queue_event(event_name, event)
+            pair = _battle_texts(event)
+            if pair is not None:
+                new_left, left_delta = _merge_text(left, pair[0])
+                new_right, right_delta = _merge_text(right, pair[1])
+                left, right = new_left, new_right
+                if left_delta or right_delta:
+                    yield BattleStreamChunk(
+                        left_text=left,
+                        right_text=right,
+                        left_delta=left_delta,
+                        right_delta=right_delta,
+                        event=event_name,
+                        raw=event,
+                    )
+            if _terminal(event):
+                yield BattleStreamChunk(
+                    left, right, event="completed", finished=True, raw=event
+                )
+                return
+        raise QueueTimeoutError(
+            "Battle queue ended before a completion event was received."
+        )
+
+    def battle(
+        self,
+        prompt: str,
+        *,
+        left_model: str | None = None,
+        right_model: str | None = None,
+        config: GenerationConfig | None = None,
+    ) -> BattleResponse:
+        chunks = self.stream_battle(
+            prompt,
+            left_model=left_model,
+            right_model=right_model,
+            config=config,
+        )
+        final: BattleStreamChunk | None = None
+        for chunk in chunks:
+            if chunk.finished:
+                final = chunk
+        if final is None:
+            raise ProtocolError("Battle stream produced no terminal chunk.")
+        if not final.left_text or not final.right_text:
+            raise ProtocolError(
+                "Battle queue completed without two non-empty responses."
+            )
+        return BattleResponse(
+            final.left_text, final.right_text, left_model, right_model
+        )
 
 
-class AsyncArenaClient(ArenaClient):
-    """Async API with the same semantics as :class:`ArenaClient`."""
-    # Keep the public API explicit instead of silently returning blocking values.
-    def __init__(self, **kwargs: Any) -> None:
-        base_url = kwargs.pop("base_url", DEFAULT_BASE_URL)
-        cookies, headers = kwargs.pop("cookies", None), kwargs.pop("headers", None)
-        self.chat_fn_index = kwargs.pop("chat_fn_index", None)
-        self.battle_fn_index = kwargs.pop("battle_fn_index", None)
-        self.transport = AsyncArenaTransport(base_url, cookies=cookies, headers=headers, impersonate=kwargs.pop("impersonate", "chrome124"))
-        self._config = None
+class AsyncArenaClient(_ArenaClientMixin):
+    """Async client with parity to :class:`ArenaClient`."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        cookies: CookieInput = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        http2: bool = True,
+        verify: bool | str = True,
+        chat_fn_index: int | None = None,
+        battle_fn_index: int | None = None,
+        chat_payload_factory: ChatPayloadFactory | None = None,
+        battle_payload_factory: BattlePayloadFactory | None = None,
+        http_transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.transport = AsyncArenaTransport(
+            base_url,
+            cookies=cookies,
+            headers=headers,
+            timeout=timeout,
+            http2=http2,
+            verify=verify,
+            http_transport=http_transport,
+        )
+        self.chat_fn_index = chat_fn_index
+        self.battle_fn_index = battle_fn_index
+        self.chat_payload_factory = chat_payload_factory
+        self.battle_payload_factory = battle_payload_factory
+        self._config: Mapping[str, Any] | None = None
+
+    async def __aenter__(self) -> AsyncArenaClient:  # noqa: PYI034 - Self is not in typing until Python 3.11
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
 
     async def aclose(self) -> None:
         await self.transport.close()
-
-    async def __aenter__(self) -> "AsyncArenaClient":
-        return self
-
-    async def __aexit__(self, *_: Any) -> None:
-        await self.aclose()
 
     async def config(self, *, refresh: bool = False) -> Mapping[str, Any]:
         if refresh or self._config is None:
@@ -259,37 +686,175 @@ class AsyncArenaClient(ArenaClient):
             self._config = value
         return self._config
 
-    async def get_models(self) -> list[ModelInfo]:
-        # Keep the async method non-blocking; config is the stable public source
-        # available across Gradio deployments.
-        return _models_from_config(await self.config())
+    async def get_models(self, *, refresh: bool = False) -> list[ModelInfo]:
+        return _models_from_config(await self.config(refresh=refresh))
 
     async def get_endpoint(self, purpose: str = "chat") -> QueueEndpoint:
+        if purpose not in {"chat", "battle"}:
+            raise ValueError("purpose must be 'chat' or 'battle'")
         explicit = self.chat_fn_index if purpose == "chat" else self.battle_fn_index
-        return QueueEndpoint(fn_index=explicit if explicit is not None else _find_fn_index(await self.config(), purpose))
+        config = None if explicit is not None else await self.config()
+        return self._selected_endpoint(purpose, config)
 
-    async def astream(self, prompt: str, *, model: str | None = None, config: GenerationConfig | None = None) -> AsyncIterator[StreamChunk]:
-        config = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
-        index = self.chat_fn_index if self.chat_fn_index is not None else _find_fn_index(await self.config(), "chat")
+    async def _queue(
+        self,
+        fn_index: int,
+        data: Sequence[Any],
+        timeout: float,
+    ) -> AsyncIterator[tuple[str, Any]]:
+        if fn_index < 0:
+            raise ValueError("fn_index must be non-negative")
         session_hash = _session_hash()
-        joined = await self.transport.post_json(QUEUE_JOIN_PATH, {"data": self._chat_payload(prompt, model, config), "fn_index": index, "session_hash": session_hash})
-        if isinstance(joined, Mapping) and joined.get("error"):
-            raise ProtocolError("Arena queue rejected request: %s" % joined["error"])
+        joined = await self.transport.post_json(
+            QUEUE_JOIN_PATH,
+            {"data": list(data), "fn_index": fn_index, "session_hash": session_hash},
+        )
+        self._check_join(joined)
+        yielded = False
+        async for event in self.transport.sse(
+            QUEUE_DATA_PATH,
+            params={"session_hash": session_hash},
+            timeout=timeout,
+        ):
+            yielded = True
+            yield event
+        if not yielded:
+            raise QueueTimeoutError("Queue stream closed without returning any events.")
+
+    async def stream_queue(
+        self,
+        data: Sequence[Any],
+        *,
+        fn_index: int,
+        timeout: float = DEFAULT_QUEUE_TIMEOUT,
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """Yield raw queue events for a callback with a custom input schema."""
+        async for event in self._queue(fn_index, data, timeout):
+            yield event
+
+    async def astream(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        config: GenerationConfig | None = None,
+        history: Sequence[Message] = (),
+    ) -> AsyncIterator[StreamChunk]:
+        generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
+        endpoint = self._selected_endpoint(
+            "chat", None if self.chat_fn_index is not None else await self.config()
+        )
+        data = self._chat_data(prompt, model, generation, history)
         previous = ""
-        async for event_name, event in self.transport.sse(QUEUE_DATA_PATH, params={"session_hash": session_hash}, timeout=config.queue_timeout):
-            text = _assistant_text(event)
-            if text is not None:
-                full = text if text.startswith(previous) else previous + text
-                delta, previous = full[len(previous):], full
+        async for event_name, event in self._queue(
+            endpoint.fn_index, data, generation.queue_timeout
+        ):
+            _check_queue_event(event_name, event)
+            update = _assistant_text(event)
+            if update is not None:
+                full, delta = _merge_text(previous, update)
+                previous = full
                 if delta:
-                    yield StreamChunk(text=full, delta=delta, event=event_name, raw=event)
+                    yield StreamChunk(
+                        text=full, delta=delta, event=event_name, raw=event
+                    )
             if _terminal(event):
-                yield StreamChunk(text=previous, delta="", event="completed", finished=True, raw=event)
+                yield StreamChunk(
+                    text=previous, delta="", event="completed", finished=True, raw=event
+                )
                 return
+        raise QueueTimeoutError(
+            "Queue stream ended before a completion event was received."
+        )
 
-    async def acomplete(self, prompt: str, *, model: str | None = None, config: GenerationConfig | None = None) -> str:
-        return "".join([chunk.delta async for chunk in self.astream(prompt, model=model, config=config)])
+    async def acomplete(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        config: GenerationConfig | None = None,
+    ) -> str:
+        return "".join(
+            [
+                chunk.delta
+                async for chunk in self.astream(prompt, model=model, config=config)
+            ]
+        )
 
-    def chat(self, *, model: str | None = None, config: GenerationConfig | None = None) -> "AsyncChatSession":
+    def chat(
+        self,
+        *,
+        model: str | None = None,
+        config: GenerationConfig | None = None,
+    ) -> AsyncChatSession:
         from .session import AsyncChatSession
+
         return AsyncChatSession(self, model=model, config=config)
+
+    async def astream_battle(
+        self,
+        prompt: str,
+        *,
+        left_model: str | None = None,
+        right_model: str | None = None,
+        config: GenerationConfig | None = None,
+    ) -> AsyncIterator[BattleStreamChunk]:
+        generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
+        endpoint = self._selected_endpoint(
+            "battle", None if self.battle_fn_index is not None else await self.config()
+        )
+        data = self._battle_data(prompt, left_model, right_model, generation)
+        left = right = ""
+        async for event_name, event in self._queue(
+            endpoint.fn_index, data, generation.queue_timeout
+        ):
+            _check_queue_event(event_name, event)
+            pair = _battle_texts(event)
+            if pair is not None:
+                new_left, left_delta = _merge_text(left, pair[0])
+                new_right, right_delta = _merge_text(right, pair[1])
+                left, right = new_left, new_right
+                if left_delta or right_delta:
+                    yield BattleStreamChunk(
+                        left_text=left,
+                        right_text=right,
+                        left_delta=left_delta,
+                        right_delta=right_delta,
+                        event=event_name,
+                        raw=event,
+                    )
+            if _terminal(event):
+                yield BattleStreamChunk(
+                    left, right, event="completed", finished=True, raw=event
+                )
+                return
+        raise QueueTimeoutError(
+            "Battle queue ended before a completion event was received."
+        )
+
+    async def abattle(
+        self,
+        prompt: str,
+        *,
+        left_model: str | None = None,
+        right_model: str | None = None,
+        config: GenerationConfig | None = None,
+    ) -> BattleResponse:
+        final: BattleStreamChunk | None = None
+        async for chunk in self.astream_battle(
+            prompt,
+            left_model=left_model,
+            right_model=right_model,
+            config=config,
+        ):
+            if chunk.finished:
+                final = chunk
+        if final is None:
+            raise ProtocolError("Battle stream produced no terminal chunk.")
+        if not final.left_text or not final.right_text:
+            raise ProtocolError(
+                "Battle queue completed without two non-empty responses."
+            )
+        return BattleResponse(
+            final.left_text, final.right_text, left_model, right_model
+        )

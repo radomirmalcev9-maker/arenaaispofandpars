@@ -1,15 +1,75 @@
-"""Unofficial, cookie-authenticated client for Gradio-based Arena frontends."""
+"""Unofficial, cookie-authenticated sync/async clients for Arena frontends.
+
+This package uses caller-provided credentials and does not bypass browser
+verification challenges. See the project README for protocol caveats.
+"""
 
 from .client import ArenaClient, AsyncArenaClient
-from .direct import AsyncDirectArenaClient, DirectArenaClient, DirectChatSession
-from .exceptions import ArenaError, AuthenticationError, ChallengeRequiredError, ModelUnavailableError, ProtocolError, QueueTimeoutError, RateLimitError
-from .models import BattleResponse, GenerationConfig, Message, ModelInfo, QueueEndpoint, StreamChunk
+from .direct import (
+    AsyncDirectArenaClient,
+    AsyncDirectChatSession,
+    DirectArenaClient,
+    DirectChatSession,
+)
+from .exceptions import (
+    ArenaError,
+    AuthenticationError,
+    ChallengeRequiredError,
+    ModelUnavailableError,
+    ProtocolError,
+    QueueTimeoutError,
+    RateLimitError,
+)
+from .models import (
+    BattleResponse,
+    BattleStreamChunk,
+    GenerationConfig,
+    Message,
+    ModelInfo,
+    QueueEndpoint,
+    StreamChunk,
+)
 from .session import AsyncChatSession, ChatSession
+from .transport import (
+    ArenaTransport,
+    AsyncArenaTransport,
+    SSEParser,
+    normalize_cookies,
+    parse_cookie_header,
+)
+
+# Short aliases for applications that do not need to distinguish the backend.
+Client = ArenaClient
+AsyncClient = AsyncArenaClient
 
 __all__ = [
-    "ArenaClient", "AsyncArenaClient", "DirectArenaClient", "AsyncDirectArenaClient", "DirectChatSession", "ChatSession", "AsyncChatSession", "ArenaError",
-    "AuthenticationError", "ChallengeRequiredError", "QueueTimeoutError", "ModelUnavailableError",
-    "RateLimitError", "ProtocolError", "ModelInfo", "Message",
-    "GenerationConfig", "StreamChunk", "BattleResponse", "QueueEndpoint",
+    "ArenaClient",
+    "ArenaError",
+    "ArenaTransport",
+    "AsyncArenaClient",
+    "AsyncArenaTransport",
+    "AsyncChatSession",
+    "AsyncClient",
+    "AsyncDirectArenaClient",
+    "AsyncDirectChatSession",
+    "AuthenticationError",
+    "BattleResponse",
+    "BattleStreamChunk",
+    "ChallengeRequiredError",
+    "ChatSession",
+    "Client",
+    "DirectArenaClient",
+    "DirectChatSession",
+    "GenerationConfig",
+    "Message",
+    "ModelInfo",
+    "ModelUnavailableError",
+    "ProtocolError",
+    "QueueEndpoint",
+    "QueueTimeoutError",
+    "RateLimitError",
+    "SSEParser",
+    "StreamChunk",
+    "normalize_cookies",
+    "parse_cookie_header",
 ]
-
