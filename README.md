@@ -4,7 +4,7 @@
 
 > Arena не предоставляет стабильный публичный API для всех этих маршрутов. Эндпоинты, очереди, порядок callback-аргументов и формат стрима могут измениться без предупреждения. Используйте клиент только в соответствии с правилами сервиса и имеющимися у вас правами доступа.
 >
-> Библиотека использует только переданные вами cookie/заголовки и, для Direct Chat, явно переданную вами verification assertion. Она **не** получает сессионные данные из браузера, не решает CAPTCHA и не обходит Cloudflare, Turnstile или другие проверки. При challenge выбрасывается `ChallengeRequiredError`; завершите проверку в обычном браузере и обновите свою сессию.
+> Библиотека использует переданные вами cookie/заголовки и, для Direct Chat, явно переданную вами verification assertion; по явному запросу (`session_source="firefox"`) она может читать сессию из вашего локального профиля Firefox (см. ниже). Она **не** решает CAPTCHA и не обходит Cloudflare, Turnstile или другие проверки: при challenge (`ChallengeRequiredError`) проверку проходите вы в обычном браузере — с Firefox-сессией клиент дождётся этого, перечитает cookie и повторит запрос.
 
 ## Установка
 
@@ -52,6 +52,54 @@ with ArenaClient(cookies="./cookies.json") as arena:
 Поддерживается также объект `{"cookies": [...]}` или экспорт `{"cookie": "a=b; c=d"}`. Атрибуты domain/path из JSON не переносятся в cookie jar `httpx`; клиент передаёт нормализованные имена и значения в запросы к заданному `base_url`. Не помещайте реальные cookie или токены в репозиторий, логи и issue.
 
 По умолчанию `base_url="https://arena.ai"`; можно указать другой разрешённый frontend/backend, например `https://lmarena.ai`. Статические дополнительные заголовки передаются через `headers={...}`. User-Agent по умолчанию идентифицирует библиотеку как `arena-api`.
+
+## Сессия из локального Firefox (`session_source="firefox"`)
+
+Вместо ручного экспорта cookie можно переиспользовать сессию вашего Firefox: клиент читает авторизационные cookie из локального профиля и сам формирует согласованные с браузером заголовки.
+
+```python
+from arena_api import ArenaClient
+
+with ArenaClient(session_source="firefox") as arena:
+    print(arena.get_models())
+```
+
+Как это работает:
+
+- **Извлечение cookie** — через `rookiepy` (`python -m pip install '.[firefox]'`): `rookiepy.firefox(domains=["arena.ai", "lmarena.ai"])` и нормализация записей в плоский `dict[str, str]`, готовый для прямой передачи в `curl_cffi.requests.Session` или `httpx.Client`. Если `rookiepy` не установлен, cookie-база заблокирована запущенным Firefox (SQLite lock) или вернула пустой результат, включается встроенный fallback без внешних зависимостей: снимок `cookies.sqlite` вместе с `-wal`/`-shm` во временную папку и чтение через стандартный `sqlite3` — без борьбы за блокировки с браузером. Профиль по умолчанию определяется по `profiles.ini` (секция `[Install...]` → `Default`, затем профиль с `Default=1`), с fallback'ом на каталог `*.default-release` и, в крайнем случае, на профиль с самым свежим `cookies.sqlite`.
+- **Заголовки** — `FirefoxSessionManager.firefox_headers()` строит User-Agent под текущую ОС и версию Firefox из `compatibility.ini` профиля (с замороженным `rv:109.0`, как в реальном Firefox), плюс `Accept-Language` (из профиля/системы или параметр `language`), `Sec-GPC: 1` и `Sec-Fetch-*` (вариант `fetch`/XHR по умолчанию, `navigation=True` для документных запросов) — отпечаток заголовков совпадает с реальным браузером. `Accept-Encoding` не подставляется: его согласует сам HTTP-бэкенд (httpx/curl_cffi) в соответствии с доступными декодерами.
+- **403 / `ChallengeRequiredError`** — клиент печатает «Сессия устарела. Откройте arena.ai в Firefox, обновите страницу, затем нажмите Enter...», ждёт Enter, перечитывает cookie через `rookiepy` и прозрачно повторяет запрос (до `max_auth_refreshes=2` попыток по умолчанию, для sync- и async-методов, включая стримы). CAPTCHA и защиты не решаются автоматически — проверку проходите вы в обычном браузере.
+
+Cookie из Firefox перекрывают одноимённые значения из `cookies=`, а явные `headers=` перекрывают заголовки Firefox. Для headless-окружений создайте менеджер с `interactive=False` (без ожидания Enter, cookie перечитываются сразу) и передайте сам объект:
+
+```python
+from arena_api import ArenaClient
+from arena_api.auth import FirefoxSessionManager
+
+manager = FirefoxSessionManager(interactive=False, language="ru-RU")
+with ArenaClient(session_source=manager) as arena:
+    ...
+```
+
+Менеджер удобно использовать и отдельно, например с `curl_cffi`:
+
+```python
+from arena_api.auth import FirefoxSessionManager
+
+manager = FirefoxSessionManager(domains=["arena.ai", "lmarena.ai"])
+cookies = manager.load_cookies()      # {"session": "...", "cf_clearance": "..."}
+headers = manager.firefox_headers()   # User-Agent, Sec-GPC, Sec-Fetch-*, ...
+
+from curl_cffi import requests
+
+session = requests.Session(impersonate="firefox", cookies=cookies, headers=headers)
+# либо домено-зависимый экспорт:
+for domain, jar in manager.to_curl_cffi().items():
+    for name, value in jar.items():
+        session.cookies.set(name, value, domain=domain)
+```
+
+Тонкости: имена cookie от более ранних доменов в `domains` имеют приоритет при коллизиях; сессия из Firefox не «чинит» просроченный на сервере логин — перезайдите в браузере; полный листинг cookie и записей с доменами доступен через `manager.cookie_records()` / `manager.to_curl_cffi()`.
 
 ## Gradio очередь и SSE
 
@@ -159,4 +207,5 @@ with DirectArenaClient(
 
 - `example.py` — Gradio queue/SSE;
 - `example_direct.py` — Direct Chat с assertion, переданной пользователем;
-- `tests/` — офлайн unit-тесты на парсинг cookie/SSE, mapping моделей, очереди, async API и ошибки.
+- `example_firefox.py` — сессия из локального профиля Firefox;
+- `tests/` — офлайн unit-тесты на парсинг cookie/SSE, mapping моделей, очереди, async API, ошибки, Firefox-сессию и retry при 403.

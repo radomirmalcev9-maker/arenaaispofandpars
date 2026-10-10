@@ -2,17 +2,33 @@
 
 Only credentials explicitly provided by the caller are used. Browser challenges
 are reported as :class:`ChallengeRequiredError`; this transport does not solve
-or bypass Cloudflare, Turnstile, CAPTCHA, or other interactive checks.
+or bypass Cloudflare, Turnstile, CAPTCHA, or other interactive checks. When a
+``session_refresher`` hook is installed (see the ``session_source`` option of
+the clients), an authentication failure first asks that hook for fresh
+cookies — e.g. after the user re-verified in their browser — and transparently
+retries the request.
 """
 
 from __future__ import annotations
 
+import asyncio
 import codecs
 import json
 import math
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from contextlib import (
+    AbstractAsyncContextManager,
+    AbstractContextManager,
+    asynccontextmanager,
+    contextmanager,
+)
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -34,6 +50,10 @@ from .exceptions import (
 CookieInput: TypeAlias = (
     Mapping[str, Any] | str | Path | Sequence[Mapping[str, Any]] | None
 )
+# Optional hook consulted when a request fails with an auth error (HTTP 401/403
+# or a browser challenge). It returns fresh cookies to apply before retrying,
+# or None to surface the original error to the caller.
+SessionRefresher: TypeAlias = Callable[[ArenaError], Mapping[str, str] | None]
 
 
 _CHALLENGE_MARKERS = (
@@ -204,6 +224,63 @@ def _network_error(exc: httpx.RequestError, *, streaming: bool) -> ArenaError:
     return ArenaError(f"Arena network request failed ({type(exc).__name__}).")
 
 
+def _merged_default_headers(
+    headers: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Overlay caller headers on the defaults, case-insensitively.
+
+    Without this, passing ``User-Agent`` alongside the default lowercase
+    ``user-agent`` would make httpx send a comma-joined value.
+    """
+    merged = dict(DEFAULT_HEADERS)
+    if headers:
+        overridden = {str(key).lower() for key in headers}
+        for key in list(merged):
+            if str(key).lower() in overridden:
+                del merged[key]
+        merged.update(headers)
+    return merged
+
+
+def _validate_max_auth_refreshes(value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("max_auth_refreshes must be a non-negative integer")
+
+
+class _SyncStream:
+    """An already entered httpx stream context awaiting consumption."""
+
+    __slots__ = ("_context", "response")
+
+    def __init__(
+        self,
+        context: AbstractContextManager[httpx.Response],
+        response: httpx.Response,
+    ) -> None:
+        self._context = context
+        self.response = response
+
+    def close(self) -> None:
+        self._context.__exit__(None, None, None)
+
+
+class _AsyncStream:
+    """Async counterpart of :class:`_SyncStream`."""
+
+    __slots__ = ("_context", "response")
+
+    def __init__(
+        self,
+        context: AbstractAsyncContextManager[httpx.Response],
+        response: httpx.Response,
+    ) -> None:
+        self._context = context
+        self.response = response
+
+    async def close(self) -> None:
+        await self._context.__aexit__(None, None, None)
+
+
 class SSEParser:
     """Incremental SSE decoder that tolerates arbitrary byte boundaries.
 
@@ -288,28 +365,39 @@ class SSEParser:
 
 
 class ArenaTransport:
-    """Synchronous HTTP/2-capable transport backed by ``httpx``."""
+    """Synchronous HTTP/2-capable transport backed by ``httpx``.
+
+    ``session_cookies`` holds the browser-session cookie set (it overlays
+    ``cookies``); ``session_refresher`` is consulted on auth failures to
+    refresh that set before a transparent retry.
+    """
 
     def __init__(
         self,
         base_url: str,
         *,
         cookies: CookieInput = None,
+        session_cookies: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
         verify: bool | str = True,
         http_transport: httpx.BaseTransport | None = None,
+        session_refresher: SessionRefresher | None = None,
+        max_auth_refreshes: int = 2,
     ) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a finite, positive number")
+        _validate_max_auth_refreshes(max_auth_refreshes)
         self.base_url = _normalize_base_url(base_url)
-        merged_headers = dict(DEFAULT_HEADERS)
-        if headers:
-            merged_headers.update(headers)
+        merged_headers = _merged_default_headers(headers)
+        self._base_cookies = normalize_cookies(cookies)
+        self._session_cookies: dict[str, str] = dict(session_cookies or {})
+        self._session_refresher = session_refresher
+        self._max_auth_refreshes = max_auth_refreshes
         self.session = httpx.Client(
             headers=merged_headers,
-            cookies=normalize_cookies(cookies),
+            cookies=self._effective_cookies(),
             timeout=httpx.Timeout(timeout),
             http2=http2,
             verify=verify,
@@ -321,18 +409,52 @@ class ArenaTransport:
     def url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    def _effective_cookies(self) -> dict[str, str]:
+        """Caller-supplied cookies overlaid with the browser-session set."""
+        merged = dict(self._base_cookies)
+        merged.update(self._session_cookies)
+        return merged
+
+    def _apply_session_cookies(self, cookies: Mapping[str, str]) -> None:
+        """Replace the browser-session set; cookies removed browser-side drop out."""
+        self._session_cookies = dict(cookies)
+        self.session.cookies = httpx.Cookies(self._effective_cookies())
+
+    def _refresh_after_auth_error(self, error: AuthenticationError) -> bool:
+        """Ask the session source for fresh cookies; report whether to retry."""
+        if self._session_refresher is None:
+            return False
+        fresh = self._session_refresher(error)
+        if not isinstance(fresh, Mapping) or not fresh:
+            return False
+        self._apply_session_cookies(fresh)
+        return True
+
+    def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Perform one request attempt, mapping transport-level failures."""
         try:
             response = self.session.request(method, self.url(path), **kwargs)
         except httpx.RequestError as exc:
             raise _network_error(exc, streaming=False) from exc
         _check_sync_response(response)
+        _raise_if_challenge_page(response.text, response.headers)
         return response
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        attempts = self._max_auth_refreshes + 1
+        for attempt in range(attempts):
+            try:
+                return self._send(method, path, **kwargs)
+            except AuthenticationError as error:
+                if (
+                    attempt + 1 >= attempts
+                    or not self._refresh_after_auth_error(error)
+                ):
+                    raise
+        raise AssertionError("retry loop must return or raise")  # pragma: no cover
 
     def get_json(self, path: str, **kwargs: Any) -> Any:
         response = self._request("GET", path, **kwargs)
-        body = response.text
-        _raise_if_challenge_page(body, response.headers)
         try:
             return response.json()
         except (ValueError, json.JSONDecodeError) as exc:
@@ -348,12 +470,10 @@ class ArenaTransport:
 
     def get_text(self, path: str, **kwargs: Any) -> str:
         response = self._request("GET", path, **kwargs)
-        _raise_if_challenge_page(response.text, response.headers)
         return response.text
 
     def post_json(self, path: str, payload: Mapping[str, Any], **kwargs: Any) -> Any:
         response = self._request("POST", path, json=dict(payload), **kwargs)
-        _raise_if_challenge_page(response.text, response.headers)
         try:
             return response.json()
         except (ValueError, json.JSONDecodeError) as exc:
@@ -368,8 +488,30 @@ class ArenaTransport:
         streaming_timeout: bool = True,
         **kwargs: Any,
     ) -> Iterator[httpx.Response]:
+        stream: _SyncStream | None = None
         try:
-            with self.session.stream(method, self.url(path), **kwargs) as response:
+            stream = self._acquire_stream(method, path, kwargs)
+            yield stream.response
+        except httpx.RequestError as exc:
+            raise _network_error(exc, streaming=streaming_timeout) from exc
+        finally:
+            if stream is not None:
+                stream.close()
+
+    def _acquire_stream(
+        self, method: str, path: str, kwargs: dict[str, Any]
+    ) -> _SyncStream:
+        """Open a stream response, refreshing the session on auth errors.
+
+        Status and content-type validation happens before the response is
+        yielded, so a 401/403 or a challenge page can still be retried with
+        refreshed cookies without the consumer noticing.
+        """
+        attempts = self._max_auth_refreshes + 1
+        for attempt in range(attempts):
+            context = self.session.stream(method, self.url(path), **kwargs)
+            response = context.__enter__()
+            try:
                 _check_sync_response(response, streaming=True)
                 content_type = response.headers.get("content-type", "").lower()
                 if "text/html" in content_type:
@@ -378,9 +520,19 @@ class ArenaTransport:
                     raise ProtocolError(
                         f"Expected a streaming response from {path}, received HTML."
                     )
-                yield response
-        except httpx.RequestError as exc:
-            raise _network_error(exc, streaming=streaming_timeout) from exc
+            except AuthenticationError as error:
+                context.__exit__(AuthenticationError, error, error.__traceback__)
+                if (
+                    attempt + 1 < attempts
+                    and self._refresh_after_auth_error(error)
+                ):
+                    continue
+                raise
+            except BaseException as error:
+                context.__exit__(type(error), error, error.__traceback__)
+                raise
+            return _SyncStream(context, response)
+        raise AssertionError("retry loop must return or raise")  # pragma: no cover
 
     def sse(
         self,
@@ -436,28 +588,39 @@ class ArenaTransport:
 
 
 class AsyncArenaTransport:
-    """Asynchronous HTTP/2-capable transport backed by ``httpx``."""
+    """Asynchronous HTTP/2-capable transport backed by ``httpx``.
+
+    Accepts the same session refresh options as :class:`ArenaTransport`; the
+    (potentially blocking, console-interactive) refresher runs in a worker
+    thread so the event loop stays responsive.
+    """
 
     def __init__(
         self,
         base_url: str,
         *,
         cookies: CookieInput = None,
+        session_cookies: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
         verify: bool | str = True,
         http_transport: httpx.AsyncBaseTransport | None = None,
+        session_refresher: SessionRefresher | None = None,
+        max_auth_refreshes: int = 2,
     ) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a finite, positive number")
+        _validate_max_auth_refreshes(max_auth_refreshes)
         self.base_url = _normalize_base_url(base_url)
-        merged_headers = dict(DEFAULT_HEADERS)
-        if headers:
-            merged_headers.update(headers)
+        merged_headers = _merged_default_headers(headers)
+        self._base_cookies = normalize_cookies(cookies)
+        self._session_cookies: dict[str, str] = dict(session_cookies or {})
+        self._session_refresher = session_refresher
+        self._max_auth_refreshes = max_auth_refreshes
         self.session = httpx.AsyncClient(
             headers=merged_headers,
-            cookies=normalize_cookies(cookies),
+            cookies=self._effective_cookies(),
             timeout=httpx.Timeout(timeout),
             http2=http2,
             verify=verify,
@@ -469,17 +632,52 @@ class AsyncArenaTransport:
     def url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    def _effective_cookies(self) -> dict[str, str]:
+        """Caller-supplied cookies overlaid with the browser-session set."""
+        merged = dict(self._base_cookies)
+        merged.update(self._session_cookies)
+        return merged
+
+    def _apply_session_cookies(self, cookies: Mapping[str, str]) -> None:
+        """Replace the browser-session set; cookies removed browser-side drop out."""
+        self._session_cookies = dict(cookies)
+        self.session.cookies = httpx.Cookies(self._effective_cookies())
+
+    async def _refresh_after_auth_error(self, error: AuthenticationError) -> bool:
+        """Run the (blocking) refresher in a worker thread; report whether to retry."""
+        if self._session_refresher is None:
+            return False
+        fresh = await asyncio.to_thread(self._session_refresher, error)
+        if not isinstance(fresh, Mapping) or not fresh:
+            return False
+        self._apply_session_cookies(fresh)
+        return True
+
+    async def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Perform one request attempt, mapping transport-level failures."""
         try:
             response = await self.session.request(method, self.url(path), **kwargs)
         except httpx.RequestError as exc:
             raise _network_error(exc, streaming=False) from exc
         _check_sync_response(response)
+        _raise_if_challenge_page(response.text, response.headers)
         return response
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        attempts = self._max_auth_refreshes + 1
+        for attempt in range(attempts):
+            try:
+                return await self._send(method, path, **kwargs)
+            except AuthenticationError as error:
+                if (
+                    attempt + 1 >= attempts
+                    or not await self._refresh_after_auth_error(error)
+                ):
+                    raise
+        raise AssertionError("retry loop must return or raise")  # pragma: no cover
 
     async def get_json(self, path: str, **kwargs: Any) -> Any:
         response = await self._request("GET", path, **kwargs)
-        _raise_if_challenge_page(response.text, response.headers)
         try:
             return response.json()
         except (ValueError, json.JSONDecodeError) as exc:
@@ -495,14 +693,12 @@ class AsyncArenaTransport:
 
     async def get_text(self, path: str, **kwargs: Any) -> str:
         response = await self._request("GET", path, **kwargs)
-        _raise_if_challenge_page(response.text, response.headers)
         return response.text
 
     async def post_json(
         self, path: str, payload: Mapping[str, Any], **kwargs: Any
     ) -> Any:
         response = await self._request("POST", path, json=dict(payload), **kwargs)
-        _raise_if_challenge_page(response.text, response.headers)
         try:
             return response.json()
         except (ValueError, json.JSONDecodeError) as exc:
@@ -517,10 +713,30 @@ class AsyncArenaTransport:
         streaming_timeout: bool = True,
         **kwargs: Any,
     ) -> AsyncIterator[httpx.Response]:
+        stream: _AsyncStream | None = None
         try:
-            async with self.session.stream(
-                method, self.url(path), **kwargs
-            ) as response:
+            stream = await self._acquire_stream(method, path, kwargs)
+            yield stream.response
+        except httpx.RequestError as exc:
+            raise _network_error(exc, streaming=streaming_timeout) from exc
+        finally:
+            if stream is not None:
+                await stream.close()
+
+    async def _acquire_stream(
+        self, method: str, path: str, kwargs: dict[str, Any]
+    ) -> _AsyncStream:
+        """Open a stream response, refreshing the session on auth errors.
+
+        Status and content-type validation happens before the response is
+        yielded, so a 401/403 or a challenge page can still be retried with
+        refreshed cookies without the consumer noticing.
+        """
+        attempts = self._max_auth_refreshes + 1
+        for attempt in range(attempts):
+            context = self.session.stream(method, self.url(path), **kwargs)
+            response = await context.__aenter__()
+            try:
                 await _check_async_response(response)
                 content_type = response.headers.get("content-type", "").lower()
                 if "text/html" in content_type:
@@ -529,9 +745,21 @@ class AsyncArenaTransport:
                     raise ProtocolError(
                         f"Expected a streaming response from {path}, received HTML."
                     )
-                yield response
-        except httpx.RequestError as exc:
-            raise _network_error(exc, streaming=streaming_timeout) from exc
+            except AuthenticationError as error:
+                await context.__aexit__(
+                    AuthenticationError, error, error.__traceback__
+                )
+                if (
+                    attempt + 1 < attempts
+                    and await self._refresh_after_auth_error(error)
+                ):
+                    continue
+                raise
+            except BaseException as error:
+                await context.__aexit__(type(error), error, error.__traceback__)
+                raise
+            return _AsyncStream(context, response)
+        raise AssertionError("retry loop must return or raise")  # pragma: no cover
 
     async def sse(
         self,
