@@ -227,6 +227,145 @@ except ChallengeRequiredError as exc:
 
 Поддерживаемые Playwright-опции покрывают легитимную часть «нормализации окружения» без патчей: `locale` (он же `navigator.languages`), `timezone_id`, `user_agent`, `viewport`, `device_scale_factor`, `color_scheme`, `reduced_motion`.
 
+## `recaptcha_toolkit` — решение reCAPTCHA и маскировка автоматизации
+
+Отдельный пакет `recaptcha_toolkit` собирает под одним типизированным API четыре библиотеки:
+
+| Библиотека | Роль |
+| --- | --- |
+| [`playwright-recaptcha`](https://github.com/Xewdy444/Playwright-reCAPTCHA) | v2 через аудио-челлендж (Google Speech API) или картинки (CapSolver), перехват токена для v3 |
+| [`VisionAIRecaptchaSolver-0`](https://github.com/Altum-x/VisionAIRecaptchaSolver-0) | локальное решение v2/v3 на YOLO-моделях, без внешних API |
+| [`selenium-recaptcha-solver`](https://pypi.org/project/selenium-recaptcha-solver/) | решение аудио-челленджа v2 для Selenium |
+| [`playwright-stealth`](https://pypi.org/project/playwright-stealth/) | маскировка `navigator.webdriver`, языков, платформы и пр. |
+
+> **Область применения.** Пакет предназначен для автоматизированного тестирования страниц, на которые у вас есть явное разрешение: собственные стенды, staging-зоны, страницы клиентов, публичные демо-стенды вендора. Он **не** подключён к `arena_api` и не участвует ни в одном сценарии этого клиента — раздел «Что этот модуль сознательно не делает» выше остаётся в силе: позиция проекта по обходу защит не изменилась, подключение `recaptcha_toolkit` к чему-либо — полностью осознанное решение вызывающего кода. Использование против сервисов, чьи правила это запрещают, нарушает их условия.
+
+### Установка
+
+```bash
+python -m pip install ".[captcha]"            # Playwright + playwright-recaptcha + playwright-stealth
+python -m pip install ".[captcha-selenium]"   # Selenium + selenium-recaptcha-solver
+python -m pip install ".[vision]"             # YOLO-солвер (тянет ultralytics/torch)
+python -m playwright install chromium
+```
+
+Оба аудио-солвера требуют системный **FFmpeg** (`apt-get install ffmpeg` / `brew install ffmpeg`) — `pydub` конвертирует MP3 в WAV перед распознаванием.
+
+### Playwright, синхронно
+
+```python
+from recaptcha_toolkit import PlaywrightBot, SolverBackend
+
+with PlaywrightBot(backend=SolverBackend.AUDIO) as bot:
+    page = bot.new_page()
+    page.goto("https://www.google.com/recaptcha/api2/demo")
+
+    token = bot.solve_recaptcha_v2(page, wait=True, wait_timeout=30)
+    print(token)
+```
+
+reCAPTCHA v3 — браузер решает её сам, библиотека только перехватывает токен. Слушатель надо подключить **до** запроса `/recaptcha/api2/reload`, поэтому страница перезагружается внутри солвера:
+
+```python
+token = bot.solve_recaptcha_v3(page, timeout=30, reload=True)
+```
+
+### Playwright, асинхронно
+
+API зеркальный, конфигурация та же:
+
+```python
+import asyncio
+from recaptcha_toolkit import AsyncPlaywrightBot
+
+async def main() -> None:
+    async with AsyncPlaywrightBot() as bot:
+        page = await bot.new_page()
+        await page.goto("https://www.google.com/recaptcha/api2/demo")
+        print(await bot.solve_recaptcha_v2(page))
+
+asyncio.run(main())
+```
+
+### Selenium
+
+```python
+from recaptcha_toolkit import SeleniumBot
+
+with SeleniumBot.launch_chrome() as bot:
+    bot.driver.get("https://www.google.com/recaptcha/api2/demo")
+
+    iframe = bot.find_recaptcha_iframe(timeout=10)   # XPath //iframe[@title="reCAPTCHA"]
+    bot.solve_recaptcha_v2(iframe=iframe)            # внутри: solver.click_recaptcha_v2(iframe=...)
+
+    print(bot.get_token())
+```
+
+User-Agent по умолчанию — «не headless»: любой UA с `Headless` резко повышает риск детекта (это прямо указано в документации `selenium-recaptcha-solver`). Маскировка накатывается через CDP-хук `Page.addScriptToEvaluateOnNewDocument` до первой навигации.
+
+Чуть короче — сразу токен:
+
+```python
+token = bot.solve_and_get_token(token_timeout=20)
+```
+
+### Переключение на YOLO (`VisionAIRecaptchaSolver-0`)
+
+Флагом, без изменений в коде бота:
+
+```python
+from recaptcha_toolkit import PlaywrightBot, SolverBackend, VisionAIOptions
+
+with PlaywrightBot(
+    backend=SolverBackend.VISION_AI,
+    vision_ai=VisionAIOptions(timeout=180, server_port=8443),
+) as bot:
+    page = bot.new_page()
+    page.goto("https://www.google.com/recaptcha/api2/demo")
+    # website_key и website_url определяются сами; можно передать явно:
+    token = bot.solve_recaptcha_v2(page, website_key="6Le-...", website_url=page.url)
+```
+
+YOLO-солвер работает **не** в вашей странице: он поднимает свой Chromium и реплицирует виджет, поэтому ему нужны `website_key` / `website_url`. Прямой вызов, без Playwright вообще:
+
+```python
+from recaptcha_toolkit import VisionAISolver
+
+token = VisionAISolver().solve(
+    website_key="6Le-wvkSVVABCPBMRTvw0Q4Muexq1bi0DJwx_mJ-",
+    website_url="https://www.google.com/recaptcha/api2/demo",
+)
+```
+
+Конкурентным инстансам нужны разные `server_port` и `download_dir`.
+
+### Обработка ошибок
+
+Всё наследуется от `CaptchaError`, частые случаи — отдельными классами:
+
+```python
+from recaptcha_toolkit import CaptchaError, RecaptchaNotFoundError, RecaptchaTimeoutError
+
+try:
+    token = bot.solve_recaptcha_v2(page)
+except RecaptchaNotFoundError:
+    ...   # iframe/виджет не найден на странице
+except RecaptchaTimeoutError:
+    ...   # не уложились в wait_timeout / timeout
+except CaptchaError as exc:
+    print("капчу решить не удалось:", exc)
+```
+
+Полный набор: `RecaptchaNotFoundError`, `RecaptchaTimeoutError`, `RecaptchaRateLimitError` («Try again later» — лимит на IP), `RecaptchaSolveError`, `SiteKeyDetectionError`, `SolverDependencyError` (не установлен пакет).
+
+### Известные грабли
+
+- **Конфликт пинов `SpeechRecognition`.** `playwright-recaptcha` требует `SpeechRecognition==3.10.4`, а `selenium-recaptcha-solver` — `~=3.8.1`. Оба используют один и тот же API (`Recognizer`, `AudioFile`, `recognize_google`, `UnknownValueError`), поэтому на практике работают с любой из двух версий, но `pip` будет ругаться. Либо ставьте ветки в разные venv, либо зафиксируйте одну версию и примите предупреждение резолвера.
+- **`https://google.com` как демо не подходит** — на главной странице Google нет виджета, солвер закономерно упадёт с `RecaptchaNotFoundError`. Используйте `https://www.google.com/recaptcha/api2/demo` (v2) и `https://antcpt.com/score_detector/` (v3).
+- **FFmpeg** отсутствующий в `PATH` даёт `RuntimeWarning` от `pydub` и молча неработающий аудиоканал.
+
+Готовые сценарии — в [`examples/`](examples/) (`--help` у каждого файла), тесты — `tests/test_recaptcha_toolkit.py`.
+
 ## Gradio очередь и SSE
 
 ```python

@@ -16,6 +16,22 @@ firefox = ["rookiepy>=0.5"]
 # Playwright/curl_cffi are imported lazily inside arena_api.auth, so the
 # package installs and imports without them.
 e2e = ["playwright>=1.44", "curl_cffi>=0.7", "numpy>=1.24"]
+# recaptcha_toolkit imports every backend lazily, so the base install stays
+# dependency-free. Pick the extras you actually need.
+#
+# Playwright branch: stealth + audio/image reCAPTCHA solving.
+captcha = [
+    "playwright>=1.44",
+    "playwright-recaptcha>=0.5",
+    "playwright-stealth>=2.0",
+]
+# Selenium branch: stealth (CDP hook) + audio reCAPTCHA solving.
+captcha-selenium = [
+    "selenium>=4.20",
+    "selenium-recaptcha-solver>=1.9",
+]
+# Local YOLO solver (pulls ultralytics + torch; large download).
+vision = ["vision-ai-recaptcha-solver>=0.1"]
 
 [tool.setuptools.packages.find]
-include = ["arena_api*"]
+include = ["arena_api*", "recaptcha_toolkit*"]
