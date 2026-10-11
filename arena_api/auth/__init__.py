@@ -16,9 +16,16 @@ captures diagnostics, and turns them into an actionable
 :class:`~arena_api.exceptions.ChallengeRequiredError` with remediation
 guidance -- which is what a synthetic monitor actually needs.
 
-Heavy dependencies (``playwright``, ``curl_cffi``, ``numpy``) are imported
-lazily inside the functions that need them, so importing this package stays
-cheap and works without them installed.
+:mod:`arena_api.auth.captcha` is the opt-in bridge to
+:mod:`recaptcha_toolkit`: hand a ``RecaptchaToolkitSolver`` to a
+:class:`~arena_api.auth.challenge.ChallengeHandler`, a
+:class:`~arena_api.auth.browser.BrowserEnvironmentOptions` or a
+:class:`~arena_api.auth.session.BrowserSessionManager` and a detected reCAPTCHA
+is solved instead of only reported. Nothing is active until you do.
+
+Heavy dependencies (``playwright``, ``curl_cffi``, ``numpy``,
+``recaptcha_toolkit``) are imported lazily inside the functions that need them,
+so importing this package stays cheap and works without them installed.
 """
 
 from .browser import (
@@ -27,11 +34,21 @@ from .browser import (
     BrowserEnvironmentOptions,
     run_sync,
 )
+from .captcha import (
+    TOOLKIT_PACKAGE,
+    CaptchaAttempt,
+    CaptchaSolver,
+    RecaptchaToolkitSolver,
+    detect_recaptcha_version,
+    detect_recaptcha_version_sync,
+    observation_targets_recaptcha,
+)
 from .challenge import (
     CLOUDFLARE_FRAME_HOSTS,
     HCAPTCHA_SELECTORS,
     RECAPTCHA_SELECTORS,
     REMEDIATION_TEMPLATE,
+    SOLVABLE_CHALLENGE_KINDS,
     STATUS_TEXT_MARKERS,
     TURNSTILE_SELECTORS,
     ChallengeHandler,
@@ -82,6 +99,8 @@ __all__ = [
     "BrowserEnvironmentOptions",
     "BrowserSessionManager",
     "CLOUDFLARE_FRAME_HOSTS",
+    "CaptchaAttempt",
+    "CaptchaSolver",
     "ChallengeHandler",
     "ChallengeKind",
     "ChallengeObservation",
@@ -102,8 +121,10 @@ __all__ = [
     "RECAPTCHA_SELECTORS",
     "REMEDIATION_TEMPLATE",
     "RawResponse",
-    "RECAPTCHA_SELECTORS",
+    "RecaptchaToolkitSolver",
+    "SOLVABLE_CHALLENGE_KINDS",
     "STATUS_TEXT_MARKERS",
+    "TOOLKIT_PACKAGE",
     "SYNTHETIC_MONITOR_HEADER",
     "SessionManager",
     "SessionProbe",
@@ -114,10 +135,13 @@ __all__ = [
     "build_init_script",
     "chromium_user_agent",
     "cubic_bezier_point",
+    "detect_recaptcha_version",
+    "detect_recaptcha_version_sync",
     "fitts_duration",
     "inspect_page",
     "inspect_response",
     "normalize_state_payload",
+    "observation_targets_recaptcha",
     "resolve_element_center",
     "run_sync",
 ]
