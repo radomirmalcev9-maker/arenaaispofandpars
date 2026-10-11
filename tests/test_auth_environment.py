@@ -183,13 +183,14 @@ def test_no_viewport_mode() -> None:
 def test_launch_args_are_container_safe_by_default() -> None:
     kwargs = BrowserEnvironmentOptions().launch_kwargs()
     assert "--disable-dev-shm-usage" in kwargs["args"]
-    assert "--no-sandbox" not in kwargs["args"]
+    assert kwargs["chromium_sandbox"] is True
     assert kwargs["headless"] is True
 
 
-def test_no_sandbox_is_opt_in() -> None:
+def test_disabling_the_sandbox_is_opt_in() -> None:
     kwargs = BrowserEnvironmentOptions(no_sandbox=True).launch_kwargs()
-    assert "--no-sandbox" in kwargs["args"]
+    assert kwargs["chromium_sandbox"] is False
+    assert "--no-sandbox" not in kwargs["args"]
 
 
 def test_artifacts_require_a_directory() -> None:

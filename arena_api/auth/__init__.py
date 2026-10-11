@@ -74,6 +74,7 @@ from .session import (
     SessionProbe,
     SessionValidation,
     chromium_user_agent,
+    normalize_state_payload,
 )
 
 __all__ = [
@@ -117,6 +118,7 @@ __all__ = [
     "fitts_duration",
     "inspect_page",
     "inspect_response",
+    "normalize_state_payload",
     "resolve_element_center",
     "run_sync",
 ]

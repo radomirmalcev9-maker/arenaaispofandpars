@@ -146,6 +146,8 @@ session = manager.to_curl_cffi_session()
 cookies = manager.load_cookies()   # {"session": "...", ...}
 ```
 
+`storage_path` понимает все три формата файла cookie: `storage_state` от Playwright, массив записей `{"name", "value", "domain"}` (тот, что выше в разделе «Cookie-сессия») и браузерный экспорт `{"cookie": "a=b; c=d"}`. У записей без `domain` он подставляется из `base_url`; порт из хоста отбрасывается, потому что домен cookie его не содержит.
+
 Быстрый путь (`validate()`) — это один `curl_cffi`-запрос: поднимать Chromium, чтобы узнать «мы ещё залогинены?», не нужно. Медленный путь (`refresh_session()`) запускает браузер и выполняет **обычный вход с вашими учётными данными**; результат сохраняется в `cookies.json` (формат `storage_state`) и экспортируется в `curl_cffi.requests.Session`.
 
 ### Воспроизводимый браузер
@@ -332,4 +334,6 @@ with DirectArenaClient(
 - `example.py` — Gradio queue/SSE;
 - `example_direct.py` — Direct Chat с assertion, переданной пользователем;
 - `example_firefox.py` — сессия из локального профиля Firefox;
-- `tests/` — офлайн unit-тесты на парсинг cookie/SSE, mapping моделей, очереди, async API, ошибки, Firefox-сессию, retry при 403, кинематику курсора, init-скрипт детерминизма, детектор challenge и жизненный цикл сессии.
+- `example_e2e.py` — синтетический мониторинг на `arena_api.auth`: быстрая валидация через `curl_cffi` (`--check`, без браузера), обновление через реальный логин, детерминированный контекст, кинематический ввод, детектор challenge;
+- `tests/test_auth_integration.py` — интеграционные тесты: реальный локальный HTTP-сервер плюс настоящий `curl_cffi` (валидация, редиректы, 401/429, challenge) и сверка генерируемых kwargs с реальными сигнатурами `playwright.async_api`;
+- остальные `tests/` — офлайн unit-тесты на парсинг cookie/SSE, mapping моделей, очереди, async API, ошибки, Firefox-сессию, retry при 403, кинематику курсора, init-скрипт детерминизма, детектор challenge и жизненный цикл сессии.

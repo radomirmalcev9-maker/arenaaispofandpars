@@ -16,6 +16,7 @@ from arena_api.auth.session import (
     RawResponse,
     SessionValidation,
     chromium_user_agent,
+    normalize_state_payload,
 )
 from arena_api.exceptions import AuthenticationError, ChallengeRequiredError
 
@@ -168,6 +169,67 @@ def test_import_rejects_unsupported_shapes(tmp_path) -> None:
     manager = make_manager(storage_path=tmp_path / "s.json")
     with pytest.raises(TypeError):
         manager.import_cookies(42)
+
+
+def test_storage_state_accepts_a_plain_cookie_array(tmp_path) -> None:
+    """The README's cookies.json format must work as storage_path too."""
+    path = tmp_path / "cookies.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"name": "session", "value": "abc", "domain": "arena.test"},
+                {"name": "cf_clearance", "value": "def", "domain": ".arena.test"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manager = make_manager(storage_path=path)
+    assert manager.load_cookies() == {"session": "abc", "cf_clearance": "def"}
+
+
+def test_storage_state_accepts_a_cookie_header_export(tmp_path) -> None:
+    path = tmp_path / "cookies.json"
+    path.write_text(
+        json.dumps({"cookie": "session=abc; cf_clearance=def"}), encoding="utf-8"
+    )
+    manager = make_manager(storage_path=path)
+    assert manager.load_cookies() == {"session": "abc", "cf_clearance": "def"}
+
+
+def test_records_without_a_domain_inherit_the_manager_host(tmp_path) -> None:
+    """Hand-written exports usually omit the domain; they must not vanish."""
+    path = tmp_path / "cookies.json"
+    path.write_text(
+        json.dumps([{"name": "session", "value": "abc"}]), encoding="utf-8"
+    )
+    manager = make_manager(storage_path=path)
+    assert manager.load_cookies() == {"session": "abc"}
+    assert manager.cookie_records()[0]["domain"] == "arena.test"
+
+
+def test_export_then_reuse_as_storage_path(tmp_path) -> None:
+    """Round-trip: export_cookies() output must be loadable as storage_path."""
+    first = make_manager(storage_path=tmp_path / "a.json")
+    first.import_cookies({"session": "abc"})
+    exported = first.export_cookies(tmp_path / "b.json")
+
+    second = make_manager(storage_path=exported)
+    assert second.load_cookies() == {"session": "abc"}
+
+
+def test_unrecognised_state_file_yields_no_cookies(tmp_path) -> None:
+    path = tmp_path / "cookies.json"
+    path.write_text(json.dumps({"unexpected": "shape"}), encoding="utf-8")
+    assert make_manager(storage_path=path).load_cookies() == {}
+
+
+def test_normalize_state_payload_helper() -> None:
+    assert normalize_state_payload([{"name": "a", "value": "1"}], "h")["cookies"][0][
+        "domain"
+    ] == "h"
+    assert normalize_state_payload({"cookie": "a=1"}, "h")["cookies"][0]["name"] == "a"
+    assert normalize_state_payload({"cookies": []}, "h") == {"cookies": [], "origins": []}
+    assert normalize_state_payload("nope", "h") == {}
 
 
 # --------------------------------------------------------------------------- #

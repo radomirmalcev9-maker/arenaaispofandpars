@@ -66,6 +66,85 @@ DEFAULT_VALIDATE_PATHS: tuple[str, ...] = ("/",)
 DEFAULT_ACCEPT_STATUSES: tuple[int, ...] = (200, 204, 206, 301, 302, 304)
 
 
+def _coerce_cookie_records(cookies: Any, host: str) -> list[dict[str, Any]]:
+    """Normalise a list of cookie records, backfilling domain/path.
+
+    Records exported by hand often carry only ``name`` and ``value``; without
+    a domain they would be filtered out by every domain-scoped lookup, so the
+    manager's own host is filled in.
+    """
+    records: list[dict[str, Any]] = []
+    if not isinstance(cookies, (list, tuple)):
+        return records
+    for item in cookies:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        value = item.get("value")
+        if not isinstance(name, str) or not isinstance(value, str) or not name:
+            continue
+        records.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": str(item.get("domain") or host),
+                "path": str(item.get("path") or "/"),
+                "expires": item.get("expires", -1),
+                "secure": bool(item.get("secure", True)),
+                "httpOnly": bool(item.get("httpOnly", False)),
+                "sameSite": str(item.get("sameSite") or "Lax"),
+            }
+        )
+    return records
+
+
+def _records_from_cookie_header(header: str, host: str) -> list[dict[str, Any]]:
+    """Parse a ``"a=1; b=2"`` Cookie header into cookie records."""
+    records: list[dict[str, Any]] = []
+    for part in str(header).split(";"):
+        name, _, value = part.partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        records.append(
+            {
+                "name": name,
+                "value": value.strip(),
+                "domain": host,
+                "path": "/",
+                "expires": -1,
+                "secure": True,
+                "httpOnly": False,
+                "sameSite": "Lax",
+            }
+        )
+    return records
+
+
+def normalize_state_payload(payload: Any, host: str) -> dict[str, Any]:
+    """Accept every cookie-file shape this package documents.
+
+    Supported: a Playwright ``storage_state`` dict, a plain array of cookie
+    records (the ``cookies.json`` format shown in the README), and a browser
+    export with a ``cookie`` header string. Anything else yields an empty
+    state, so callers can fall back to a flat ``{name: value}`` mapping.
+    """
+    if isinstance(payload, Mapping):
+        cookies = payload.get("cookies")
+        if isinstance(cookies, (list, tuple)):
+            return {
+                "cookies": _coerce_cookie_records(cookies, host),
+                "origins": payload.get("origins") or [],
+            }
+        header = payload.get("cookie")
+        if isinstance(header, str):
+            return {"cookies": _records_from_cookie_header(header, host), "origins": []}
+        return {}
+    if isinstance(payload, (list, tuple)):
+        return {"cookies": _coerce_cookie_records(payload, host), "origins": []}
+    return {}
+
+
 def chromium_user_agent(version: str = DEFAULT_CHROMIUM_VERSION) -> str:
     """Build the User-Agent of a Chromium build on the current platform.
 
@@ -329,12 +408,11 @@ class BrowserSessionManager:
     def __post_init__(self) -> None:
         self.base_url = str(self.base_url).rstrip("/")
         if self.domains is None:
-            host = urlparse(self.base_url).netloc
-            self.domains = tuple(
-                dict.fromkeys(
-                    part for part in (host, host.split(":", 1)[0]) if part
-                )
-            )
+            # Cookie domains never carry a port, so derive them from the
+            # hostname. Using netloc here would silently filter out every
+            # cookie on any origin with a non-default port (typical staging).
+            host = self.host
+            self.domains = (host,) if host else ()
         else:
             self.domains = tuple(self.domains)
         if self.storage_path is not None:
@@ -347,8 +425,12 @@ class BrowserSessionManager:
 
     @property
     def host(self) -> str:
-        """Hostname of ``base_url``."""
-        return urlparse(self.base_url).netloc
+        """Hostname of ``base_url``, lower-cased and without a port.
+
+        This is the value a cookie's ``domain`` is matched against, which is
+        why the port is dropped.
+        """
+        return urlparse(self.base_url).hostname or ""
 
     def default_capture_dir(self) -> Path | None:
         """Directory used for challenge diagnostics when none is configured."""
@@ -377,7 +459,7 @@ class BrowserSessionManager:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
-        return payload if isinstance(payload, dict) else {}
+        return normalize_state_payload(payload, self.host)
 
     def cookie_records(self) -> list[dict[str, Any]]:
         """Return every stored cookie as a record with its domain and path."""
@@ -474,26 +556,24 @@ class BrowserSessionManager:
         cookies: Mapping[str, str] | Sequence[Mapping[str, Any]] | str | Path,
     ) -> None:
         """Seed the in-memory state from a mapping, records, or JSON file."""
-        records: list[dict[str, Any]] = []
         if isinstance(cookies, (str, Path)):
-            payload = json.loads(Path(cookies).read_text(encoding="utf-8"))
+            payload: Any = json.loads(Path(cookies).read_text(encoding="utf-8"))
         else:
             payload = cookies
+
+        state = normalize_state_payload(payload, self.host)
+        if state.get("cookies"):
+            self._state = state
+            return
+
+        # Fall back to a flat {name: value} mapping, or a sparse record list
+        # whose entries carried no usable name/value pair.
         if isinstance(payload, Mapping):
-            for name, value in payload.items():
-                records.append(self._record(name, str(value)))
-        elif isinstance(payload, Sequence):
-            for item in payload:
-                if not isinstance(item, Mapping):
-                    continue
-                name = item.get("name")
-                value = item.get("value")
-                if not isinstance(name, str) or not isinstance(value, str):
-                    continue
-                record = self._record(name, value)
-                record["domain"] = str(item.get("domain") or record["domain"])
-                record["path"] = str(item.get("path") or record["path"])
-                records.append(record)
+            records = [
+                self._record(str(name), str(value)) for name, value in payload.items()
+            ]
+        elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+            records = _coerce_cookie_records(list(payload), self.host)
         else:
             raise TypeError("cookies must be a mapping, a record list, or a JSON path")
         self._state = {"cookies": records, "origins": []}

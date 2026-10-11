@@ -91,8 +91,8 @@ class BrowserEnvironmentOptions:
     ignore_default_args: tuple[str, ...] = ()
     extra_http_headers: dict[str, str] = field(default_factory=dict)
 
-    #: ``--no-sandbox`` is required in some container images but weakens the
-    #: browser sandbox, so it is opt-in rather than a default.
+    #: Maps to Playwright's ``chromium_sandbox``. Disabling it is required in
+    #: some container images but weakens the browser sandbox, so it is opt-in.
     no_sandbox: bool = False
 
     #: Extra Chromium switches; ``--disable-dev-shm-usage`` is added
@@ -165,13 +165,12 @@ class BrowserEnvironmentOptions:
         args: list[str] = list(self.launch_args)
         if self.container_safe:
             args.append("--disable-dev-shm-usage")
-        if self.no_sandbox:
-            args.append("--no-sandbox")
-            args.append("--disable-setuid-sandbox")
         kwargs: dict[str, Any] = {
             "headless": self.headless,
             "slow_mo": self.slow_mo,
             "args": args,
+            # Playwright's own switch, rather than a raw --no-sandbox flag.
+            "chromium_sandbox": not self.no_sandbox,
         }
         if self.channel:
             kwargs["channel"] = self.channel
@@ -357,9 +356,18 @@ class BrowserEnvironment:
     # ------------------------------------------------------------------ #
 
     async def screenshot(self, page: Any, name: str = "screenshot.png", **kwargs: Any) -> Path:
-        """Save a full-page screenshot into the artefacts directory."""
+        """Save a screenshot into the artefacts directory.
+
+        ``animations="disabled"`` and ``caret="hide"`` are Playwright's own
+        supported stabilisers and are applied by default, on top of the
+        init-script CSS (which also stabilises ``bounding_box()`` timings and
+        non-screenshot assertions).
+        """
         path = self._artifact_path(name)
-        await page.screenshot(path=str(path), **kwargs)
+        options: dict[str, Any] = {"animations": "disabled", "caret": "hide"}
+        options.update(kwargs)
+        options.setdefault("full_page", True)
+        await page.screenshot(path=str(path), **options)
         return path
 
     async def save_storage_state(self, context: Any, name: str = "state.json") -> Path:
