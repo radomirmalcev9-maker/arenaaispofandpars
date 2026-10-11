@@ -9,3 +9,9 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Session material is a credential: never commit it.
+session.json
+session.json.bak
+storage_state*.json
+*.storage_state.json

@@ -13,6 +13,9 @@ dependencies = ["httpx[http2]>=0.27,<1"]
 [project.optional-dependencies]
 test = ["pytest>=8"]
 firefox = ["rookiepy>=0.5"]
+# Human-in-the-loop session capture (arena_api.auth.verify). Upstream
+# Playwright only: no stealth forks, no fingerprint patches.
+browser = ["playwright>=1.44"]
 
 [tool.setuptools.packages.find]
 include = ["arena_api*"]
