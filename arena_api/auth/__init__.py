@@ -11,9 +11,8 @@ Two backends live here:
   providing the Playwright wrapper, determinism init scripts and pointer
   kinematics respectively.
 
-Neither backend solves, automates, or bypasses browser verification
-challenges. :mod:`arena_api.auth.challenge` detects them, captures
-diagnostics, and turns them into an actionable
+:mod:`arena_api.auth.challenge` detects browser verification challenges,
+captures diagnostics, and turns them into an actionable
 :class:`~arena_api.exceptions.ChallengeRequiredError` with remediation
 guidance -- which is what a synthetic monitor actually needs.
 

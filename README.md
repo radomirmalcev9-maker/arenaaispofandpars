@@ -4,7 +4,7 @@
 
 > Arena не предоставляет стабильный публичный API для всех этих маршрутов. Эндпоинты, очереди, порядок callback-аргументов и формат стрима могут измениться без предупреждения. Используйте клиент только в соответствии с правилами сервиса и имеющимися у вас правами доступа.
 >
-> Библиотека использует переданные вами cookie/заголовки и, для Direct Chat, явно переданную вами verification assertion; по явному запросу (`session_source="firefox"`) она может читать сессию из вашего локального профиля Firefox (см. ниже). Она **не** решает CAPTCHA и не обходит Cloudflare, Turnstile или другие проверки: при challenge (`ChallengeRequiredError`) проверку проходите вы в обычном браузере — с Firefox-сессией клиент дождётся этого, перечитает cookie и повторит запрос.
+> Библиотека использует переданные вами cookie/заголовки и, для Direct Chat, явно переданную вами verification assertion; по явному запросу (`session_source="firefox"`) она может читать сессию из вашего локального профиля Firefox (см. ниже). При challenge (`ChallengeRequiredError`) клиент сообщает об этом — с Firefox-сессией он дождётся проверки, перечитает cookie и повторит запрос.
 
 ## Установка
 
@@ -19,7 +19,7 @@ python -m pip install '.[test]'
 pytest
 ```
 
-Транспорт построен на `httpx` с HTTP/2. TLS fingerprint spoofing, ротации User-Agent и автоматического решения браузерных проверок нет.
+Транспорт построен на `httpx` с HTTP/2.
 
 ## Cookie-сессия
 
@@ -68,7 +68,7 @@ with ArenaClient(session_source="firefox") as arena:
 
 - **Извлечение cookie** — через `rookiepy` (`python -m pip install '.[firefox]'`): `rookiepy.firefox(domains=["arena.ai", "lmarena.ai"])` и нормализация записей в плоский `dict[str, str]`, готовый для прямой передачи в `curl_cffi.requests.Session` или `httpx.Client`. Если `rookiepy` не установлен, cookie-база заблокирована запущенным Firefox (SQLite lock) или вернула пустой результат, включается встроенный fallback без внешних зависимостей: снимок `cookies.sqlite` вместе с `-wal`/`-shm` во временную папку и чтение через стандартный `sqlite3` — без борьбы за блокировки с браузером. Профиль по умолчанию определяется по `profiles.ini` (секция `[Install...]` → `Default`, затем профиль с `Default=1`), с fallback'ом на каталог `*.default-release` и, в крайнем случае, на профиль с самым свежим `cookies.sqlite`.
 - **Заголовки** — `FirefoxSessionManager.firefox_headers()` строит User-Agent под текущую ОС и версию Firefox из `compatibility.ini` профиля (с замороженным `rv:109.0`, как в реальном Firefox), плюс `Accept-Language` (из профиля/системы или параметр `language`), `Sec-GPC: 1` и `Sec-Fetch-*` (вариант `fetch`/XHR по умолчанию, `navigation=True` для документных запросов) — отпечаток заголовков совпадает с реальным браузером. `Accept-Encoding` не подставляется: его согласует сам HTTP-бэкенд (httpx/curl_cffi) в соответствии с доступными декодерами.
-- **403 / `ChallengeRequiredError`** — клиент печатает «Сессия устарела. Откройте arena.ai в Firefox, обновите страницу, затем нажмите Enter...», ждёт Enter, перечитывает cookie через `rookiepy` и прозрачно повторяет запрос (до `max_auth_refreshes=2` попыток по умолчанию, для sync- и async-методов, включая стримы). CAPTCHA и защиты не решаются автоматически — проверку проходите вы в обычном браузере.
+- **403 / `ChallengeRequiredError`** — клиент печатает «Сессия устарела. Откройте arena.ai в Firefox, обновите страницу, затем нажмите Enter...», ждёт Enter, перечитывает cookie через `rookiepy` и прозрачно повторяет запрос (до `max_auth_refreshes=2` попыток по умолчанию, для sync- и async-методов, включая стримы).
 
 Cookie из Firefox перекрывают одноимённые значения из `cookies=`, а явные `headers=` перекрывают заголовки Firefox. Для headless-окружений создайте менеджер с `interactive=False` (без ожидания Enter, cookie перечитываются сразу) и передайте сам объект:
 
@@ -211,21 +211,16 @@ except ChallengeRequiredError as exc:
 
 `inspect_response(status, headers, body)` — тот же детектор для быстрого HTTP-пути, без браузера. Статус-код сам по себе не считается challenge: `403` — это ещё и обычная ошибка авторизации, поэтому требуются подтверждающие маркеры (`cf-mitigated`, текст интерстишла, ссылка на `challenges.cloudflare.com`, challenge-фрейм). При обнаружении сохраняются скриншот, HTML и JSON с сигналами.
 
-### Что этот модуль сознательно не делает
-
-- **Не решает и не обходит** CAPTCHA, Turnstile и Managed Challenge: нет поиска и клика по чекбоксу, нет обхода через аудиоканал и STT-распознавания токена, нет автоматического получения или обновления `cf_clearance`.
-- **Не маскирует автоматизацию**: нет правок `navigator.webdriver`, `navigator.plugins`, WebGL-вендора/рендерера, Canvas-шума, `navigator.permissions.query` и объекта `window.chrome`.
-
-Причины две. Первая — это обход защиты, которую владелец сервиса включил сознательно; позиция библиотеки та же, что в `ChallengeRequiredError`. Вторая — практическая: тихо «пройденный» challenge превращает громкую и понятную ошибку сборки в тихую и плавающую, после чего мониторинг перестаёт что-либо измерять. Синтетический мониторинг полезен ровно тогда, когда он **виден**: при `identify_automation=True` страница получает `window.__arenaSynthetic`, а запросы — заголовок `X-Synthetic-Monitor`, по которому владелец сервиса может сделать исключение.
-
-Что делать вместо обхода:
+### Если синтетические проверки блокируются
 
 1. Добавьте исключение в WAF/bot-management для egress-IP или ASN вашего CI — либо матчинг по заголовку `X-Synthetic-Monitor`.
 2. В CI используйте официальные тестовые sitekey/secret Cloudflare Turnstile: они всегда возвращают проходящий токен, и пайплайн прогоняет реальный путь виджета.
 3. На собственных staging-зонах отключите Bot Fight Mode и managed challenge.
 4. Для machine-to-machine мониторинга используйте API-токен или сервисный аккаунт вместо чужой браузерной сессии.
 
-Поддерживаемые Playwright-опции покрывают легитимную часть «нормализации окружения» без патчей: `locale` (он же `navigator.languages`), `timezone_id`, `user_agent`, `viewport`, `device_scale_factor`, `color_scheme`, `reduced_motion`.
+При `identify_automation=True` страница получает `window.__arenaSynthetic`, а запросы — заголовок `X-Synthetic-Monitor`, по которому владелец сервиса может сделать исключение.
+
+Поддерживаемые Playwright-опции нормализации окружения: `locale` (он же `navigator.languages`), `timezone_id`, `user_agent`, `viewport`, `device_scale_factor`, `color_scheme`, `reduced_motion`.
 
 ## `recaptcha_toolkit` — решение reCAPTCHA и маскировка автоматизации
 
@@ -238,7 +233,7 @@ except ChallengeRequiredError as exc:
 | [`selenium-recaptcha-solver`](https://pypi.org/project/selenium-recaptcha-solver/) | решение аудио-челленджа v2 для Selenium |
 | [`playwright-stealth`](https://pypi.org/project/playwright-stealth/) | маскировка `navigator.webdriver`, языков, платформы и пр. |
 
-> **Область применения.** Пакет предназначен для автоматизированного тестирования страниц, на которые у вас есть явное разрешение: собственные стенды, staging-зоны, страницы клиентов, публичные демо-стенды вендора. Он **не** подключён к `arena_api` и не участвует ни в одном сценарии этого клиента — раздел «Что этот модуль сознательно не делает» выше остаётся в силе: позиция проекта по обходу защит не изменилась, подключение `recaptcha_toolkit` к чему-либо — полностью осознанное решение вызывающего кода. Использование против сервисов, чьи правила это запрещают, нарушает их условия.
+> Пакет автономен: он не импортируется из `arena_api` и не участвует ни в одном сценарии этого клиента — подключение остаётся на стороне вызывающего кода.
 
 ### Установка
 

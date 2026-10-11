@@ -15,10 +15,9 @@ A synthetic-monitoring tick against a host you own or are authorised to test:
 3. drive a scripted journey in a normalised, deterministic browser context
    with kinematic pointer input;
 4. after every navigation, check whether a verification challenge was served;
-   if one was, capture diagnostics and fail loudly instead of working around it.
+   if one was, capture diagnostics and stop the run.
 
-This example solves no CAPTCHA and masks no automation signal -- the run
-identifies itself with the ``X-Synthetic-Monitor`` header and
+The run identifies itself with the ``X-Synthetic-Monitor`` header and
 ``window.__arenaSynthetic`` so the site owner can allowlist it. See the
 "E2E-инфраструктура" section of the README for the supported alternatives.
 """
@@ -121,7 +120,7 @@ def check_session(base_url: str) -> int:
 
     if result.challenge is not None and result.challenge.is_challenge:
         print()
-        print("A verification challenge was served. This example does not solve it.")
+        print("A verification challenge was served.")
         print("Fix it at the infrastructure level -- see the remediation steps in")
         print("arena_api.auth.challenge.REMEDIATION_TEMPLATE.")
         return 2
