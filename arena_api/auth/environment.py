@@ -138,10 +138,6 @@ class DeterminismOptions:
         return payload
 
 
-def _js_bool(value: bool) -> str:
-    return "true" if value else "false"
-
-
 def _mulberry32(seed_expression: str) -> str:
     """Return a JS IIFE installing a seeded mulberry32 PRNG."""
     return f"""

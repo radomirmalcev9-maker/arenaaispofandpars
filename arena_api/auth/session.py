@@ -227,19 +227,25 @@ class CurlCffiProbe:
         else:
             request = factory
 
-        response = request(
-            url,
-            cookies=dict(cookies),
-            headers=dict(headers),
-            timeout=timeout,
-            allow_redirects=True,
-            verify=self.verify,
-            **({"proxy": self.proxy} if self.proxy else {}),
-            **({"impersonate": self.impersonate} if self.impersonate else {}),
-        )
+        options: dict[str, Any] = {
+            "cookies": dict(cookies),
+            "headers": dict(headers),
+            "timeout": timeout,
+            "allow_redirects": True,
+            "verify": self.verify,
+        }
+        if self.proxy:
+            options["proxy"] = self.proxy
+        if self.impersonate:
+            options["impersonate"] = self.impersonate
+        response = request(url, **options)
         return RawResponse(
             status=int(response.status_code),
-            headers=dict(response.headers),
+            headers={
+                str(key): str(value)
+                for key, value in response.headers.items()
+                if value is not None
+            },
             body=str(response.text or "")[: self.max_body_chars],
         )
 

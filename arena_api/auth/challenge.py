@@ -431,9 +431,13 @@ async def inspect_page(
         if "recaptcha" in lowered:
             signals.append(ChallengeSignal("frame", frame_url, ChallengeKind.RECAPTCHA))
 
-    scan = {"selectors": [], "frames": [], "text": "", "title": ""}
+    scan: dict[str, Any] = {"selectors": [], "frames": [], "text": "", "title": ""}
     try:
-        scan = await page.evaluate(_PAGE_SCAN_JS, list(_all_selectors(extra_selectors)))
+        evaluated = await page.evaluate(
+            _PAGE_SCAN_JS, list(_all_selectors(extra_selectors))
+        )
+        if isinstance(evaluated, dict):
+            scan = evaluated
     except Exception:
         scan = {"selectors": [], "frames": [], "text": "", "title": ""}
 

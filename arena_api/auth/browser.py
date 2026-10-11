@@ -279,7 +279,7 @@ class BrowserEnvironment:
         try:
             if self.options.screenshot_on_close:
                 for index, page in enumerate(context.pages):
-                    await self.screenshot(page, name=f"close-page-{index}")
+                    await self.screenshot(page, name=f"close-page-{index}.png")
         except Exception:
             pass
         try:
@@ -325,8 +325,7 @@ class BrowserEnvironment:
 
         A new context is created when ``context`` is not supplied.
         """
-        created = context is None
-        if created:
+        if context is None:
             context = await self.new_context(**overrides)
         page = await context.new_page()
         if self.options.install_determinism_script:

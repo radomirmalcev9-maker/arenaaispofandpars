@@ -62,8 +62,11 @@ def numpy_module() -> Any | None:
     global _NP_MODULE, _NP_LOOKED_UP
     if not _NP_LOOKED_UP:
         _NP_LOOKED_UP = True
+        module: Any = None
         try:  # pragma: no cover - depends on the environment
-            import numpy as module
+            import numpy
+
+            module = numpy
         except ImportError:  # pragma: no cover
             module = None
         _NP_MODULE = module
@@ -415,10 +418,9 @@ class TrajectoryPlanner:
         )
 
         dense = max(count * 4, 96)
-        if numpy_module() is not None:
-            curve = _sample_bezier_numpy(
-                origin, control_1, control_2, target, dense
-            )
+        np = numpy_module()
+        if np is not None:
+            curve = _sample_bezier_numpy(np, origin, control_1, control_2, target, dense)
         else:
             curve = [
                 cubic_bezier_point(origin, control_1, control_2, target, i / (dense - 1))
@@ -491,10 +493,9 @@ class TrajectoryPlanner:
 
 
 def _sample_bezier_numpy(
-    p0: Point, p1: Point, p2: Point, p3: Point, count: int
+    np: Any, p0: Point, p1: Point, p2: Point, p3: Point, count: int
 ) -> list[Point]:
     """Vectorised cubic Bezier sampling (used when ``numpy`` is installed)."""
-    np = numpy_module()
     t_values = np.linspace(0.0, 1.0, count, dtype=np.float64)
     u = 1.0 - t_values
     w0 = u**3
@@ -514,35 +515,47 @@ def _sample_bezier_numpy(
 async def resolve_element_center(
     target: Any,
     *,
+    page: Any = None,
     timeout: float | None = None,
     scroll_into_view: bool = True,
 ) -> Point:
     """Resolve a Playwright target to a viewport coordinate in CSS pixels.
 
     Accepts a ``Point``, an ``(x, y)`` pair, a ``Locator``/``ElementHandle``,
-    or a selector string resolved against its page.
+    or a selector string. A selector string has no page of its own, so one
+    must be supplied -- either via ``page=`` or by the caller (the mouse
+    drivers pass theirs).
 
     ``bounding_box()`` already returns main-frame viewport CSS pixels and
     already accounts for layout transforms and CSS ``zoom``, so the only
     correction needed is pinch-zoom (``visualViewport.scale``), which is
     non-1 on emulated mobile devices with ``is_mobile=True``.
     """
-    page = getattr(target, "page", None)
-    if page is None and hasattr(target, "evaluate"):
-        page = target
+    owner = page if page is not None else getattr(target, "page", None)
+    if owner is None and hasattr(target, "evaluate"):
+        owner = target
 
     if isinstance(target, Point):
         return target
     if isinstance(target, (tuple, list)) and len(target) == 2:
         return Point(float(target[0]), float(target[1]))
 
-    locator = target if hasattr(target, "bounding_box") else page.locator(str(target))
+    if hasattr(target, "bounding_box"):
+        locator = target
+    elif owner is not None:
+        locator = owner.locator(str(target))
+    else:
+        raise ValueError(
+            f"cannot resolve {target!r}: a selector string needs a page "
+            "(pass page=..., or use a Locator)"
+        )
+
     if scroll_into_view:
         await locator.scroll_into_view_if_needed(timeout=timeout)
     box = await locator.bounding_box(timeout=timeout)
     if box is None:
         raise LookupError(f"target has no bounding box and cannot be clicked: {target!r}")
-    scale = await _viewport_scale(page)
+    scale = await _viewport_scale(owner)
     return Point(
         (box["x"] + box["width"] / 2.0) * scale,
         (box["y"] + box["height"] / 2.0) * scale,
@@ -552,24 +565,36 @@ async def resolve_element_center(
 def resolve_element_center_sync(
     target: Any,
     *,
+    page: Any = None,
     timeout: float | None = None,
     scroll_into_view: bool = True,
 ) -> Point:
     """Blocking twin of :func:`resolve_element_center`."""
-    page = getattr(target, "page", None)
-    if page is None and hasattr(target, "evaluate"):
-        page = target
+    owner = page if page is not None else getattr(target, "page", None)
+    if owner is None and hasattr(target, "evaluate"):
+        owner = target
+
     if isinstance(target, Point):
         return target
     if isinstance(target, (tuple, list)) and len(target) == 2:
         return Point(float(target[0]), float(target[1]))
-    locator = target if hasattr(target, "bounding_box") else page.locator(str(target))
+
+    if hasattr(target, "bounding_box"):
+        locator = target
+    elif owner is not None:
+        locator = owner.locator(str(target))
+    else:
+        raise ValueError(
+            f"cannot resolve {target!r}: a selector string needs a page "
+            "(pass page=..., or use a Locator)"
+        )
+
     if scroll_into_view:
         locator.scroll_into_view_if_needed(timeout=timeout)
     box = locator.bounding_box(timeout=timeout)
     if box is None:
         raise LookupError(f"target has no bounding box and cannot be clicked: {target!r}")
-    scale = _viewport_scale_sync(page)
+    scale = _viewport_scale_sync(owner)
     return Point(
         (box["x"] + box["width"] / 2.0) * scale,
         (box["y"] + box["height"] / 2.0) * scale,
@@ -662,7 +687,9 @@ class KinematicMouse:
         timeout: float | None = None,
     ) -> Trajectory:
         """Move the cursor to ``target`` and return the trajectory played."""
-        destination = await resolve_element_center(target, timeout=timeout)
+        destination = await resolve_element_center(
+            target, page=self.page, timeout=timeout
+        )
         trajectory = self.planner.plan(
             self._position, destination, target_width=target_width, seed=seed
         )
@@ -827,7 +854,9 @@ class KinematicMouseSync:
         timeout: float | None = None,
     ) -> Trajectory:
         """Move the cursor to ``target`` and return the trajectory played."""
-        destination = resolve_element_center_sync(target, timeout=timeout)
+        destination = resolve_element_center_sync(
+            target, page=self.page, timeout=timeout
+        )
         trajectory = self.planner.plan(
             self._position, destination, target_width=target_width, seed=seed
         )
