@@ -4,9 +4,34 @@ This package uses caller-provided credentials — or, opt-in via
 ``session_source="firefox"``, the signed-in session of your local Firefox
 profile — and does not bypass browser verification challenges. See the
 project README for protocol caveats.
+
+``arena_api.auth`` additionally ships E2E/synthetic-monitoring tooling
+(Playwright wrapper, pointer kinematics, determinism init scripts, session
+lifecycle management and a challenge *detector*). It solves no CAPTCHA and
+masks no automation signal; see ``arena_api.auth.environment`` and
+``arena_api.auth.challenge``.
 """
 
-from .auth import FirefoxSessionError, FirefoxSessionManager, SessionManager
+from .auth import (
+    BrowserEnvironment,
+    BrowserEnvironmentOptions,
+    BrowserSessionManager,
+    ChallengeHandler,
+    ChallengeKind,
+    ChallengeObservation,
+    DeterminismOptions,
+    FirefoxSessionError,
+    FirefoxSessionManager,
+    FormLoginFlow,
+    KinematicMouse,
+    KinematicMouseSync,
+    SessionManager,
+    SessionValidation,
+    TrajectoryPlanner,
+    build_init_script,
+    inspect_page,
+    inspect_response,
+)
 from .client import ArenaClient, AsyncArenaClient
 from .direct import (
     AsyncDirectArenaClient,
