@@ -19,6 +19,12 @@ If a challenge appears during a refresh, the run stops with captured
 diagnostics (:class:`~arena_api.exceptions.ChallengeRequiredError` and the
 remediation guide in :mod:`arena_api.auth.challenge`).
 
+*Optionally*, a ``captcha_solver`` (see :mod:`arena_api.auth.captcha`) turns
+that stop into a solve: a reCAPTCHA met during the login is cleared and the
+refresh continues. Configuring a solver without a ``login_flow`` gives a
+challenge-only refresh -- open ``captcha_url``, clear the screen, persist the
+cookies -- for the case where the session is fine but blocked.
+
 ``curl_cffi`` is used here as a fast HTTP client with HTTP/2 and a real TLS
 stack. Its ``impersonate=`` knob is exposed as a pass-through because some
 servers reject non-browser TLS stacks outright, and it defaults to ``None``.
@@ -34,7 +40,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 from urllib.parse import urljoin, urlparse
 
 from ..constants import DEFAULT_BASE_URL
@@ -42,6 +48,9 @@ from ..exceptions import AuthenticationError, ChallengeRequiredError
 from .browser import BrowserEnvironment, BrowserEnvironmentOptions
 from .challenge import ChallengeHandler, ChallengeObservation, inspect_response
 from .kinematics import KinematicMouse
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from .captcha import CaptchaSolver
 
 __all__ = [
     "BrowserSessionManager",
@@ -394,6 +403,13 @@ class BrowserSessionManager:
     challenge_handler: ChallengeHandler | None = None
     environment_options: BrowserEnvironmentOptions | None = None
     login_flow: LoginFlow | None = None
+    #: Opt-in challenge solver (see :mod:`arena_api.auth.captcha`). When set, a
+    #: reCAPTCHA met during a refresh is solved and the login continues instead
+    #: of failing the run; with no ``login_flow`` it enables a challenge-only
+    #: refresh against ``captcha_url`` (or ``base_url``).
+    captcha_solver: "CaptchaSolver | None" = None
+    #: URL opened for a challenge-only refresh; defaults to ``base_url``.
+    captcha_url: str | None = None
     user_agent: str | None = None
     chromium_version: str = DEFAULT_CHROMIUM_VERSION
     timeout: float = 45.0
@@ -421,6 +437,12 @@ class BrowserSessionManager:
                 capture_dir=self.default_capture_dir(),
                 raise_on_detection=False,
             )
+        if self.captcha_solver is not None:
+            # A solver handed to the manager is a solver the manager uses: fill
+            # in the handler it was not given explicitly, and turn solving on.
+            if self.challenge_handler.captcha_solver is None:
+                self.challenge_handler.captcha_solver = self.captcha_solver
+            self.challenge_handler.solve_on_detection = True
 
     @property
     def host(self) -> str:
@@ -754,8 +776,17 @@ class BrowserSessionManager:
     async def arefresh_session(
         self, reason: BaseException | None = None
     ) -> dict[str, str] | None:
-        """Re-authenticate through a real login flow and persist the state."""
-        if self.login_flow is None:
+        """Re-authenticate in a browser and persist the resulting state.
+
+        Two entry points, in order of preference:
+
+        * ``login_flow`` -- an ordinary credentialed sign-in. A reCAPTCHA met on
+          the way is solved first when a ``captcha_solver`` is configured.
+        * ``captcha_solver`` alone -- the session is not expired, it is blocked
+          by a verification screen, so opening ``captcha_url`` (default
+          ``base_url``) and clearing it is enough to continue.
+        """
+        if self.login_flow is None and self.captcha_solver is None:
             raise AuthenticationError(
                 "no login_flow configured; construct BrowserSessionManager with "
                 "login_flow=FormLoginFlow(...) so the session can be renewed "
@@ -773,15 +804,16 @@ class BrowserSessionManager:
             context = await environment.new_context()
             page = await environment.new_page(context)
             await handler.install(page)
-            await self.login_flow.run(page)
+            if self.login_flow is not None:
+                await self.login_flow.run(page)
+            else:
+                await page.goto(
+                    self.captcha_url or self.base_url, wait_until="domcontentloaded"
+                )
             observation = await handler.check(page)
             if observation.is_challenge:
-                handler.raise_for(observation)
-            if self.storage_path is not None:
-                Path(self.storage_path).parent.mkdir(parents=True, exist_ok=True)
-                self._state = await context.storage_state(path=str(self.storage_path))
-            else:
-                self._state = await context.storage_state()
+                handler.raise_for(observation, attempts=handler.solve_attempts)
+            await self._persist_state(context)
 
         cookies = self.load_cookies()
         if not cookies:
@@ -790,6 +822,14 @@ class BrowserSessionManager:
                 f"{', '.join(self.domains or ())} were stored"
             )
         return cookies
+
+    async def _persist_state(self, context: Any) -> None:
+        """Write the context's cookies/localStorage to ``storage_path`` (or memory)."""
+        if self.storage_path is not None:
+            Path(self.storage_path).parent.mkdir(parents=True, exist_ok=True)
+            self._state = await context.storage_state(path=str(self.storage_path))
+        else:
+            self._state = await context.storage_state()
 
     def refresh_session(
         self, reason: BaseException | None = None
@@ -809,7 +849,7 @@ class BrowserSessionManager:
         attempts = 0
         while not result.ok and attempts < max(0, int(self.max_refresh_attempts)):
             attempts += 1
-            if self.login_flow is None:
+            if self.login_flow is None and self.captcha_solver is None:
                 break
             refreshed = await self.arefresh_session(reason=None)
             if refreshed is None:
@@ -820,7 +860,7 @@ class BrowserSessionManager:
                 handler = self.challenge_handler or ChallengeHandler(
                     raise_on_detection=False
                 )
-                handler.raise_for(result.challenge)
+                handler.raise_for(result.challenge, attempts=handler.solve_attempts)
             result.raise_for_status()
         return self.load_cookies()
 

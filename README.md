@@ -4,7 +4,7 @@
 
 > Arena не предоставляет стабильный публичный API для всех этих маршрутов. Эндпоинты, очереди, порядок callback-аргументов и формат стрима могут измениться без предупреждения. Используйте клиент только в соответствии с правилами сервиса и имеющимися у вас правами доступа.
 >
-> Библиотека использует переданные вами cookie/заголовки и, для Direct Chat, явно переданную вами verification assertion; по явному запросу (`session_source="firefox"`) она может читать сессию из вашего локального профиля Firefox (см. ниже). При challenge (`ChallengeRequiredError`) клиент сообщает об этом — с Firefox-сессией он дождётся проверки, перечитает cookie и повторит запрос.
+> Библиотека использует переданные вами cookie/заголовки и, для Direct Chat, явно переданную вами verification assertion. `auto_client()` и `session_source="firefox"` читают сессию из **вашего собственного** локального профиля браузера — ничего не отправляется наружу, кроме обычных запросов к выбранному `base_url`. При challenge (`ChallengeRequiredError`) клиент сообщает об этом — с браузерной сессией он дождётся проверки, перечитает cookie и повторит запрос.
 
 ## Установка
 
@@ -20,6 +20,124 @@ pytest
 ```
 
 Транспорт построен на `httpx` с HTTP/2.
+
+## Ноль настроек: от вас нужен только вход в аккаунт
+
+Единственный ручной шаг — войти в свой аккаунт в своём браузере. Всё остальное
+`arena_api/auto.py` делает сам: находит сессию, подставляет заголовки того же
+браузера, проверяет её одним запросом, а при отказе — обновляет.
+
+```bash
+python -m pip install '.[auto]'           # всё сразу: профили браузеров + солвер
+playwright install chromium               # нужен только для решения капчи
+```
+
+То же самое по частям (каждый шаг необязателен):
+
+```bash
+python -m pip install '.[firefox]'        # чтение профилей Chrome/Edge/Brave/...
+python -m pip install '.[auth-captcha]'   # автоматическое решение reCAPTCHA
+python -m pip install '.[e2e]'            # быстрая валидация сессии через curl_cffi
+```
+
+```python
+from arena_api import auto_client
+
+with auto_client() as arena:          # ни одного аргумента
+    print(arena.get_models())
+```
+
+Если сессия не найдена, библиотека напишет, где именно она искала, и подождёт
+Enter: откройте сайт в браузере, войдите, вернитесь в терминал — дальше всё само.
+
+### Где ищется сессия (по порядку, берётся первый найденный)
+
+1. `cookies=` — если вы всё-таки передали экспорт вручную;
+2. `ARENA_COOKIE` (строка `Cookie` из DevTools) или `ARENA_COOKIES_FILE` (путь к JSON);
+3. `state/cookies.json` — если такой файл уже есть (его сохранили вы или прошлый
+   запуск с `storage_path=`); сам bootstrap cookie на диск не пишет;
+4. ваш профиль **Firefox** (`cookies.sqlite` читается даже залоченным, `rookiepy` не нужен);
+5. остальные браузеры через `rookiepy`: Chrome, Chromium, Edge, Brave, Vivaldi, Opera.
+
+Заголовки запросов соответствуют тому браузеру, откуда взялись cookie: сессия из
+Firefox представляется Firefox, после обновления в нашем Chromium — Chromium.
+
+### Что происходит, когда сессию отвергли
+
+Порядок («лестница») — от самого дешёвого способа к самому тяжёлому:
+
+1. **перечитать источник**: для браузерного профиля это «обновите страницу и
+   нажмите Enter» — свой браузер не запускается;
+2. **настоящий вход по форме**: задаётся переменными окружения
+   `ARENA_LOGIN_URL`, `ARENA_USERNAME`, `ARENA_PASSWORD`, `ARENA_USER_SELECTOR`,
+   `ARENA_PASS_SELECTOR`, `ARENA_SUBMIT_SELECTOR`, `ARENA_SUCCESS_URL`
+   (неполный набор игнорируется — ничего не угадывается);
+3. **снять капчу в браузере**: если установлены зависимости солвера,
+   `solve_captchas="auto"` включает его сам; stealth применяется всегда, второй
+   браузер не запускается — используется страница самого прогона.
+
+Обычно до 2–3-й ступени дело не доходит: транспорт сам запрашивает свежие cookie
+и повторяет запрос, так что `ChallengeRequiredError` до вас не доходит.
+
+### Полезные переключатели
+
+Все поля `AutoOptions` необязательны; чаще всего хватает одного-двух:
+
+```python
+from arena_api import AutoOptions, auto_client
+
+client = auto_client(
+    AutoOptions(
+        base_url="https://lmarena.ai",  # другой доступный вам frontend
+        solve_captchas="auto",          # auto | True | False
+        captcha_backend="audio",        # audio | image | vision_ai
+        interactive=False,              # не ждать Enter (для cron/CI)
+        verify=True,                    # один проверочный запрос при старте
+    )
+)
+```
+
+| Поле | По умолчанию | Зачем |
+|---|---|---|
+| `cookies` | `None` | явный экспорт — переопределяет всё остальное |
+| `storage_path` | `state/cookies.json`, если существует | куда сохранять и откуда читать сессию |
+| `use_browser_profiles` | `True` | читать профили браузеров |
+| `profiles_root`, `profile_name`, `cookie_database` | `None` | нестандартное расположение Firefox |
+| `interactive`, `prompt` | `True`, `input` | ждать ли входа и как именно спрашивать |
+| `login_flow`, `login_from_env` | `None`, `True` | свой сценарий входа вместо переменных окружения |
+| `solve_captchas`, `captcha_backend`, `captcha_solver` | `"auto"`, `"audio"`, `None` | решение reCAPTCHA |
+| `probe_path`, `verify` | `/config`, `True` | каким запросом проверять сессию |
+| `max_auth_refreshes` | `2` | сколько раз повторить запрос после обновления |
+
+### То же самое из командной строки
+
+```bash
+python -m arena_api --explain    # где искалась сессия, есть ли логин и солвер
+python -m arena_api --status     # найденная сессия + один проверочный запрос
+python -m arena_api --models     # список моделей
+python -m arena_api --prompt "Привет"
+```
+
+Коды возврата: `0` — всё работает, `1` — сессию найти не удалось, `2` — сессия
+найдена, но сервер её отверг.
+
+После `pip install .` те же флаги доступны как консольная команда `arena-api`
+(`[project.scripts]` в `pyproject.toml`): `arena-api --status`.
+
+### Direct Chat
+
+```python
+from arena_api import auto_direct_client
+
+# assertion по-прежнему получаете вы сами — direct.py ничего не решает за вас
+client = auto_direct_client(verification_token="03YOUR_ASSERTION")
+
+# opt-in: перехватить свежую v3-assertion солвером на странице Direct Chat
+client = auto_direct_client(verification_token="auto")
+```
+
+`auto_direct_client()` принимает ту же сессию, что и `auto_client()`, поэтому
+отклонённый cookie обновляется и запрос повторяется автоматически.
 
 ## Cookie-сессия
 
@@ -115,7 +233,8 @@ playwright install chromium
 | `environment.py` | init-скрипт детерминизма: заморозка анимаций, seeded `Math.random`, привязка `Date`, тестовые хуки |
 | `browser.py` | `BrowserEnvironment`: воспроизводимые контексты Playwright, трассировки, HAR, скриншоты, артефакты |
 | `kinematics.py` | кинематика курсора: кубические кривые Безье, время по Фиттсу, ease-in-out, микро-тремор, overshoot |
-| `challenge.py` | детектирование верификационных экранов и сбор диагностики |
+| `challenge.py` | детектирование верификационных экранов и сбор диагностики; opt-in решение через солвер |
+| `captcha.py` | мост к `recaptcha_toolkit`: решение reCAPTCHA v2/v3 на уже открытой странице (только по явному запросу) |
 | `session.py` | `BrowserSessionManager`: валидация через `curl_cffi`, экспорт `cookies.json`, обновление через реальный логин |
 
 ### Валидация и обновление сессии
@@ -222,6 +341,47 @@ except ChallengeRequiredError as exc:
 
 Поддерживаемые Playwright-опции нормализации окружения: `locale` (он же `navigator.languages`), `timezone_id`, `user_agent`, `viewport`, `device_scale_factor`, `color_scheme`, `reduced_motion`.
 
+### Решение reCAPTCHA во время прогона (opt-in)
+
+Всё вышесказанное — про **детектирование**: по умолчанию `arena_api.auth` находит верификационный экран, сохраняет диагностику и сообщает о нём. Если вам нужно именно *решить* reCAPTCHA (на своём стенде или там, где у вас есть на это право), подключите мост к `recaptcha_toolkit`:
+
+```bash
+python -m pip install '.[auth-captcha]'      # audio/image + playwright-stealth
+python -m pip install '.[e2e,vision]'        # либо локальный YOLO-бэкенд
+python -m playwright install chromium
+```
+
+```python
+from arena_api.auth import BrowserEnvironment, BrowserEnvironmentOptions, RecaptchaToolkitSolver
+
+solver = RecaptchaToolkitSolver(backend="audio")   # "audio" | "image" | "vision_ai"
+options = BrowserEnvironmentOptions.with_captcha_solving(solver, artifacts_dir="./artifacts")
+
+async with BrowserEnvironment(options) as env:
+    page = await env.new_page()          # хендлер решения ставится на каждую страницу
+    await page.goto("https://your-staging.example/login")
+    # капча решается сама по мере появления; явно — так:
+    observation = await env.solve_challenge(page)
+    print(observation.kind)              # none, если экран успешно снят
+```
+
+Три точки подключения, все opt-in:
+
+| Куда передать солвер | Что происходит |
+|---|---|
+| `BrowserEnvironmentOptions(solve_challenges=True, captcha_solver=...)` | хендлер ставится на каждую новую страницу и решает капчу по мере появления |
+| `ChallengeHandler(captcha_solver=..., solve_on_detection=True)` | решает в `check()` и в слушателе `install()`; подходит для точечного контроля |
+| `BrowserSessionManager(captcha_solver=...)` | решает капчу во время `refresh_session()`; без `login_flow` это «challenge-only» обновление: открыть `captcha_url`, снять экран, сохранить cookie |
+
+Как это устроено и где границы:
+
+- **Второго браузера нет.** Боты `recaptcha_toolkit` используются как фасад солвера: `solve_recaptcha_v2/v3` принимают внешнюю `page` и не трогают собственный контекст бота, поэтому бот создаётся, но **не** запускается. Исключение — `vision_ai`: YOLO-солвер реплицирует виджет в своём Chromium, поэтому ему передаются `website_key`/`website_url` (определяются со страницы) и, по умолчанию, cookie вашей страницы.
+- **v2 или v3 определяется по странице**: видимый чекбокс → аудио/картиночный челлендж, невидимый виджет → перехват токена с перезагрузкой страницы (слушатель должен встать до запроса `/recaptcha/api2/reload`). Можно зафиксировать вручную: `RecaptchaToolkitSolver(version="v3")`.
+- **Решается только reCAPTCHA.** Turnstile, hCaptcha и managed-челлендж Cloudflare токена не дают — они остаются на пути «обнаружить и сообщить», даже если солвер подключён (`SOLVABLE_CHALLENGE_KINDS`). Смешанные случаи (reCAPTCHA внутри Cloudflare-интерстишла) по умолчанию тоже не решаются: снятие виджета не снимет интерстишел. Флаг `allow_mixed_signals=True` снимает это ограничение.
+- **Маскировка применяется при решении** (`apply_stealth=True` по умолчанию): решать капчу, одновременно объявляя `navigator.webdriver` и `X-Synthetic-Monitor`, бессмысленно. `BrowserEnvironmentOptions.with_captcha_solving()` поэтому снимает оба объявления; на собственном стенде, где монитор разрешён по заголовку, верните их: `with_captcha_solving(solver, identify_automation=True)`.
+- **Циклы исключены.** Перезагрузка страницы снова будит слушатель, поэтому на страницу выделен бюджет `max_solve_attempts` (по умолчанию 1), параллельные решения по одной странице сериализуются, а неудача поднимает `CaptchaSolveError` (подкласс `ChallengeRequiredError`, так что существующие `except` продолжают работать) с перечислением всех попыток и их причин.
+- Быстрый HTTP-путь (`validate()`, `inspect_response()`) страницы не имеет, поэтому всегда остаётся наблюдательным.
+
 ## `recaptcha_toolkit` — решение reCAPTCHA и маскировка автоматизации
 
 Отдельный пакет `recaptcha_toolkit` собирает под одним типизированным API четыре библиотеки:
@@ -233,7 +393,7 @@ except ChallengeRequiredError as exc:
 | [`selenium-recaptcha-solver`](https://pypi.org/project/selenium-recaptcha-solver/) | решение аудио-челленджа v2 для Selenium |
 | [`playwright-stealth`](https://pypi.org/project/playwright-stealth/) | маскировка `navigator.webdriver`, языков, платформы и пр. |
 
-> Пакет автономен: он не импортируется из `arena_api` и не участвует ни в одном сценарии этого клиента — подключение остаётся на стороне вызывающего кода.
+> Пакет автономен: по умолчанию он не импортируется из `arena_api` и не участвует ни в одном сценарии этого клиента. Единственная связь — opt-in мост `arena_api.auth.captcha` (см. «Решение reCAPTCHA во время прогона» выше): он импортируется лениво и ничего не делает, пока вы не передадите солвер в хендлер, окружение или менеджер сессии.
 
 ### Установка
 
@@ -458,6 +618,7 @@ with DirectArenaClient(
 
 - `AuthenticationError` — cookie/session отклонена;
 - `ChallengeRequiredError` — нужна интерактивная браузерная проверка;
+- `CaptchaSolveError` (подкласс `ChallengeRequiredError`) — подключённый солвер не снял капчу; в сообщении — все попытки и их причины;
 - `RateLimitError` — лимит запросов (при наличии `retry_after` доступен в секундах);
 - `QueueTimeoutError` — очередь/стрим не завершился в отведённое время;
 - `ModelUnavailableError` — модель или callback недоступны;
@@ -466,8 +627,13 @@ with DirectArenaClient(
 ## Примеры и тесты
 
 - `example.py` — Gradio queue/SSE;
+- `example_auto_login.py` — ноль настроек: `auto_client()` сам находит сессию, проверяет и обновляет её;
 - `example_direct.py` — Direct Chat с assertion, переданной пользователем;
 - `example_firefox.py` — сессия из локального профиля Firefox;
 - `example_e2e.py` — синтетический мониторинг на `arena_api.auth`: быстрая валидация через `curl_cffi` (`--check`, без браузера), обновление через реальный логин, детерминированный контекст, кинематический ввод, детектор challenge;
+- `example_auth_captcha.py` — opt-in решение reCAPTCHA в E2E-прогоне: `with_captcha_solving`, challenge-only обновление сессии и явный `solve_challenge()`;
 - `tests/test_auth_integration.py` — интеграционные тесты: реальный локальный HTTP-сервер плюс настоящий `curl_cffi` (валидация, редиректы, 401/429, challenge) и сверка генерируемых kwargs с реальными сигнатурами `playwright.async_api`;
+- `tests/test_auto.py` — офлайн-тесты `arena_api/auto.py`: порядок источников сессии, классификация проверочного запроса, автообновление отвергнутой сессии, «лестница» обновления, Direct Chat и CLI;
+- `tests/test_auth_captcha.py` — офлайн-тесты моста к `recaptcha_toolkit`: выбор v2/v3, stealth, отсутствие второго браузера, бэкенды audio/image/vision_ai, бюджет попыток и интеграция с `ChallengeHandler`/`BrowserEnvironment`/`BrowserSessionManager`;
+- `python -m arena_api` — CLI того же bootstrap-слоя (`arena_api/__main__.py`);
 - остальные `tests/` — офлайн unit-тесты на парсинг cookie/SSE, mapping моделей, очереди, async API, ошибки, Firefox-сессию, retry при 403, кинематику курсора, init-скрипт детерминизма, детектор challenge и жизненный цикл сессии.

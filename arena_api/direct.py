@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from .client import SessionSource, _resolve_session_source
 from .constants import (
     DEFAULT_BASE_URL,
     DEFAULT_QUEUE_TIMEOUT,
@@ -27,6 +28,7 @@ from .constants import (
     DIRECT_STREAM_PATH,
 )
 from .exceptions import ModelUnavailableError, ProtocolError, QueueTimeoutError
+from .auth.firefox_session import SessionManager
 from .models import GenerationConfig, Message, ModelInfo, StreamChunk
 from .transport import (
     ArenaTransport,
@@ -495,13 +497,20 @@ class _DirectMixin:
 
 
 class DirectArenaClient(_DirectMixin):
-    """Blocking client for the current Arena Direct Chat frontend."""
+    """Blocking client for the current Arena Direct Chat frontend.
+
+    Accepts the same ``session_source`` as
+    :class:`~arena_api.client.ArenaClient` (``"firefox"`` or any
+    :class:`~arena_api.auth.SessionManager`), so a stale session is re-read and
+    the request replayed instead of surfacing a 403.
+    """
 
     def __init__(
         self,
         *,
         base_url: str = DEFAULT_BASE_URL,
         cookies: CookieInput = None,
+        session_source: SessionSource = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
@@ -510,15 +519,30 @@ class DirectArenaClient(_DirectMixin):
         direct_page_path: str = DIRECT_PAGE_PATH,
         direct_stream_path: str = DIRECT_STREAM_PATH,
         http_transport: httpx.BaseTransport | None = None,
+        max_auth_refreshes: int = 2,
     ) -> None:
+        session = _resolve_session_source(session_source, base_url)
+        merged_headers: dict[str, str] = {}
+        if session is not None:
+            merged_headers.update(session.headers)
+        if headers:
+            merged_headers.update(headers)
         self.transport = ArenaTransport(
             base_url,
             cookies=cookies,
-            headers=headers,
+            session_cookies=session.cookies if session is not None else None,
+            headers=merged_headers or None,
             timeout=timeout,
             http2=http2,
             verify=verify,
             http_transport=http_transport,
+            session_refresher=(
+                session.manager.refresh_session if session is not None else None
+            ),
+            max_auth_refreshes=max_auth_refreshes,
+        )
+        self.session_manager: SessionManager | None = (
+            session.manager if session is not None else None
         )
         self.verification_token = verification_token
         self.direct_page_path = direct_page_path
@@ -708,13 +732,18 @@ class DirectChatSession:
 
 
 class AsyncDirectArenaClient(_DirectMixin):
-    """Async client for the same Direct Chat frontend."""
+    """Async client for the same Direct Chat frontend.
+
+    Supports ``session_source`` exactly like :class:`DirectArenaClient`; the
+    (possibly blocking) refresh runs in a worker thread.
+    """
 
     def __init__(
         self,
         *,
         base_url: str = DEFAULT_BASE_URL,
         cookies: CookieInput = None,
+        session_source: SessionSource = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
@@ -723,15 +752,30 @@ class AsyncDirectArenaClient(_DirectMixin):
         direct_page_path: str = DIRECT_PAGE_PATH,
         direct_stream_path: str = DIRECT_STREAM_PATH,
         http_transport: httpx.AsyncBaseTransport | None = None,
+        max_auth_refreshes: int = 2,
     ) -> None:
+        session = _resolve_session_source(session_source, base_url)
+        merged_headers: dict[str, str] = {}
+        if session is not None:
+            merged_headers.update(session.headers)
+        if headers:
+            merged_headers.update(headers)
         self.transport = AsyncArenaTransport(
             base_url,
             cookies=cookies,
-            headers=headers,
+            session_cookies=session.cookies if session is not None else None,
+            headers=merged_headers or None,
             timeout=timeout,
             http2=http2,
             verify=verify,
             http_transport=http_transport,
+            session_refresher=(
+                session.manager.refresh_session if session is not None else None
+            ),
+            max_auth_refreshes=max_auth_refreshes,
+        )
+        self.session_manager: SessionManager | None = (
+            session.manager if session is not None else None
         )
         self.verification_token = verification_token
         self.direct_page_path = direct_page_path

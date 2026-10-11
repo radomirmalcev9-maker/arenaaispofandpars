@@ -418,6 +418,15 @@ class ArenaTransport:
         self._session_cookies = dict(cookies)
         self.session.cookies = httpx.Cookies(self._effective_cookies())
 
+    def apply_session_cookies(self, cookies: Mapping[str, str]) -> None:
+        """Install a refreshed browser-session cookie set.
+
+        The transport does this itself before replaying a request; callers that
+        refresh a session *outside* a request (a bootstrap probe, a scheduled
+        renewal) use this to bring the client up to date.
+        """
+        self._apply_session_cookies(cookies)
+
     def _refresh_after_auth_error(self, error: AuthenticationError) -> bool:
         """Ask the session source for fresh cookies; report whether to retry."""
         if self._session_refresher is None:
@@ -640,6 +649,15 @@ class AsyncArenaTransport:
         """Replace the browser-session set; cookies removed browser-side drop out."""
         self._session_cookies = dict(cookies)
         self.session.cookies = httpx.Cookies(self._effective_cookies())
+
+    def apply_session_cookies(self, cookies: Mapping[str, str]) -> None:
+        """Install a refreshed browser-session cookie set.
+
+        The transport does this itself before replaying a request; callers that
+        refresh a session *outside* a request (a bootstrap probe, a scheduled
+        renewal) use this to bring the client up to date.
+        """
+        self._apply_session_cookies(cookies)
 
     async def _refresh_after_auth_error(self, error: AuthenticationError) -> bool:
         """Run the (blocking) refresher in a worker thread; report whether to retry."""

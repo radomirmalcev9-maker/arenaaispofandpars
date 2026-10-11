@@ -25,6 +25,17 @@ public DOM markers. See :data:`REMEDIATION_TEMPLATE` for the durable
 infrastructure-level fixes -- allowlisting, the vendor's published test keys
 for CI, an exception rule on a zone you own, or a real service credential
 instead of a borrowed browser session.
+
+Opting in to solving
+--------------------
+:class:`ChallengeHandler` can also *clear* a challenge instead of only
+reporting it, but only when you ask for it: pass a ``captcha_solver`` (see
+:mod:`arena_api.auth.captcha`) and set ``solve_on_detection=True``. The handler
+then solves, re-scans the page, and reports only a challenge that survived --
+with every attempt's failure reason attached to the error. Kinds outside
+:data:`SOLVABLE_CHALLENGE_KINDS` are never solved. The fast HTTP path
+(:func:`inspect_response`, :meth:`ChallengeHandler.check_response`) has no page
+to act on, so it stays observational in all configurations.
 """
 
 from __future__ import annotations
@@ -35,9 +46,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, NamedTuple, Sequence
 
-from ..exceptions import ChallengeRequiredError
+from ..exceptions import CaptchaSolveError, ChallengeRequiredError
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from .captcha import CaptchaAttempt, CaptchaSolver
 
 __all__ = [
     "CLOUDFLARE_FRAME_HOSTS",
@@ -48,6 +62,7 @@ __all__ = [
     "HCAPTCHA_SELECTORS",
     "RECAPTCHA_SELECTORS",
     "REMEDIATION_TEMPLATE",
+    "SOLVABLE_CHALLENGE_KINDS",
     "STATUS_TEXT_MARKERS",
     "TURNSTILE_SELECTORS",
     "inspect_page",
@@ -130,6 +145,13 @@ class ChallengeKind(str, Enum):
     INTERSTITIAL = "interstitial"
     RATE_LIMIT = "rate_limit"
     UNKNOWN = "unknown"
+
+
+#: Kinds a solver bridge can act on (see :mod:`arena_api.auth.captcha`).
+#: :mod:`recaptcha_toolkit` solves reCAPTCHA only: Turnstile, hCaptcha and a
+#: managed Cloudflare interstitial have no token to produce here, so they keep
+#: the detect-and-report path even when a solver is configured.
+SOLVABLE_CHALLENGE_KINDS: frozenset[ChallengeKind] = frozenset({ChallengeKind.RECAPTCHA})
 
 
 class ChallengeSignal(NamedTuple):
@@ -534,10 +556,18 @@ async def _capture(
 
 @dataclass
 class ChallengeHandler:
-    """Detect, capture and report challenges; never solve them.
+    """Detect, capture and report challenges -- and optionally solve reCAPTCHA.
 
     Attach to a page with :meth:`install` to flag challenges as they appear
     during a flow, and call :meth:`check` at assertion points.
+
+    By default the handler is purely observational. Handing it a
+    ``captcha_solver`` (see :mod:`arena_api.auth.captcha`) and setting
+    ``solve_on_detection=True`` opts in to solving: a detected challenge is
+    passed to the solver, the page is re-scanned afterwards, and only a
+    challenge that survives the solve is reported as a failure. Kinds the
+    solver cannot act on -- Turnstile, hCaptcha, a managed Cloudflare
+    interstitial -- always keep the detect-and-report path.
     """
 
     capture_dir: str | Path | None = None
@@ -546,7 +576,24 @@ class ChallengeHandler:
     screenshot: bool = True
     raise_on_detection: bool = True
     on_detection: Callable[[ChallengeObservation], None] | None = None
+
+    #: Opt-in solver bridge, e.g.
+    #: :class:`~arena_api.auth.captcha.RecaptchaToolkitSolver`. ``None`` keeps
+    #: the handler observational.
+    captcha_solver: "CaptchaSolver | None" = None
+
+    #: Whether :meth:`check` and the :meth:`install` listener may attempt a
+    #: solve. Has no effect without ``captcha_solver``.
+    solve_on_detection: bool = False
+
+    #: Solve attempts per page before the challenge is reported instead. Keeps
+    #: a reload-driven flow (the v3 backend reloads the page) from looping.
+    max_solve_attempts: int = 1
+
     _observations: list[ChallengeObservation] = field(default_factory=list, repr=False)
+    _solve_attempts: list["CaptchaAttempt"] = field(default_factory=list, repr=False)
+    _solving_pages: set[int] = field(default_factory=set, repr=False)
+    _page_solve_budget: dict[int, int] = field(default_factory=dict, repr=False)
 
     @property
     def observations(self) -> tuple[ChallengeObservation, ...]:
@@ -554,13 +601,26 @@ class ChallengeHandler:
         return tuple(self._observations)
 
     @property
+    def solve_attempts(self) -> tuple["CaptchaAttempt", ...]:
+        """Every solve attempt made so far, oldest first."""
+        return tuple(self._solve_attempts)
+
+    @property
+    def last_attempt(self) -> "CaptchaAttempt | None":
+        """Most recent solve attempt, or ``None``."""
+        return self._solve_attempts[-1] if self._solve_attempts else None
+
+    @property
     def last(self) -> ChallengeObservation | None:
         """Most recent challenge, or ``None``."""
         return self._observations[-1] if self._observations else None
 
     def clear(self) -> None:
-        """Forget all recorded observations."""
+        """Forget all recorded observations and solve attempts."""
         self._observations.clear()
+        self._solve_attempts.clear()
+        self._solving_pages.clear()
+        self._page_solve_budget.clear()
 
     def note(self, observation: ChallengeObservation) -> ChallengeObservation:
         """Record an observation and fire ``on_detection``, without raising.
@@ -600,9 +660,9 @@ class ChallengeHandler:
         )
         return self.record(observation)
 
-    async def check(self, page: Any, *, url: str | None = None) -> ChallengeObservation:
-        """Scan a Playwright page and record the result."""
-        observation = await inspect_page(
+    async def _inspect(self, page: Any, *, url: str | None = None) -> ChallengeObservation:
+        """Scan a page with this handler's configuration (no recording)."""
+        return await inspect_page(
             page,
             capture_dir=self.capture_dir,
             screenshot=self.screenshot,
@@ -610,6 +670,96 @@ class ChallengeHandler:
             extra_text_markers=self.extra_text_markers,
             url=url,
         )
+
+    def can_solve(self, observation: ChallengeObservation) -> bool:
+        """Whether this handler would hand ``observation`` to its solver."""
+        if not self.solve_on_detection or self.captcha_solver is None:
+            return False
+        if not observation.is_challenge:
+            return False
+        supports = getattr(self.captcha_solver, "supports", None)
+        if callable(supports):
+            return bool(supports(observation))
+        return observation.kind in SOLVABLE_CHALLENGE_KINDS
+
+    async def solve_page(
+        self,
+        page: Any,
+        *,
+        observation: ChallengeObservation | None = None,
+        url: str | None = None,
+        attempts: int | None = None,
+    ) -> ChallengeObservation:
+        """Solve the challenge on ``page``, then re-scan and record the result.
+
+        Returns the post-solve observation. When the challenge survives every
+        attempt, :attr:`raise_on_detection` decides whether it is raised
+        (with each attempt's failure reason) or returned for the caller to
+        handle -- the same contract :meth:`record` already has.
+
+        :param page: an open Playwright page.
+        :param observation: a scan to act on; ``None`` scans the page first and
+            returns immediately when it holds no challenge.
+        :param url: URL reported in the observation (defaults to ``page.url``).
+        :param attempts: solve attempts for this call. ``None`` uses what is
+            left of the page's :attr:`max_solve_attempts` budget, which is what
+            keeps the passive listener from looping; an explicit number always
+            runs that many attempts (and is charged to the same budget).
+        """
+        solver = self.captcha_solver
+        if solver is None:
+            raise ValueError(
+                "no captcha_solver configured; construct ChallengeHandler with "
+                "captcha_solver=RecaptchaToolkitSolver(...) to solve challenges"
+            )
+        current = observation if observation is not None else await self._inspect(page, url=url)
+        if not current.is_challenge:
+            return self.record(current)
+        # A challenge that is about to be solved is still worth recording: the
+        # run should show that it happened, not only that it was cleared.
+        self.note(current)
+
+        page_key = id(page)
+        if attempts is None:
+            budget = max(1, int(self.max_solve_attempts)) - self._page_solve_budget.get(page_key, 0)
+        else:
+            budget = max(1, int(attempts))
+        for _ in range(max(0, budget)):
+            self._page_solve_budget[page_key] = self._page_solve_budget.get(page_key, 0) + 1
+            self._solve_attempts.append(await solver.asolve(page, current))
+            current = await self._inspect(page, url=url)
+            self.note(current)
+            if not current.is_challenge:
+                return current
+
+        if self.raise_on_detection:
+            self.raise_for(current, attempts=self.solve_attempts)
+        return current
+
+    async def _auto_solve(self, page: Any, *, url: str | None = None) -> None:
+        """Solve from the passive listener, one page at a time.
+
+        Guarded twice over: a page that is already being solved is skipped (the
+        v3 backend reloads the page, which fires the listener again), and the
+        per-page attempt budget caps the total work so a stubborn challenge
+        ends in a report rather than a reload loop.
+        """
+        page_key = id(page)
+        if page_key in self._solving_pages:
+            return
+        if self._page_solve_budget.get(page_key, 0) >= max(1, int(self.max_solve_attempts)):
+            return
+        self._solving_pages.add(page_key)
+        try:
+            await self.solve_page(page, url=url)
+        finally:
+            self._solving_pages.discard(page_key)
+
+    async def check(self, page: Any, *, url: str | None = None) -> ChallengeObservation:
+        """Scan a Playwright page, record the result, and solve it if opted in."""
+        observation = await self._inspect(page, url=url)
+        if self.can_solve(observation):
+            return await self.solve_page(page, observation=observation, url=url)
         return self.record(observation)
 
     async def install(self, page: Any) -> None:
@@ -617,7 +767,9 @@ class ChallengeHandler:
 
         Useful for long flows where a challenge may appear mid-run rather than
         on the landing page. Detection is purely observational: the response
-        body is read, never modified or replayed.
+        body is read, never modified or replayed. With ``solve_on_detection``
+        enabled, a solvable challenge additionally triggers :meth:`solve_page`
+        on the page that produced it.
         """
 
         async def _on_response(response: Any) -> None:
@@ -625,12 +777,21 @@ class ChallengeHandler:
                 if response.status in _SUSPECT_STATUS or response.status == 200:
                     body = await _safe_body(response)
                     if body:
-                        self.check_response(
+                        observation = inspect_response(
                             response.status,
                             response.headers,
                             body,
                             url=response.url,
+                            extra_text_markers=self.extra_text_markers,
                         )
+                        if self.can_solve(observation):
+                            # Recorded here, then re-scanned from the DOM by
+                            # solve_page: a widget reference in a subresource
+                            # body is not the same as a challenge on the page.
+                            self.note(observation)
+                            await self._auto_solve(page, url=response.url)
+                            return
+                        self.record(observation)
             except ChallengeRequiredError:
                 raise
             except Exception:
@@ -638,7 +799,12 @@ class ChallengeHandler:
 
         page.on("response", lambda response: _schedule(_on_response(response)))
 
-    def raise_for(self, observation: ChallengeObservation) -> None:
+    def raise_for(
+        self,
+        observation: ChallengeObservation,
+        *,
+        attempts: Sequence["CaptchaAttempt"] = (),
+    ) -> None:
         """Raise :class:`ChallengeRequiredError` with remediation guidance."""
         artifacts = [
             path
@@ -652,11 +818,19 @@ class ChallengeHandler:
                 REMEDIATION_TEMPLATE.format(monitor_header="X-Synthetic-Monitor"),
             ]
         )
+        failed = [attempt for attempt in attempts if not attempt.ok]
+        if failed:
+            detail += "\nSolver attempts:\n" + "\n".join(
+                f"  - {attempt.describe()}" for attempt in failed
+            )
         if artifacts:
             detail += "\nCaptured diagnostics:\n" + "\n".join(
                 f"  - {path}" for path in artifacts
             )
-        raise ChallengeRequiredError(detail)
+        error: ChallengeRequiredError = (
+            CaptchaSolveError(detail) if failed else ChallengeRequiredError(detail)
+        )
+        raise error
 
 
 async def _safe_body(response: Any) -> str:

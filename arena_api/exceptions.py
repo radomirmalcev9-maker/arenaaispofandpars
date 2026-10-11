@@ -19,6 +19,17 @@ class ChallengeRequiredError(AuthenticationError):
     """
 
 
+class CaptchaSolveError(ChallengeRequiredError):
+    """A configured solver could not clear an interactive challenge.
+
+    Raised only when ``arena_api.auth`` was explicitly given a captcha solver
+    (see :mod:`arena_api.auth.captcha`). It subclasses
+    :class:`ChallengeRequiredError`, so existing handlers keep working: the
+    remediation is still a browser/human-level fix, the message just also
+    reports what the solver tried and why it gave up.
+    """
+
+
 class QueueTimeoutError(ArenaError):
     """The queue or stream did not complete before its configured timeout."""
 

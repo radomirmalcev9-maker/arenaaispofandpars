@@ -15,7 +15,13 @@ things and nothing else:
 
 It does **not** install stealth/fingerprint patches. See
 :mod:`arena_api.auth.environment` for the reasoning; the short version is that
-a synthetic monitor should be identifiable, not camouflaged.
+a synthetic monitor should be identifiable, not camouflaged. The one opt-in
+exception is challenge *solving*: ``BrowserEnvironmentOptions.solve_challenges``
+plus a ``captcha_solver`` installs a
+:class:`~arena_api.auth.challenge.ChallengeHandler` on every page, and
+:meth:`BrowserEnvironmentOptions.with_captcha_solving` additionally drops the
+synthetic-monitor announcement, since masking automation while announcing it
+would be self-contradictory.
 
 Playwright is imported lazily, so importing this module never requires the
 package (or a downloaded browser binary) to be present.
@@ -24,14 +30,18 @@ package (or a downloaded browser binary) to be present.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as _distribution_version
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+from .challenge import ChallengeHandler, ChallengeObservation
 from .environment import DeterminismOptions, build_init_script
 from .kinematics import KinematicMouse, TrajectoryPlanner
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from .captcha import CaptchaSolver
 
 __all__ = [
     "BrowserEnvironment",
@@ -130,6 +140,51 @@ class BrowserEnvironmentOptions:
     #: Trajectory planner handed to :meth:`BrowserEnvironment.mouse`.
     planner: TrajectoryPlanner | None = None
 
+    #: Opt-in challenge solver (see :mod:`arena_api.auth.captcha`). ``None``
+    #: keeps every page observational, which is the default posture.
+    captcha_solver: "CaptchaSolver | None" = None
+
+    #: Install a solving :class:`~arena_api.auth.challenge.ChallengeHandler` on
+    #: every page created by :meth:`BrowserEnvironment.new_page`. Requires
+    #: ``captcha_solver``.
+    solve_challenges: bool = False
+
+    #: Use this handler instead of building one from the options above. Its
+    #: ``captcha_solver`` is filled in from ``captcha_solver`` when unset.
+    challenge_handler: ChallengeHandler | None = None
+
+    @classmethod
+    def with_captcha_solving(
+        cls,
+        captcha_solver: Any,
+        *,
+        identify_automation: bool = False,
+        **overrides: Any,
+    ) -> "BrowserEnvironmentOptions":
+        """Options preconfigured to solve challenges rather than only report them.
+
+        Masking ``navigator.webdriver`` while announcing the run through
+        ``X-Synthetic-Monitor`` and ``window.__arenaSynthetic`` defeats both, so
+        the announcements are dropped by default here. Pass
+        ``identify_automation=True`` to keep them (for example on a staging host
+        that allowlists the monitor by header).
+
+        :param captcha_solver: e.g.
+            :class:`~arena_api.auth.captcha.RecaptchaToolkitSolver`.
+        :param identify_automation: keep the synthetic-monitor announcements.
+        :param overrides: any other :class:`BrowserEnvironmentOptions` field.
+        """
+        determinism = overrides.pop("determinism", None) or DeterminismOptions()
+        if not identify_automation:
+            determinism = replace(determinism, identify_automation=False)
+        return cls(
+            captcha_solver=captcha_solver,
+            solve_challenges=True,
+            identify_automation=identify_automation,
+            determinism=determinism,
+            **overrides,
+        )
+
     def context_kwargs(self) -> dict[str, Any]:
         """Render the Playwright ``new_context`` keyword arguments."""
         kwargs: dict[str, Any] = {
@@ -206,6 +261,7 @@ class BrowserEnvironment:
         self._browser: Any = None
         self._contexts: list[Any] = []
         self._started = False
+        self._challenge_handler: ChallengeHandler | None = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -228,6 +284,35 @@ class BrowserEnvironment:
         """Directory that captured artefacts are written to."""
         directory = self.options.artifacts_dir
         return Path(directory) if directory is not None else None
+
+    @property
+    def challenge_handler(self) -> ChallengeHandler | None:
+        """Handler installed on new pages, or ``None`` when solving is off.
+
+        Built once, from ``options.challenge_handler`` when supplied, so every
+        page of a run shares one observation and attempt history. Diagnostics
+        land in ``artifacts_dir/challenges``.
+        """
+        if self._challenge_handler is not None:
+            return self._challenge_handler
+        if not self.options.solve_challenges or self.options.captcha_solver is None:
+            return None
+        handler = self.options.challenge_handler
+        if handler is None:
+            capture_dir = (
+                self.artifacts_dir / "challenges" if self.artifacts_dir else None
+            )
+            handler = ChallengeHandler(
+                capture_dir=capture_dir,
+                # A listener runs inside a background task, where raising would
+                # be swallowed; solve_challenge() raises explicitly instead.
+                raise_on_detection=False,
+            )
+        if handler.captcha_solver is None:
+            handler.captcha_solver = self.options.captcha_solver
+        handler.solve_on_detection = True
+        self._challenge_handler = handler
+        return handler
 
     async def start(self) -> "BrowserEnvironment":
         """Launch Playwright and the browser."""
@@ -343,7 +428,38 @@ class BrowserEnvironment:
                     await route.continue_()
 
             await page.route("**/*", _route_handler)
+        handler = self.challenge_handler
+        if handler is not None:
+            await handler.install(page)
         return page
+
+    async def solve_challenge(
+        self, page: Any, *, url: str | None = None, raise_on_failure: bool = True
+    ) -> ChallengeObservation:
+        """Solve a challenge on ``page`` explicitly and return the re-scan.
+
+        :meth:`new_page` already solves challenges as they appear when
+        ``solve_challenges`` is on; this is the imperative form for a known
+        point in a flow (after a navigation, before an assertion).
+
+        :param page: an open Playwright page.
+        :param url: URL to report in the observation (defaults to ``page.url``).
+        :param raise_on_failure: raise
+            :class:`~arena_api.exceptions.CaptchaSolveError` when the challenge
+            survives every attempt.
+        :returns: the post-solve :class:`ChallengeObservation`.
+        """
+        handler = self.challenge_handler
+        if handler is None:
+            raise ValueError(
+                "challenge solving is not configured; set "
+                "BrowserEnvironmentOptions.solve_challenges and captcha_solver "
+                "(or use BrowserEnvironmentOptions.with_captcha_solving)"
+            )
+        observation = await handler.solve_page(page, url=url)
+        if observation.is_challenge and raise_on_failure:
+            handler.raise_for(observation, attempts=handler.solve_attempts)
+        return observation
 
     def mouse(self, page: Any, **kwargs: Any) -> KinematicMouse:
         """Return a :class:`KinematicMouse` bound to ``page``."""
