@@ -101,6 +101,130 @@ for domain, jar in manager.to_curl_cffi().items():
 
 Тонкости: имена cookie от более ранних доменов в `domains` имеют приоритет при коллизиях; сессия из Firefox не «чинит» просроченный на сервере логин — перезайдите в браузере; полный листинг cookie и записей с доменами доступен через `manager.cookie_records()` / `manager.to_curl_cffi()`.
 
+## E2E-инфраструктура `arena_api.auth` (Playwright)
+
+Модуль для синтетического мониторинга и интеграционных тестов **собственных или явно разрешённых** деплоев. Дополнительные зависимости:
+
+```bash
+python -m pip install '.[e2e]'
+playwright install chromium
+```
+
+| Модуль | Назначение |
+|---|---|
+| `environment.py` | init-скрипт детерминизма: заморозка анимаций, seeded `Math.random`, привязка `Date`, тестовые хуки |
+| `browser.py` | `BrowserEnvironment`: воспроизводимые контексты Playwright, трассировки, HAR, скриншоты, артефакты |
+| `kinematics.py` | кинематика курсора: кубические кривые Безье, время по Фиттсу, ease-in-out, микро-тремор, overshoot |
+| `challenge.py` | детектирование верификационных экранов и сбор диагностики |
+| `session.py` | `BrowserSessionManager`: валидация через `curl_cffi`, экспорт `cookies.json`, обновление через реальный логин |
+
+### Валидация и обновление сессии
+
+```python
+from arena_api.auth import BrowserSessionManager, FormLoginFlow
+
+manager = BrowserSessionManager(
+    base_url="https://example.com",
+    storage_path="./state/cookies.json",
+    validate_paths=("/api/me",),
+    login_flow=FormLoginFlow(
+        login_url="https://example.com/login",
+        username_selector="input[name=email]",
+        password_selector="input[name=password]",
+        submit_selector="button[type=submit]",
+        success_url_contains="/app",
+    ),
+)
+
+result = manager.validate()
+print(result.describe())   # ok [200] https://example.com/api/me: session accepted
+
+if not result.ok:
+    manager.refresh_session()      # реальный логин в Playwright, без обхода проверок
+
+session = manager.to_curl_cffi_session()
+cookies = manager.load_cookies()   # {"session": "...", ...}
+```
+
+Быстрый путь (`validate()`) — это один `curl_cffi`-запрос: поднимать Chromium, чтобы узнать «мы ещё залогинены?», не нужно. Медленный путь (`refresh_session()`) запускает браузер и выполняет **обычный вход с вашими учётными данными**; результат сохраняется в `cookies.json` (формат `storage_state`) и экспортируется в `curl_cffi.requests.Session`.
+
+### Воспроизводимый браузер
+
+```python
+import asyncio
+from arena_api.auth import (
+    BrowserEnvironment, BrowserEnvironmentOptions, DeterminismOptions,
+)
+
+async def main():
+    options = BrowserEnvironmentOptions(
+        locale="en-US",
+        timezone_id="UTC",
+        viewport={"width": 1440, "height": 900},
+        reduced_motion="reduce",
+        artifacts_dir="./artifacts",
+        record_trace=True,
+        determinism=DeterminismOptions(random_seed=7),
+        block_resource_types=("media", "font"),
+    )
+    async with BrowserEnvironment(options) as env:
+        page = await env.new_page()
+        await page.goto("https://example.com")
+        await page.evaluate("() => window.__arenaTestHooks.drain(3)")
+
+        mouse = env.mouse(page, seed=7)
+        await mouse.hover("nav a[href='/pricing']")
+        await mouse.click("a.cta")
+
+        await env.screenshot(page, "landing.png")
+        await env.save_storage_state(page.context, "state.json")
+
+asyncio.run(main())
+```
+
+### Кинематика курсора
+
+```python
+from arena_api.auth import TrajectoryPlanner
+
+planner = TrajectoryPlanner(seed=42)
+trajectory = planner.plan((0, 0), (640, 480))
+len(trajectory), trajectory.duration, trajectory.straightness
+```
+
+Многие UI-компоненты зависят от **движения**, а не только от финальной точки: hover-меню с гистерезисом, тултипы с debounce на `pointerenter`, drag-handles, слайдеры, канвас. Один `mouse.move(x, y)` пропускает все промежуточные события и даёт и ложные срабатывания, и пропущенные баги. Траектория строится по кубической кривой Безье, длительность — по закону Фиттса, скорость — ease-in-out с микро-тремором, изредка — небольшой overshoot с возвратом. При заданном `seed` траектория воспроизводится бит-в-бит, поэтому упавший hover-тест можно отладить, а не «поймать заново».
+
+### Детектирование challenge
+
+```python
+from arena_api import ChallengeRequiredError
+from arena_api.auth import ChallengeHandler, inspect_response
+
+handler = ChallengeHandler(capture_dir="./artifacts/challenges", raise_on_detection=True)
+try:
+    await handler.check(page)
+except ChallengeRequiredError as exc:
+    print(exc)      # что обнаружено, где, и как это исправить
+```
+
+`inspect_response(status, headers, body)` — тот же детектор для быстрого HTTP-пути, без браузера. Статус-код сам по себе не считается challenge: `403` — это ещё и обычная ошибка авторизации, поэтому требуются подтверждающие маркеры (`cf-mitigated`, текст интерстишла, ссылка на `challenges.cloudflare.com`, challenge-фрейм). При обнаружении сохраняются скриншот, HTML и JSON с сигналами.
+
+### Что этот модуль сознательно не делает
+
+- **Не решает и не обходит** CAPTCHA, Turnstile и Managed Challenge: нет поиска и клика по чекбоксу, нет обхода через аудиоканал и STT-распознавания токена, нет автоматического получения или обновления `cf_clearance`.
+- **Не маскирует автоматизацию**: нет правок `navigator.webdriver`, `navigator.plugins`, WebGL-вендора/рендерера, Canvas-шума, `navigator.permissions.query` и объекта `window.chrome`.
+
+Причины две. Первая — это обход защиты, которую владелец сервиса включил сознательно; позиция библиотеки та же, что в `ChallengeRequiredError`. Вторая — практическая: тихо «пройденный» challenge превращает громкую и понятную ошибку сборки в тихую и плавающую, после чего мониторинг перестаёт что-либо измерять. Синтетический мониторинг полезен ровно тогда, когда он **виден**: при `identify_automation=True` страница получает `window.__arenaSynthetic`, а запросы — заголовок `X-Synthetic-Monitor`, по которому владелец сервиса может сделать исключение.
+
+Что делать вместо обхода:
+
+1. Добавьте исключение в WAF/bot-management для egress-IP или ASN вашего CI — либо матчинг по заголовку `X-Synthetic-Monitor`.
+2. В CI используйте официальные тестовые sitekey/secret Cloudflare Turnstile: они всегда возвращают проходящий токен, и пайплайн прогоняет реальный путь виджета.
+3. На собственных staging-зонах отключите Bot Fight Mode и managed challenge.
+4. Для machine-to-machine мониторинга используйте API-токен или сервисный аккаунт вместо чужой браузерной сессии.
+
+Поддерживаемые Playwright-опции покрывают легитимную часть «нормализации окружения» без патчей: `locale` (он же `navigator.languages`), `timezone_id`, `user_agent`, `viewport`, `device_scale_factor`, `color_scheme`, `reduced_motion`.
+
 ## Gradio очередь и SSE
 
 ```python
@@ -208,4 +332,4 @@ with DirectArenaClient(
 - `example.py` — Gradio queue/SSE;
 - `example_direct.py` — Direct Chat с assertion, переданной пользователем;
 - `example_firefox.py` — сессия из локального профиля Firefox;
-- `tests/` — офлайн unit-тесты на парсинг cookie/SSE, mapping моделей, очереди, async API, ошибки, Firefox-сессию и retry при 403.
+- `tests/` — офлайн unit-тесты на парсинг cookie/SSE, mapping моделей, очереди, async API, ошибки, Firefox-сессию, retry при 403, кинематику курсора, init-скрипт детерминизма, детектор challenge и жизненный цикл сессии.
