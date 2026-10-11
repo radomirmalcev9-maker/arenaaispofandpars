@@ -2,14 +2,12 @@
 
 This package uses caller-provided credentials — or, opt-in via
 ``session_source="firefox"``, the signed-in session of your local Firefox
-profile — and does not bypass browser verification challenges. See the
-project README for protocol caveats.
+profile. See the project README for protocol caveats.
 
 ``arena_api.auth`` additionally ships E2E/synthetic-monitoring tooling
 (Playwright wrapper, pointer kinematics, determinism init scripts, session
-lifecycle management and a challenge *detector*). It solves no CAPTCHA and
-masks no automation signal; see ``arena_api.auth.environment`` and
-``arena_api.auth.challenge``.
+lifecycle management and a challenge *detector*); see
+``arena_api.auth.environment`` and ``arena_api.auth.challenge``.
 """
 
 from .auth import (

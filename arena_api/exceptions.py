@@ -14,7 +14,6 @@ class AuthenticationError(ArenaError):
 class ChallengeRequiredError(AuthenticationError):
     """The service returned a browser verification or anti-bot challenge.
 
-    The client intentionally does not solve, automate, or bypass challenges.
     Refresh or verify the session in a normal browser, then provide the
     resulting credentials through the documented client inputs.
     """

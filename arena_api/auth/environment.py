@@ -15,28 +15,12 @@ than protections:
 :func:`build_init_script` produces a single ``page.add_init_script`` payload
 that removes *those* sources of flake.
 
-What this module deliberately does not do
------------------------------------------
-It does not attempt to make an automated browser look like a human-operated
-one. Concretely, and on purpose, there is no:
-
-* ``navigator.webdriver`` removal or masking;
-* ``navigator.plugins`` / ``navigator.mimeTypes`` fabrication;
-* WebGL ``UNMASKED_VENDOR_WEBGL`` / ``UNMASKED_RENDERER_WEBGL`` spoofing;
-* Canvas / AudioContext fingerprint noise injection;
-* ``navigator.permissions.query`` patching;
-* ``window.chrome`` object fabrication.
-
-Those have exactly one purpose -- defeating bot-detection and anti-abuse
-systems that a site owner deployed deliberately -- and ``arena-api`` does not
-do that (see ``ChallengeRequiredError`` and the project README). They also make
-a test suite *worse*: a suite that passes only while lying about its runtime is
-a suite you cannot trust.
-
-The honest alternative, implemented here, is the opposite: set
-``identify_automation=True`` and the page exposes ``window.__arenaSynthetic``
+Identifying the monitor
+-----------------------
+Set ``identify_automation=True`` and the page exposes ``window.__arenaSynthetic``
 so the site under test can branch, and the operator can allowlist the monitor.
-Synthetic monitoring works best when the monitor is identifiable.
+See :mod:`arena_api.auth.challenge` for detecting and reporting verification
+screens.
 
 Genuinely legitimate needs that people sometimes reach for stealth patches to
 solve are already first-class Playwright context options, and

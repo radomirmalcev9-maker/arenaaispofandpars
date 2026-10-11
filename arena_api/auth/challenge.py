@@ -20,27 +20,11 @@ So this module answers three questions and stops:
   :class:`~arena_api.exceptions.ChallengeRequiredError` with a remediation
   guide and paths to captured screenshots, HTML and metadata.
 
-What this module deliberately does not do
------------------------------------------
-It does not solve challenges. Specifically, there is no:
-
-* Turnstile checkbox localisation or synthetic click;
-* challenge ``iframe`` bounding-box targeting and pointer playback;
-* interception or download of the accessibility audio stream;
-* speech-to-text transcription of that stream and token submission;
-* ``cf_clearance`` minting, harvesting, or refresh automation.
-
-Those are circumvention of an access control the site owner deployed on
-purpose. They are also operationally fragile: any of them converts a loud,
-actionable failure into a silent, intermittent one. The remediation guide in
-:data:`REMEDIATION_TEMPLATE` lists the durable fixes -- allowlisting,
-Cloudflare's published Turnstile *test* keys for CI, an exception rule on a
-zone you own, or a real service credential instead of a borrowed browser
-session.
-
-The detection logic itself is standard and safe: it reads response headers,
-status codes, frame URLs and public DOM markers. Nothing here interacts with
-the challenge widget beyond observing that it is present.
+The detection logic reads response headers, status codes, frame URLs and
+public DOM markers. See :data:`REMEDIATION_TEMPLATE` for the durable
+infrastructure-level fixes -- allowlisting, the vendor's published test keys
+for CI, an exception rule on a zone you own, or a real service credential
+instead of a borrowed browser session.
 """
 
 from __future__ import annotations
@@ -210,8 +194,8 @@ class ChallengeObservation:
 
 
 REMEDIATION_TEMPLATE = """\
-arena-api did not solve the challenge and will not bypass it. Fix it at the \
-infrastructure level instead:
+The service requested an interactive browser verification. Fix it at the \
+infrastructure level:
 
   1. Allowlist the monitor. Add a WAF skip / bot-management exception rule for
      your CI runner's egress IPs or ASN, or match on the \
@@ -219,12 +203,12 @@ infrastructure level instead:
 identify_automation is enabled.
   2. Use the vendor's own test credentials in CI. Cloudflare publishes Turnstile
      test sitekey/secret pairs that always return a passing token, so a pipeline
-     can exercise the real widget path without evading anything.
+     can exercise the real widget path end to end.
   3. Relax the rule on zones you own: disable Bot Fight Mode / managed
      challenges for the staging hostname your suite targets.
   4. Prefer a real credential over a borrowed browser session. For
-     machine-to-machine monitoring, an API token or service account is both
-     more stable and more honest than replaying a user's cookies.
+     machine-to-machine monitoring, an API token or service account is more
+     stable than replaying a user's cookies.
   5. If you must exercise production, do it at a human-scale cadence and
      identify the traffic so the operator can tune their rule.
 """

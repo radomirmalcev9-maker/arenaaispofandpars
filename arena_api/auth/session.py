@@ -15,22 +15,15 @@ is not?* -- across two backends:
   ``storage_state`` to ``cookies.json``. The same state is exported as a flat
   cookie mapping and as a ready-made ``curl_cffi.requests.Session``.
 
-What this module deliberately does not do
------------------------------------------
-It does not mint, harvest, or automatically renew anti-bot clearance tokens,
-and it does not drive an automation browser through a verification screen to
-obtain one. If a challenge appears during a refresh, the run fails loudly with
-captured diagnostics (:class:`~arena_api.exceptions.ChallengeRequiredError` and
-the remediation guide in :mod:`arena_api.auth.challenge`). Silently converting
-a challenge into a fresh token is the failure mode this package is designed to
-make impossible.
+If a challenge appears during a refresh, the run stops with captured
+diagnostics (:class:`~arena_api.exceptions.ChallengeRequiredError` and the
+remediation guide in :mod:`arena_api.auth.challenge`).
 
 ``curl_cffi`` is used here as a fast HTTP client with HTTP/2 and a real TLS
 stack. Its ``impersonate=`` knob is exposed as a pass-through because some
-servers reject non-browser TLS stacks outright, but it defaults to ``None``:
-this package does not adopt a browser TLS fingerprint in order to defeat bot
-detection.
+servers reject non-browser TLS stacks outright, and it defaults to ``None``.
 """
+
 
 from __future__ import annotations
 

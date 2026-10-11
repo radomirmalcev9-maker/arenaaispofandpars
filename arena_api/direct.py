@@ -1,8 +1,7 @@
 """Client for the Arena Next.js Direct Chat streaming frontend.
 
 These routes are undocumented and can change at any time. This adapter accepts
-only verification assertions explicitly supplied by the caller; it does not
-mint, replay, solve, or bypass browser verification tokens or anti-bot checks.
+only verification assertions explicitly supplied by the caller.
 """
 
 from __future__ import annotations

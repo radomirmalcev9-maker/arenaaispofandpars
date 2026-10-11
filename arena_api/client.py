@@ -492,8 +492,7 @@ class ArenaClient(_ArenaClientMixin):
     :class:`arena_api.auth.FirefoxSessionManager`). When the session goes
     stale, the client prints guidance, waits for you to re-verify in Firefox,
     re-reads the profile, and retries the request transparently (up to
-    ``max_auth_refreshes`` times). Browser challenges are never solved or
-    bypassed here.
+    ``max_auth_refreshes`` times).
     """
 
     def __init__(

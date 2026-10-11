@@ -1,12 +1,10 @@
 """HTTP and incremental SSE primitives shared by both client variants.
 
 Only credentials explicitly provided by the caller are used. Browser challenges
-are reported as :class:`ChallengeRequiredError`; this transport does not solve
-or bypass Cloudflare, Turnstile, CAPTCHA, or other interactive checks. When a
-``session_refresher`` hook is installed (see the ``session_source`` option of
-the clients), an authentication failure first asks that hook for fresh
-cookies — e.g. after the user re-verified in their browser — and transparently
-retries the request.
+are reported as :class:`ChallengeRequiredError`. When a ``session_refresher``
+hook is installed (see the ``session_source`` option of the clients), an
+authentication failure first asks that hook for fresh cookies — e.g. after the
+user re-verified in their browser — and transparently retries the request.
 """
 
 from __future__ import annotations
@@ -185,7 +183,7 @@ def _raise_for_status(
     if _looks_like_challenge(body, headers):
         raise ChallengeRequiredError(
             "The service requested an interactive browser verification. "
-            "Refresh or verify the session in a normal browser; arena-api does not bypass challenges."
+            "Refresh or verify the session in a normal browser and retry."
         )
     if status in (401, 403):
         raise AuthenticationError(f"The supplied session was rejected (HTTP {status}).")
