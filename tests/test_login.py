@@ -25,6 +25,7 @@ from arena_api.auth.login import (
     login_environment_options,
 )
 from arena_api.auth.browser import BrowserEnvironmentOptions
+from arena_api.auth.environment import HIDE_WEBDRIVER_SCRIPT
 
 
 # --------------------------------------------------------------------------- #
@@ -730,6 +731,94 @@ def test_the_solver_reaches_the_environment(
 
     assert options_seen[0].captcha_solver is solver
     assert options_seen[0].solve_challenges is True
+
+
+# --------------------------------------------------------------------------- #
+# hide_automation: the sign-in window stops advertising itself
+# --------------------------------------------------------------------------- #
+
+
+def test_a_person_driven_window_is_honest_by_default() -> None:
+    options = login_environment_options()
+
+    assert options.ignore_default_args == ()
+    assert "--disable-blink-features=AutomationControlled" not in options.launch_args
+    assert options.extra_init_scripts == ()
+
+
+def test_hide_automation_drops_the_markers_google_reads() -> None:
+    options = login_environment_options(hide_automation=True)
+
+    launch = options.launch_kwargs()
+    assert launch["ignore_default_args"] == ["--enable-automation"]
+    # --disable-dev-shm-usage comes from container_safe and is unrelated.
+    assert "--disable-blink-features=AutomationControlled" in launch["args"]
+    assert options.extra_init_scripts == (HIDE_WEBDRIVER_SCRIPT,)
+    # The deterministic init script is a separate, unrelated payload: the login
+    # window must not get it, and the mask must not depend on it.
+    assert options.install_determinism_script is False
+
+
+def test_hide_automation_merges_explicit_switches() -> None:
+    """An explicit ignore_default_args/launch_args survives the opt-in."""
+    options = login_environment_options(
+        hide_automation=True,
+        ignore_default_args=("--no-first-run",),
+        launch_args=("--lang=en-US",),
+        extra_init_scripts=("/* mine */",),
+    )
+
+    assert options.ignore_default_args == ("--no-first-run", "--enable-automation")
+    assert options.launch_args == (
+        "--lang=en-US",
+        "--disable-blink-features=AutomationControlled",
+    )
+    assert options.extra_init_scripts == ("/* mine */", HIDE_WEBDRIVER_SCRIPT)
+
+
+def test_alogin_and_save_forwards_hide_automation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options_seen, _ = patch_environment(monkeypatch, [[], [cookie("session", "abc")]])
+
+    result = run(
+        alogin_and_save(
+            path=tmp_path / "cookies.json",
+            hide_automation=True,
+            prompt=Prompt(),
+        )
+    )
+
+    assert result.saved is True
+    assert options_seen[0].extra_init_scripts == (HIDE_WEBDRIVER_SCRIPT,)
+    assert "--enable-automation" in options_seen[0].ignore_default_args
+    assert "--disable-blink-features=AutomationControlled" in options_seen[0].launch_args
+
+
+def test_an_explicit_environment_options_wins_over_hide_automation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Supplying options means they are used as they are, mask included or not."""
+    own = BrowserEnvironmentOptions(extra_init_scripts=())
+    supplied: list[Any] = []
+
+    def factory(options: Any) -> FakeEnvironment:
+        supplied.append(options)
+        return FakeEnvironment([[], [cookie("session", "abc")]])
+
+    monkeypatch.setattr(login_module, "BrowserEnvironment", factory)
+
+    run(
+        alogin_and_save(
+            path=tmp_path / "cookies.json",
+            hide_automation=True,
+            environment_options=own,
+            prompt=Prompt(),
+        )
+    )
+
+    assert supplied[0] is own
+    assert own.extra_init_scripts == ()
 
 
 # --------------------------------------------------------------------------- #

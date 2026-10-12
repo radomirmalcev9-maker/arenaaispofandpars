@@ -359,6 +359,26 @@ def test_determinism_script_can_be_disabled(fake_playwright) -> None:
     assert asyncio.run(scenario()).init_scripts == []
 
 
+def test_extra_init_scripts_reach_the_page_before_navigation(fake_playwright) -> None:
+    """The sign-in window needs its mask installed on the very first page."""
+    mask = "/* webdriver mask */"
+
+    async def scenario():
+        env = BrowserEnvironment(
+            BrowserEnvironmentOptions(
+                install_determinism_script=False,
+                extra_init_scripts=(mask,),
+            )
+        )
+        page = await env.new_page()
+        await env.close()
+        return page
+
+    page = asyncio.run(scenario())
+    assert page.init_scripts == [mask]
+    assert page.gotos == [], "the script is installed before anything is loaded"
+
+
 def test_resource_blocking_aborts_only_the_configured_types(fake_playwright) -> None:
     async def scenario():
         env = BrowserEnvironment(

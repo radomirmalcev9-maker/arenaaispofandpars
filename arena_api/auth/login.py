@@ -52,6 +52,7 @@ from urllib.parse import urlparse
 
 from ..constants import DEFAULT_BASE_URL
 from .browser import BrowserEnvironment, BrowserEnvironmentOptions, run_sync
+from .environment import HIDE_WEBDRIVER_SCRIPT
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from .captcha import CaptchaSolver
@@ -88,6 +89,18 @@ NO_SESSION_YET = (
 
 #: Printed when the caller gave up (Ctrl-C / closed stdin).
 WAIT_CANCELLED = "[arena-api] login wait cancelled; no state file will be written"
+
+#: Playwright's own automation switches, dropped when ``hide_automation`` is on:
+#: ``--enable-automation`` also raises Chromium's "controlled by automated
+#: software" infobar, which is a loud hint for any sign-in page that looks for
+#: one. Passed as ``ignore_default_args``, not as an argument of our own.
+AUTOMATION_DEFAULT_ARGS_TO_DROP = ("--enable-automation",)
+
+#: Chrome/Chromium switch that stops the browser from reporting
+#: ``navigator.webdriver`` at all (the Blink feature is called
+#: ``AutomationControlled``). The init-script mask in
+#: :data:`~arena_api.auth.environment.HIDE_WEBDRIVER_SCRIPT` covers the rest.
+AUTOMATION_BLINK_SWITCH = "--disable-blink-features=AutomationControlled"
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +187,7 @@ def login_environment_options(
     storage_state: str | Path | None = None,
     captcha_solver: "CaptchaSolver | None" = None,
     artifacts_dir: str | Path | None = None,
+    hide_automation: bool = False,
     **overrides: Any,
 ) -> BrowserEnvironmentOptions:
     """Options for a browser driven by a person, not by a test.
@@ -186,7 +200,17 @@ def login_environment_options(
     :param captcha_solver: opt-in solver for a challenge met on the way to the
         sign-in form. Solving stays off by default: a person can click through
         it, and diagnostics are not worth surprising automation here.
-    :param overrides: any other :class:`BrowserEnvironmentOptions` field.
+    :param hide_automation: drop the switches and page markers that give the
+        window away as a driven browser. Off by default -- the library says what
+        it is. Turn it on for the one case where the check is not about you:
+        signing in to *your own* account through Google, which refuses an
+        account sign-in from anything it reads as automated ("this browser or
+        app may not be secure"). It normally needs ``channel="chrome"`` as well:
+        a real browser that does not advertise itself, rather than a bundled
+        build pretending to be one.
+    :param overrides: any other :class:`BrowserEnvironmentOptions` field. An
+        explicit ``ignore_default_args``, ``launch_args`` or
+        ``extra_init_scripts`` is *merged* with what ``hide_automation`` adds.
     """
     kwargs: dict[str, Any] = {
         "headless": headless,
@@ -199,6 +223,16 @@ def login_environment_options(
         "artifacts_dir": artifacts_dir,
     }
     kwargs.update(overrides)
+    if hide_automation:
+        kwargs["ignore_default_args"] = tuple(
+            kwargs.get("ignore_default_args", ())
+        ) + AUTOMATION_DEFAULT_ARGS_TO_DROP
+        kwargs["launch_args"] = tuple(kwargs.get("launch_args", ())) + (
+            AUTOMATION_BLINK_SWITCH,
+        )
+        kwargs["extra_init_scripts"] = tuple(
+            kwargs.get("extra_init_scripts", ())
+        ) + (HIDE_WEBDRIVER_SCRIPT,)
     options = BrowserEnvironmentOptions(**kwargs)
     if captcha_solver is not None:
         options.captcha_solver = captcha_solver
@@ -219,6 +253,7 @@ async def alogin_and_save(
     domains: Sequence[str] | None = None,
     headless: bool = False,
     channel: str | None = None,
+    hide_automation: bool = False,
     reuse_existing: bool = True,
     save: bool = True,
     rounds: int = 5,
@@ -245,6 +280,10 @@ async def alogin_and_save(
         cannot see.
     :param channel: Chromium channel, e.g. ``"chrome"`` to use your installed
         browser instead of Playwright's build.
+    :param hide_automation: make the window look like a browser a person drives
+        (see :func:`login_environment_options`). Needed when the sign-in goes
+        through Google; ignored when ``environment_options`` is supplied, since
+        those options are then used as they are.
     :param reuse_existing: seed the context from ``path`` when it already
         exists, so an earlier session does not have to be repeated. Pass
         ``False`` to sign in as somebody else.
@@ -291,6 +330,7 @@ async def alogin_and_save(
             storage_state=seed,
             captcha_solver=captcha_solver,
             artifacts_dir=artifacts_dir,
+            hide_automation=hide_automation,
         )
     )
 

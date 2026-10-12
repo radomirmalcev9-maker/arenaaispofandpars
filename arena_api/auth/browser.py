@@ -120,6 +120,14 @@ class BrowserEnvironmentOptions:
     #: Set to ``False`` to skip the init script entirely.
     install_determinism_script: bool = True
 
+    #: Extra ``page.add_init_script`` payloads, installed before any navigation
+    #: on every page :meth:`BrowserEnvironment.new_page` returns. The one the
+    #: library itself uses is
+    #: :data:`~arena_api.auth.environment.HIDE_WEBDRIVER_SCRIPT`, and only in
+    #: the sign-in window (see ``hide_automation`` there): reproducibility is
+    #: this package's goal, concealment is not.
+    extra_init_scripts: tuple[str, ...] = ()
+
     #: Announce the run as synthetic (header + ``window.__arenaSynthetic``).
     identify_automation: bool = True
 
@@ -417,6 +425,8 @@ class BrowserEnvironment:
             script = build_init_script(
                 self.options.determinism or DeterminismOptions()
             )
+            await page.add_init_script(script=script)
+        for script in self.options.extra_init_scripts:
             await page.add_init_script(script=script)
         if self.options.block_resource_types:
             blocked = set(self.options.block_resource_types)

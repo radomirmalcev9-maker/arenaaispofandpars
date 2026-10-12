@@ -272,6 +272,14 @@ class AutoOptions:
     #: the account signs in *through Google* rather than with a password.
     channel: str | None = None
 
+    #: Drop the automation markers in the ``--login`` window
+    #: (``--enable-automation``, ``navigator.webdriver``). Off by default; turn
+    #: it on together with ``channel="chrome"`` when the sign-in goes through
+    #: Google and it keeps answering "this browser or app may not be secure".
+    #: It only affects the interactive sign-in window -- the session the library
+    #: then reads is the same either way.
+    hide_automation: bool = False
+
     #: ``True``/``False`` force challenge solving on or off; ``"auto"`` (the
     #: default) enables it when the solver dependencies are importable.
     solve_captchas: bool | Literal["auto"] = "auto"
@@ -796,9 +804,10 @@ def interactive_login(
     :param login_flow: fill the sign-in form first (``FormLoginFlow``). Without
         it, a complete ``ARENA_*`` configuration is used when present.
     :param overrides: any other :class:`AutoOptions` field -- including
-        ``channel`` (e.g. ``"chrome"``), which is how you sign in to an account
-        that authenticates *through Google*: Google rejects Playwright's bundled
-        Chromium but accepts a real, installed browser.
+        ``channel`` (e.g. ``"chrome"``) and ``hide_automation``, which together
+        are how you sign in to an account that authenticates *through Google*:
+        Google rejects Playwright's bundled Chromium, and reads the automation
+        markers it leaves behind even in a real one.
     :returns: a :class:`LoginOutcome`; :attr:`LoginOutcome.ok` is ``False`` when
         nothing was captured or the server rejected it.
 
@@ -818,6 +827,7 @@ def interactive_login(
         domains=options.cookie_domains(),
         headless=headless,
         channel=options.channel,
+        hide_automation=options.hide_automation,
         reuse_existing=not fresh,
         rounds=rounds,
         login_flow=flow,
@@ -1460,6 +1470,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--hide-automation",
+        action="store_true",
+        help=(
+            "make the --login window stop advertising that it is driven "
+            "(--enable-automation, navigator.webdriver); pair it with --channel "
+            "chrome when the sign-in goes through Google"
+        ),
+    )
+    parser.add_argument(
         "--login-rounds",
         type=int,
         default=5,
@@ -1491,6 +1510,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         probe_path=args.probe_path,
         verify=not args.no_verify,
         channel=args.channel,
+        hide_automation=args.hide_automation,
     )
 
 

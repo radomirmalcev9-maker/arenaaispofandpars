@@ -25,6 +25,30 @@
 - Тесты: `channel` в `AutoOptions`/CLI/override и текст подсказки
   (`tests/test_auto.py`).
 
+### `--hide-automation`: окно входа перестаёт представляться роботом
+
+- `login_environment_options(hide_automation=True)` (и `--hide-automation` в CLI,
+  `AutoOptions.hide_automation`) убирает из окна `--login` то, по чему Google
+  отличает управляемый браузер: `--enable-automation` уходит в
+  `ignore_default_args`, добавляется `--disable-blink-features=AutomationControlled`,
+  а на страницу ставится init-скрипт `HIDE_WEBDRIVER_SCRIPT`, снимающий
+  `navigator.webdriver` (удаление из прототипа, с `defineProperty` для сборок,
+  где `delete` запрещён). Пара `--channel chrome --hide-automation` — рабочая
+  комбинация для аккаунта, который входит **через Google**.
+- Новое поле `BrowserEnvironmentOptions.extra_init_scripts` — init-скрипты,
+  которые ставятся на каждую страницу из `new_page()` **до** первой навигации
+  (маска ставится только так: скрипт, добавленный после `goto`, уже опоздал).
+  Явные `ignore_default_args`/`launch_args`/`extra_init_scripts`, переданные в
+  `login_environment_options`, не затираются, а дополняются.
+- Маскировка остаётся opt-in и не проникает в обычный путь: `build_init_script`
+  по-прежнему не содержит ни одного стелс-маркера (это стережёт отдельный тест),
+  `hide_automation=False` по умолчанию, а при явном `environment_options=`
+  вариант вызывающего используется как есть.
+- `HIDE_WEBDRIVER_SCRIPT` экспортируется из `arena_api.auth`; заодно убраны
+  дубликаты `TOOLKIT_PACKAGE`/`inspect_page` в его `__all__` и добавлен тест
+  гигиены (`arena_api.auth` как и верхний уровень: всё импортированное
+  объявлено, ничего не объявлено дважды).
+
 ### Тесты
 
 - `test_a_saved_result_names_the_file` больше не сравнивает вывод `describe()` с

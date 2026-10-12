@@ -79,6 +79,7 @@ from .challenge import (
 from .environment import (
     ANIMATION_FREEZE_CSS,
     DEFAULT_INIT_SCRIPT,
+    HIDE_WEBDRIVER_SCRIPT,
     DeterminismOptions,
     build_init_script,
 )
@@ -145,6 +146,7 @@ __all__ = [
     "FirefoxSessionManager",
     "FormLoginFlow",
     "HCAPTCHA_SELECTORS",
+    "HIDE_WEBDRIVER_SCRIPT",
     "KinematicMouse",
     "KinematicMouseSync",
     "LoginFlow",
@@ -158,7 +160,6 @@ __all__ = [
     "SOLVABLE_CHALLENGE_KINDS",
     "STATUS_TEXT_MARKERS",
     "STATE_FILE_MODE",
-    "TOOLKIT_PACKAGE",
     "TOOLKIT_PACKAGE",
     "WAITABLE_CHALLENGE_KINDS",
     "SYNTHETIC_MONITOR_HEADER",
@@ -176,7 +177,6 @@ __all__ = [
     "detect_recaptcha_version",
     "detect_recaptcha_version_sync",
     "fitts_duration",
-    "inspect_page",
     "inspect_page",
     "inspect_page_sync",
     "login_and_save",

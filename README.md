@@ -126,12 +126,21 @@ if outcome.ok:
      браузеров), затем `auto_client()`.
    Дальше работает `arena-api --status` / `--models` / `--prompt` без всякого
    Playwright.
-2. **Дать окну входа настоящий браузер:** `--channel chrome` (или `msedge` на
-   Windows) — Playwright запускает установленный у вас Google Chrome, и Google
-   такой вход принимает. Из Python то же самое:
-   `interactive_login(channel="chrome")` или `login_and_save(channel="chrome")`.
+2. **Дать окну входа настоящий браузер и перестать представляться роботом:**
+   ```bash
+   python -m arena_api --login --channel chrome --hide-automation
+   ```
+   `--channel chrome` (или `msedge` на Windows) запускает установленный у вас
+   Google Chrome вместо встроенной сборки, а `--hide-automation` убирает то, по
+   чему Google и отличает управляемый браузер: флаг `--enable-automation`, строку
+   «Chrome управляется программой автоматизации» и `navigator.webdriver`.
+   Из Python то же самое:
+   `interactive_login(channel="chrome", hide_automation=True)` или
+   `login_and_save(channel="chrome", hide_automation=True)`.
    Если Chrome не установлен, команда скажет именно это, а не «поставьте
-   chromium».
+   chromium». Оба флага влияют **только на окно входа** — сессия, которую
+   библиотека затем читает, от них не зависит; по умолчанию маскировка
+   выключена, потому что библиотека не скрывает, что она автоматизация.
 3. **Сначала войти в Google в этом же окне** (например, через другой вход на
    странице), а уже потом выбирать «Войти через Arena» — работает не всегда и
    потому стоит последним.
@@ -193,6 +202,7 @@ client = auto_client(
 | `interactive`, `prompt` | `True`, `input` | ждать ли входа и как именно спрашивать |
 | `login_flow`, `login_from_env` | `None`, `True` | свой сценарий входа вместо переменных окружения |
 | `channel` | `None` | в каком браузере открывать окно `--login`: `chrome`/`msedge` вместо встроенного Chromium (нужно, когда аккаунт входит через Google) |
+| `hide_automation` | `False` | убрать в окне `--login` признаки автоматизации, которые читает Google (`--enable-automation`, `navigator.webdriver`); включать вместе с `channel="chrome"` |
 | `solve_captchas`, `captcha_backend`, `captcha_solver` | `"auto"`, `"audio"`, `None` | решение reCAPTCHA (токен) |
 | `wait_out_challenges`, `challenge_wait_timeout` | `True`, `30.0` | ждать ли челленджи без токена: Turnstile, managed Cloudflare, hCaptcha, DataDome |
 | `probe_path`, `verify` | `/config`, `True` | каким запросом проверять сессию |
@@ -211,7 +221,9 @@ python -m arena_api --prompt "Привет"
 Флаги ожидания: `--no-wait` (не ждать челленджи без токена, только детектировать),
 `--wait-timeout 45` (сколько секунд ждать за один раунд), `--fresh`
 (игнорировать сохранённую сессию при входе), `--headless` (спрятать окно входа —
-почти никогда не нужно), `--login-rounds 5` (сколько нажатий Enter предложить).
+почти никогда не нужно), `--login-rounds 5` (сколько нажатий Enter предложить),
+`--channel chrome` и `--hide-automation` (окно входа как настоящий браузер — см.
+«Если Google не даёт войти»).
 
 Коды возврата: `0` — всё работает, `1` — сессию найти не удалось, `2` — сессия
 найдена, но сервер её отверг.

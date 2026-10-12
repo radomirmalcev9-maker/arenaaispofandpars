@@ -42,9 +42,38 @@ from typing import Any
 
 __all__ = [
     "ANIMATION_FREEZE_CSS",
+    "HIDE_WEBDRIVER_SCRIPT",
     "DeterminismOptions",
     "build_init_script",
 ]
+
+#: Opt-in init script that drops the ``navigator.webdriver`` marker Playwright
+#: leaves on every page.
+#:
+#: This module's job is reproducibility, not concealment, so the marker is left
+#: alone by default -- :func:`build_init_script` never contains this script.
+#: The one place it earns its keep is the *sign-in window* a person drives
+#: (:func:`arena_api.auth.login.login_and_save` with
+#: ``hide_automation=True``): Google refuses to authenticate an account from a
+#: browser it reads as automated ("this browser or app may not be secure"), and
+#: a human signing in to their own account is not the threat that check is for.
+#: Use it there and nowhere else.
+HIDE_WEBDRIVER_SCRIPT = """
+(function () {
+  const proto = Object.getPrototypeOf(navigator);
+  try {
+    delete proto.webdriver;
+  } catch (error) {
+    /* A hardened build can refuse the delete; fall through to defineProperty. */
+  }
+  if ('webdriver' in proto) {
+    Object.defineProperty(proto, 'webdriver', {
+      get: () => undefined,
+      configurable: true
+    });
+  }
+})();
+""".strip()
 
 #: CSS applied to make layout and painting stable for screenshots.
 #:

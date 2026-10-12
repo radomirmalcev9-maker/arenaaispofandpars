@@ -1781,6 +1781,20 @@ def test_interactive_login_forwards_the_browser_channel(tmp_path, monkeypatch) -
     assert calls["channel"] == "msedge"
 
 
+def test_interactive_login_forwards_hide_automation(tmp_path, monkeypatch) -> None:
+    """Google's check is about the window, not about the session it yields."""
+    calls = stub_login(monkeypatch, saved_result(tmp_path / "c.json"))
+
+    interactive_login(AutoOptions(), path=tmp_path / "c.json")
+    assert calls["hide_automation"] is False  # honest by default
+
+    interactive_login(AutoOptions(hide_automation=True), path=tmp_path / "c.json")
+    assert calls["hide_automation"] is True
+
+    interactive_login(AutoOptions(), path=tmp_path / "c.json", hide_automation=True)
+    assert calls["hide_automation"] is True
+
+
 def test_interactive_login_fresh_start_ignores_the_old_session(tmp_path, monkeypatch) -> None:
     calls = stub_login(monkeypatch, saved_result(tmp_path / "c.json"))
 
@@ -1933,6 +1947,7 @@ def test_cli_login_maps_its_flags(tmp_path, monkeypatch) -> None:
             "2",
             "--channel",
             "chrome",
+            "--hide-automation",
         ]
     ) == 0
 
@@ -1941,6 +1956,7 @@ def test_cli_login_maps_its_flags(tmp_path, monkeypatch) -> None:
     assert calls["headless"] is True
     assert calls["rounds"] == 2
     assert calls["options"].channel == "chrome"  # the window will be real Chrome
+    assert calls["options"].hide_automation is True
 
 
 def test_cli_login_defaults_to_the_discoverable_state_file(tmp_path, monkeypatch) -> None:
@@ -2009,7 +2025,15 @@ def test_cli_login_reports_a_browser_error_on_stderr(tmp_path, monkeypatch, caps
 
 def test_cli_help_documents_the_login_flags() -> None:
     text = build_arg_parser().format_help()
-    for flag in ("--login", "--fresh", "--headless", "--login-rounds", "--storage", "--channel"):
+    for flag in (
+        "--login",
+        "--fresh",
+        "--headless",
+        "--login-rounds",
+        "--storage",
+        "--channel",
+        "--hide-automation",
+    ):
         assert flag in text
 
 
