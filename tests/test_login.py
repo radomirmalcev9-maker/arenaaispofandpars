@@ -760,5 +760,8 @@ def test_a_saved_result_names_the_file() -> None:
     )
 
     assert result.ok is True
-    assert "saved (state/cookies.json)" in result.describe()
+    # ``describe()`` renders the path as the platform does: on Windows the very
+    # same Path stringifies with backslashes, so compare against it, not a
+    # POSIX literal.
+    assert f"saved ({Path('state/cookies.json')})" in result.describe()
     assert "1 cookie(s) for arena.ai" in result.describe()
