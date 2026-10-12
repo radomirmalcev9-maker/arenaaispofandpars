@@ -16,16 +16,25 @@ captures diagnostics, and turns them into an actionable
 :class:`~arena_api.exceptions.ChallengeRequiredError` with remediation
 guidance -- which is what a synthetic monitor actually needs.
 
+:mod:`arena_api.auth.login` covers the one step nobody can automate away: it
+opens a headed browser, lets a person sign in, and persists the session as a
+Playwright ``storage_state`` file that later runs discover on their own
+(``login_and_save()``, or ``arena-api --login`` from the bootstrap layer).
+
 :mod:`arena_api.auth.captcha` is the opt-in bridge to
-:mod:`recaptcha_toolkit`: hand a ``RecaptchaToolkitSolver`` to a
-:class:`~arena_api.auth.challenge.ChallengeHandler`, a
+:mod:`arena_api._vendor.recaptcha_toolkit`: hand a ``RecaptchaToolkitSolver`` to
+a :class:`~arena_api.auth.challenge.ChallengeHandler`, a
 :class:`~arena_api.auth.browser.BrowserEnvironmentOptions` or a
 :class:`~arena_api.auth.session.BrowserSessionManager` and a detected reCAPTCHA
-is solved instead of only reported. Nothing is active until you do.
+is solved instead of only reported. The kinds that have no token to produce are
+covered too: ``ChallengeWaitSolver`` waits Turnstile and a managed Cloudflare
+interstitial out, and hands hCaptcha/DataDome to a person in a headed window;
+``CompositeSolver`` dispatches between the two. Nothing is active until you ask.
 
 Heavy dependencies (``playwright``, ``curl_cffi``, ``numpy``,
-``recaptcha_toolkit``) are imported lazily inside the functions that need them,
-so importing this package stays cheap and works without them installed.
+``arena_api._vendor.recaptcha_toolkit``) are imported lazily inside the
+functions that need them, so importing this package stays cheap and works
+without them installed.
 """
 
 from .browser import (
@@ -36,15 +45,23 @@ from .browser import (
 )
 from .captcha import (
     TOOLKIT_PACKAGE,
+    WAITABLE_CHALLENGE_KINDS,
     CaptchaAttempt,
     CaptchaSolver,
+    ChallengeWaitSolver,
+    CompositeSolver,
     RecaptchaToolkitSolver,
+    describe_solver,
     detect_recaptcha_version,
     detect_recaptcha_version_sync,
     observation_targets_recaptcha,
+    solver_for,
 )
 from .challenge import (
     CLOUDFLARE_FRAME_HOSTS,
+    DATADOME_FRAME_HOSTS,
+    DATADOME_HEADERS,
+    DATADOME_SELECTORS,
     HCAPTCHA_SELECTORS,
     RECAPTCHA_SELECTORS,
     REMEDIATION_TEMPLATE,
@@ -56,6 +73,7 @@ from .challenge import (
     ChallengeObservation,
     ChallengeSignal,
     inspect_page,
+    inspect_page_sync,
     inspect_response,
 )
 from .environment import (
@@ -81,6 +99,14 @@ from .kinematics import (
     fitts_duration,
     resolve_element_center,
 )
+from .login import (
+    DEFAULT_STATE_PATH,
+    STATE_FILE_MODE,
+    LoginResult,
+    alogin_and_save,
+    login_and_save,
+    login_environment_options,
+)
 from .session import (
     BrowserSessionManager,
     CurlCffiProbe,
@@ -99,8 +125,13 @@ __all__ = [
     "BrowserEnvironmentOptions",
     "BrowserSessionManager",
     "CLOUDFLARE_FRAME_HOSTS",
+    "DATADOME_FRAME_HOSTS",
+    "DATADOME_HEADERS",
+    "DATADOME_SELECTORS",
     "CaptchaAttempt",
     "CaptchaSolver",
+    "ChallengeWaitSolver",
+    "CompositeSolver",
     "ChallengeHandler",
     "ChallengeKind",
     "ChallengeObservation",
@@ -108,6 +139,7 @@ __all__ = [
     "CurlCffiProbe",
     "DEFAULT_COOKIE_DOMAINS",
     "DEFAULT_INIT_SCRIPT",
+    "DEFAULT_STATE_PATH",
     "DeterminismOptions",
     "FirefoxSessionError",
     "FirefoxSessionManager",
@@ -116,6 +148,7 @@ __all__ = [
     "KinematicMouse",
     "KinematicMouseSync",
     "LoginFlow",
+    "LoginResult",
     "MouseSample",
     "Point",
     "RECAPTCHA_SELECTORS",
@@ -124,7 +157,10 @@ __all__ = [
     "RecaptchaToolkitSolver",
     "SOLVABLE_CHALLENGE_KINDS",
     "STATUS_TEXT_MARKERS",
+    "STATE_FILE_MODE",
     "TOOLKIT_PACKAGE",
+    "TOOLKIT_PACKAGE",
+    "WAITABLE_CHALLENGE_KINDS",
     "SYNTHETIC_MONITOR_HEADER",
     "SessionManager",
     "SessionProbe",
@@ -133,14 +169,21 @@ __all__ = [
     "Trajectory",
     "TrajectoryPlanner",
     "build_init_script",
+    "alogin_and_save",
     "chromium_user_agent",
     "cubic_bezier_point",
+    "describe_solver",
     "detect_recaptcha_version",
     "detect_recaptcha_version_sync",
     "fitts_duration",
     "inspect_page",
+    "inspect_page",
+    "inspect_page_sync",
+    "login_and_save",
+    "login_environment_options",
     "inspect_response",
     "normalize_state_payload",
+    "solver_for",
     "observation_targets_recaptcha",
     "resolve_element_center",
     "run_sync",

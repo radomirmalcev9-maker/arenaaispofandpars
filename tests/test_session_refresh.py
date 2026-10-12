@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
 
 import httpx
 import pytest
@@ -12,6 +11,7 @@ from arena_api import (
     AsyncArenaClient,
     AuthenticationError,
     ChallengeRequiredError,
+    FirefoxSessionError,
     FirefoxSessionManager,
     SessionManager,
 )
@@ -446,3 +446,48 @@ def test_session_cookies_replace_removed_ones_on_refresh() -> None:
         assert "removed_by_browser" not in cookie_header
     finally:
         client.close()
+
+
+def test_empty_session_cookies_name_the_custom_source() -> None:
+    """A non-Firefox manager must not be blamed on a Firefox profile."""
+    stub = StubSessionManager({})
+    with pytest.raises(AuthenticationError) as info:
+        ArenaClient(base_url="https://arena.test", session_source=stub)
+    message = str(info.value)
+    assert "StubSessionManager" in message
+    assert "Firefox profile" not in message
+    assert "Sign in to https://arena.test" in message
+
+
+def test_empty_firefox_session_still_points_at_the_profile(monkeypatch) -> None:
+    """The ``"firefox"`` shortcut keeps its profile-specific remediation."""
+
+    class EmptyFirefox(FirefoxSessionManager):
+        def load_cookies(self, domains=None):
+            return {}
+
+    monkeypatch.setattr("arena_api.client.FirefoxSessionManager", EmptyFirefox)
+    with pytest.raises(AuthenticationError) as info:
+        ArenaClient(base_url="https://arena.test", session_source="firefox")
+    message = str(info.value)
+    assert "local Firefox profile" in message
+    assert "Open https://arena.test in Firefox" in message
+
+
+def test_unreadable_custom_source_is_not_blamed_on_firefox(monkeypatch) -> None:
+    class Broken:
+        def load_cookies(self, domains=None):
+            raise FirefoxSessionError("cookie store is locked")
+
+        def firefox_headers(self, *, navigation: bool = False):
+            return {}
+
+        def refresh_session(self, reason=None):
+            return None
+
+    with pytest.raises(AuthenticationError) as info:
+        ArenaClient(base_url="https://arena.test", session_source=Broken())
+    message = str(info.value)
+    assert "Broken" in message
+    assert "cookie store is locked" in message
+    assert "Could not read the session from" in message

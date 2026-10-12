@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from recaptcha_toolkit import (
+from arena_api._vendor.recaptcha_toolkit import (
     BrowserOptions,
     CaptchaError,
     PlaywrightBot,
@@ -33,7 +33,7 @@ from recaptcha_toolkit import (
     VisionAIOptions,
     VisionAISolver,
 )
-from recaptcha_toolkit.vision_ai import VisionAIResult
+from arena_api._vendor.recaptcha_toolkit.vision_ai import VisionAIResult
 
 # Публичный тестовый site key демо-стенда Google.
 DEMO_SITE_KEY = "6Le-wvkSVVABCPBMRTvw0Q4Muexq1bi0DJwx_mJ-"

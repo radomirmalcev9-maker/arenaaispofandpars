@@ -100,16 +100,28 @@ def _resolve_session_source(
             "session_source must be 'firefox', a SessionManager instance, or None."
         )
     site = _base_host(base_url) or "arena.ai"
+    # The remediation differs per source: only "firefox" is about a profile.
+    from_firefox = isinstance(session_source, str)
+    source_label = (
+        "the local Firefox profile"
+        if from_firefox
+        else f"the session source ({type(manager).__name__})"
+    )
     try:
         cookies = manager.load_cookies()
     except FirefoxSessionError as exc:
         raise AuthenticationError(
-            f"Could not read the Firefox session: {exc}"
+            f"Could not read the session from {source_label}: {exc}"
         ) from exc
     if not cookies:
-        raise AuthenticationError(
-            f"No cookies for {site} were found in the local Firefox profile. "
+        hint = (
             f"Open https://{site} in Firefox, sign in, and start the client again."
+            if from_firefox
+            else f"Sign in to https://{site} and let {type(manager).__name__} "
+            "return the cookies for it."
+        )
+        raise AuthenticationError(
+            f"No cookies for {site} were found in {source_label}. {hint}"
         )
     return _ResolvedSessionSource(
         manager=manager,

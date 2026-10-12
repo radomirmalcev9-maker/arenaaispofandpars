@@ -3,17 +3,20 @@ from __future__ import annotations
 import io
 import os
 import sqlite3
+import sys
 import time
 import types
 from pathlib import Path
 
 import pytest
 
+from arena_api.auth import firefox_session as firefox_module
 from arena_api.auth.firefox_session import (
     DEFAULT_COOKIE_DOMAINS,
     FirefoxSessionError,
     FirefoxSessionManager,
     cookies_from_rookiepy,
+    default_profiles_root,
     read_firefox_cookies,
 )
 
@@ -529,3 +532,63 @@ def test_manager_validates_constructor_arguments() -> None:
         FirefoxSessionManager(max_cookie_attempts=0)
     with pytest.raises(ValueError):
         FirefoxSessionManager(lock_retry_delay=-1)
+
+
+# --------------------------------------------------------------------------- #
+# Platform specifics: this library reads real browser profiles, so the paths it
+# guesses have to be right on every OS -- and are testable from any of them.
+# --------------------------------------------------------------------------- #
+
+
+def _fake_home(monkeypatch, tmp_path) -> Path:
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    return tmp_path
+
+
+def test_profiles_root_on_windows_prefers_appdata(monkeypatch, tmp_path) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "platform", "win32")
+    appdata = home / "Roaming-elsewhere"
+    monkeypatch.setenv("APPDATA", str(appdata))
+    assert default_profiles_root() == appdata / "Mozilla" / "Firefox"
+
+
+def test_profiles_root_on_windows_without_appdata(monkeypatch, tmp_path) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("APPDATA", raising=False)
+    assert default_profiles_root() == home / "AppData" / "Roaming" / "Mozilla" / "Firefox"
+
+
+def test_profiles_root_on_macos(monkeypatch, tmp_path) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert default_profiles_root() == home / "Library" / "Application Support" / "Firefox"
+
+
+def test_profiles_root_on_linux(monkeypatch, tmp_path) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert default_profiles_root() == home / ".mozilla" / "firefox"
+
+
+def test_user_agent_platform_token_per_os(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert firefox_module._platform_token() == "Windows NT 10.0; Win64; x64"
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert firefox_module._platform_token() == "Macintosh; Intel Mac OS X 10.15"
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(firefox_module.platform, "machine", lambda: "x86_64")
+    assert firefox_module._platform_token() == "X11; Linux x86_64"
+    monkeypatch.setattr(firefox_module.platform, "machine", lambda: "aarch64")
+    assert firefox_module._platform_token() == "X11; Linux aarch64"
+    monkeypatch.setattr(firefox_module.platform, "machine", lambda: "arm64")
+    assert firefox_module._platform_token() == "X11; Linux aarch64"
+
+
+def test_user_agent_matches_the_platform_token(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    manager = FirefoxSessionManager(
+        domains=("arena.ai",), profiles_root=tmp_path, cookie_database=tmp_path / "c.sqlite"
+    )
+    assert firefox_module._platform_token() in manager.user_agent()

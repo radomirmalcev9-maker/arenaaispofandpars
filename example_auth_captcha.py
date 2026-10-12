@@ -29,6 +29,7 @@ What happens here:
 
 from __future__ import annotations
 
+from importlib.util import find_spec
 import asyncio
 import os
 import sys
@@ -159,13 +160,11 @@ def main() -> None:
     url = require_target_url()
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
-    try:
-        import playwright  # noqa: F401
-    except ImportError:
+    if find_spec("playwright") is None:
         raise SystemExit(
             "Playwright is not installed. Run: python -m pip install "
             "'.[auth-captcha]' && playwright install chromium"
-        ) from None
+        )
 
     try:
         if "--refresh" in sys.argv:

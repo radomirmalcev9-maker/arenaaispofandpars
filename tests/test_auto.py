@@ -17,22 +17,32 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
 import pytest
 
 from arena_api import ArenaClient, AsyncArenaClient
-from arena_api.auth.captcha import CaptchaAttempt, RecaptchaToolkitSolver
+from arena_api.auth.challenge import ChallengeKind, ChallengeObservation, ChallengeSignal
+from arena_api.auth.captcha import (
+    CaptchaAttempt,
+    ChallengeWaitSolver,
+    CompositeSolver,
+    RecaptchaToolkitSolver,
+)
 from arena_api.auth.session import BrowserSessionManager, FormLoginFlow
+from arena_api.auth.login import DEFAULT_STATE_PATH, LoginResult
 from arena_api.auto import (
     AutoOptions,
     AutoSessionManager,
     DirectVerificationToken,
     DiscoveredSession,
+    LoginOutcome,
     ProbeResult,
     _flat_records,
     _merge_options,
@@ -46,13 +56,14 @@ from arena_api.auto import (
     discover_session,
     explain_login,
     explain_sources,
+    interactive_login,
     login_flow_from_env,
     main,
     probe,
     resolve_solver,
     solver_dependencies_available,
 )
-from arena_api.constants import CONFIG_PATH, DEFAULT_BASE_URL
+from arena_api.constants import CONFIG_PATH, DEFAULT_BASE_URL, DIRECT_PAGE_PATH
 from arena_api.exceptions import AuthenticationError
 from arena_api.models import ModelInfo
 
@@ -166,8 +177,16 @@ def make_firefox_profile(tmp_path: Path, value: str = "from-firefox") -> Path:
 
 
 def isolated_options(tmp_path: Path, **kwargs) -> AutoOptions:
-    """Options that cannot pick anything up from the working directory."""
+    """Options that cannot pick anything up from the working directory.
+
+    ``profiles_root`` is pinned to a directory that does not exist: without it
+    the Firefox rung resolves the *host* profile (``~/.mozilla/firefox`` on
+    POSIX, ``%APPDATA%\\Mozilla\\Firefox\\Profiles`` on Windows) and wins the
+    ladder on any machine where the developer is signed in to arena.ai, so the
+    test would only pass on a machine without such a profile.
+    """
     kwargs.setdefault("storage_path", tmp_path / "unused" / "cookies.json")
+    kwargs.setdefault("profiles_root", tmp_path / "no-host-profiles")
     kwargs.setdefault("use_browser_profiles", False)
     kwargs.setdefault("solve_captchas", False)
     kwargs.setdefault("artifacts_dir", tmp_path / "artifacts")
@@ -359,6 +378,23 @@ def test_browser_profile_discovery_can_be_turned_off(tmp_path) -> None:
     assert discover_session(options) is None
 
 
+def test_isolated_options_never_point_at_a_host_browser_profile(tmp_path) -> None:
+    """The ladder tests must not read the developer's own Firefox profile.
+
+    Regression guard: with a real profile holding arena.ai cookies on the
+    machine, ``use_browser_profiles=True`` used to resolve it through the
+    default ``profiles_root`` and the Firefox rung answered before the rung
+    under test, so ``test_other_browsers_are_read_through_rookiepy`` failed
+    with ``'firefox' == 'browser:chrome'``.
+    """
+    options = isolated_options(tmp_path, use_browser_profiles=True)
+
+    root = Path(options.profiles_root)
+    assert root.is_relative_to(tmp_path)
+    assert not root.exists()
+    assert auto_module._from_firefox(options) is None
+
+
 def test_other_browsers_are_read_through_rookiepy(tmp_path, monkeypatch) -> None:
     seen = []
 
@@ -441,6 +477,27 @@ def test_discovery_reports_a_firefox_profile_it_cannot_use(tmp_path) -> None:
     )
     lines = explain_sources(options)
     assert any("unavailable" in line for line in lines)
+
+
+def test_the_discovery_report_is_aligned_and_honest(tmp_path, monkeypatch) -> None:
+    """`--explain` is the first thing a stuck user reads: keep it tidy."""
+    monkeypatch.chdir(tmp_path)
+    lines = explain_sources(AutoOptions(use_browser_profiles=False))
+    assert {line.index(":") for line in lines} == {20}, lines
+    assert any(line.endswith("not configured") for line in lines)
+    assert "None" not in "\n".join(lines)
+
+
+def test_the_discovery_report_names_a_configured_storage_file(tmp_path) -> None:
+    path = write_storage(tmp_path, {"session": "stored"})
+    lines = explain_sources(AutoOptions(storage_path=path, use_browser_profiles=False))
+    stored = next(line for line in lines if line.startswith("stored cookies.json"))
+    assert str(path) in stored and "(exists)" in stored
+
+
+def test_explain_login_keeps_its_sentence_form(monkeypatch) -> None:
+    monkeypatch.setenv("ARENA_USERNAME", "user@example.com")
+    assert explain_login(AutoOptions()).startswith("login flow: ")
 
 
 def test_discovery_explains_disabled_browser_profiles(tmp_path) -> None:
@@ -533,9 +590,31 @@ def test_complete_environment_is_announced(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_solver_stays_off_when_dependencies_are_missing(monkeypatch) -> None:
+def _observation(kind: ChallengeKind) -> ChallengeObservation:
+    """A minimal observation of one kind, for solver-capability checks."""
+    return ChallengeObservation(
+        url="https://arena.ai/config",
+        kind=kind,
+        signals=(ChallengeSignal("test", "constructed", kind),),
+    )
+
+
+def test_solver_falls_back_to_waiting_when_dependencies_are_missing(monkeypatch) -> None:
+    """Waiting needs no third-party package, so "auto" is not a silent no-op."""
     monkeypatch.setattr(auto_module, "_has_spec", lambda name: False)
-    assert resolve_solver(AutoOptions()) is None
+
+    solver = resolve_solver(AutoOptions())
+
+    assert isinstance(solver, ChallengeWaitSolver)
+    assert solver.timeout == 30.0
+    assert solver.interactive is True  # follows options.interactive
+    assert ChallengeKind.RECAPTCHA not in solver.solve_kinds
+    assert ChallengeKind.TURNSTILE in solver.solve_kinds
+
+
+def test_solver_is_fully_off_only_when_both_paths_are_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(auto_module, "_has_spec", lambda name: False)
+    assert resolve_solver(AutoOptions(wait_out_challenges=False)) is None
 
 
 def test_solver_switches_itself_on_when_dependencies_exist(monkeypatch) -> None:
@@ -545,16 +624,49 @@ def test_solver_switches_itself_on_when_dependencies_exist(monkeypatch) -> None:
         lambda name: name in {"playwright", "playwright_recaptcha", "playwright_stealth"},
     )
     solver = resolve_solver(AutoOptions())
-    assert isinstance(solver, RecaptchaToolkitSolver)
-    assert solver.backend == "audio"
-    assert solver.apply_stealth is True
+    assert isinstance(solver, CompositeSolver)
+    toolkit, wait = solver.solvers
+    assert isinstance(toolkit, RecaptchaToolkitSolver)
+    assert toolkit.backend == "audio"
+    assert toolkit.apply_stealth is True
+    assert isinstance(wait, ChallengeWaitSolver)
+    # dispatch order: a token beats patience for reCAPTCHA
+    assert solver.select(_observation(ChallengeKind.RECAPTCHA)) is toolkit
+    assert solver.select(_observation(ChallengeKind.TURNSTILE)) is wait
+    assert "composite[" in solver.describe()
 
 
 def test_solver_can_be_forced_on(monkeypatch) -> None:
     monkeypatch.setattr(auto_module, "_has_spec", lambda name: False)
     solver = resolve_solver(AutoOptions(solve_captchas=True, captcha_backend="image"))
+    assert isinstance(solver, CompositeSolver)
+    assert isinstance(solver.solvers[0], RecaptchaToolkitSolver)
+    assert solver.solvers[0].backend == "image"
+
+
+def test_waiting_can_be_disabled_on_its_own(monkeypatch) -> None:
+    monkeypatch.setattr(
+        auto_module,
+        "_has_spec",
+        lambda name: name in {"playwright", "playwright_recaptcha", "playwright_stealth"},
+    )
+    solver = resolve_solver(AutoOptions(wait_out_challenges=False))
     assert isinstance(solver, RecaptchaToolkitSolver)
-    assert solver.backend == "image"
+
+
+def test_the_wait_timeout_comes_from_the_options(monkeypatch) -> None:
+    monkeypatch.setattr(auto_module, "_has_spec", lambda name: False)
+    solver = resolve_solver(
+        AutoOptions(challenge_wait_timeout=5.0, interactive=False, output=io.StringIO())
+    )
+    assert isinstance(solver, ChallengeWaitSolver)
+    assert solver.timeout == 5.0
+    assert solver.interactive is False
+
+
+def test_a_non_positive_wait_timeout_is_refused() -> None:
+    with pytest.raises(ValueError):
+        AutoOptions(challenge_wait_timeout=0)
 
 
 def test_solver_can_be_forced_off_even_with_dependencies(monkeypatch) -> None:
@@ -967,6 +1079,45 @@ def test_headers_survive_a_source_without_them() -> None:
     assert "Chrome/" in manager.firefox_headers()["User-Agent"]
 
 
+def test_parallel_refreshes_do_not_repeat_the_work() -> None:
+    """Two requests failing at once must not start two browsers or two prompts."""
+
+    class SlowSource(StubSource):
+        def __init__(self):
+            super().__init__({"session": "renewed"})
+            self.calls = 0
+
+        def refresh_session(self, reason=None):
+            self.calls += 1
+            time.sleep(0.05)
+            return dict(self.cookies)
+
+    source = SlowSource()
+    manager = make_manager(fallback=source)
+    gate = threading.Barrier(2, timeout=10)
+
+    def refresh(_):
+        gate.wait()
+        return manager.refresh_session(AuthenticationError("rejected (403)"))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(refresh, range(2)))
+
+    assert source.calls == 1
+    assert results == [{"session": "renewed"}, {"session": "renewed"}]
+    assert manager.load_cookies() == {"session": "renewed"}
+
+
+def test_a_second_refresh_after_a_failed_one_still_tries() -> None:
+    """The short-circuit only applies while another thread already succeeded."""
+    source = StubSource(None)
+    manager = make_manager(fallback=source)
+    with pytest.raises(AuthenticationError, match="no automatic refresh path"):
+        manager.refresh_session()
+    source.cookies = {"session": "late"}
+    assert manager.refresh_session() == {"session": "late"}
+
+
 def test_adopt_replaces_the_cookie_set() -> None:
     manager = make_manager()
     manager.adopt({"session": "adopted", "other": "value"})
@@ -986,7 +1137,9 @@ def test_build_session_manager_wires_the_ladder_and_solver(tmp_path, monkeypatch
     options = isolated_options(tmp_path, login_from_env=False, solve_captchas="auto")
     manager = build_session_manager(options, discovered)
     assert manager.fallback is source
-    assert isinstance(manager.captcha_solver, RecaptchaToolkitSolver)
+    assert isinstance(manager.captcha_solver, CompositeSolver)
+    assert isinstance(manager.captcha_solver.solvers[0], RecaptchaToolkitSolver)
+    assert isinstance(manager.captcha_solver.solvers[1], ChallengeWaitSolver)
     assert manager.challenge_handler.solve_on_detection is True
     assert manager.base_url == options.base_url
     assert manager.domains == options.cookie_domains()
@@ -1068,6 +1221,73 @@ def test_async_direct_client_is_wired_the_same_way(tmp_path) -> None:
     assert asyncio.run(run()) is True
 
 
+def test_direct_client_verifies_the_session_at_startup(tmp_path) -> None:
+    recorder = Recorder((200, CONFIG_JSON, "application/json"))
+    options = isolated_options(tmp_path, cookies="session=abc", http_transport=recorder.transport)
+    output = options.output
+    client = auto_direct_client(options)
+    assert recorder.requests[0].url.path == "/config"
+    assert "verification: ok" in output.getvalue()
+    client.close()
+
+
+def test_direct_client_heals_a_rejected_session(tmp_path, monkeypatch) -> None:
+    recorder = Recorder(
+        (403, b"denied", "text/plain"),
+        (200, CONFIG_JSON, "application/json"),
+    )
+
+    def heal(self, reason=None):
+        self.adopt({"session": "fresh"})
+        return {"session": "fresh"}
+
+    monkeypatch.setattr(AutoSessionManager, "refresh_session", heal)
+    options = isolated_options(tmp_path, cookies="session=stale", http_transport=recorder.transport)
+    client = auto_direct_client(options)
+    assert "session=fresh" in recorder.cookies(1)
+    assert "verification: ok" in options.output.getvalue()
+    client.close()
+
+
+def test_direct_client_can_skip_verification(tmp_path) -> None:
+    recorder = Recorder((200, CONFIG_JSON, "application/json"))
+    options = isolated_options(
+        tmp_path, cookies="session=abc", http_transport=recorder.transport, verify=False
+    )
+    client = auto_direct_client(options)
+    assert recorder.requests == []
+    client.close()
+
+
+def test_async_direct_client_verifies_too(tmp_path) -> None:
+    recorder = Recorder((200, CONFIG_JSON, "application/json"))
+    options = isolated_options(tmp_path, cookies="session=abc", http_transport=recorder.transport)
+
+    async def run() -> str:
+        client = await auto_module.auto_async_direct_client(options)
+        await client.aclose()
+        return options.output.getvalue()
+
+    assert "verification: ok" in asyncio.run(run())
+    assert recorder.requests[0].url.path == "/config"
+
+
+def test_the_direct_chat_page_is_allowed_to_carry_a_captcha() -> None:
+    """Direct Chat embeds a v3 assertion on every load: that is not a challenge."""
+    page = (
+        b'<!doctype html><html><body>'
+        b'<div class="g-recaptcha" data-sitekey="6Lc" data-size="invisible"></div>'
+        b'</body></html>'
+    )
+    recorder = Recorder((200, page, "text/html"))
+    with ArenaClient(http_transport=recorder.transport) as client:
+        assert probe(client, DIRECT_PAGE_PATH).ok
+    recorder = Recorder((200, page, "text/html"))
+    with ArenaClient(http_transport=recorder.transport) as client:
+        result = probe(client, "/some/other/page")
+    assert not result.ok and result.auth_problem
+
+
 def test_direct_token_factory_pins_the_toolkit_solver_to_v3() -> None:
     factory = DirectVerificationToken(
         AutoOptions(captcha_solver=RecaptchaToolkitSolver(version="v2"), solve_captchas=False)
@@ -1137,6 +1357,71 @@ def test_direct_token_factory_fails_fast_without_dependencies(monkeypatch) -> No
     monkeypatch.setattr(auto_module, "_has_spec", lambda name: False)
     factory = DirectVerificationToken(AutoOptions(solve_captchas=False))
     with pytest.raises(AuthenticationError, match="auth-captcha"):
+        asyncio.run(factory.afetch())
+
+
+def test_direct_token_factory_unwraps_a_composite_solver(monkeypatch) -> None:
+    """The assertion can only come from the token member of the default pair."""
+    monkeypatch.setattr(
+        auto_module,
+        "_has_spec",
+        lambda name: name in {"playwright", "playwright_recaptcha", "playwright_stealth"},
+    )
+
+    factory = DirectVerificationToken(AutoOptions())
+
+    assert isinstance(factory.solver, RecaptchaToolkitSolver)
+    assert factory.solver.version == "v3"
+    assert factory.solver.reload_for_v3 is True
+
+
+def test_direct_token_factory_refuses_a_wait_only_solver(monkeypatch) -> None:
+    """Without the token backends the default solver can only *wait*: it would
+    report the page cleared and hand back an empty assertion."""
+    monkeypatch.setattr(auto_module, "_has_spec", lambda name: False)
+
+    factory = DirectVerificationToken(AutoOptions())
+
+    assert isinstance(factory.solver, ChallengeWaitSolver)
+    with pytest.raises(AuthenticationError, match="does not accept reCAPTCHA"):
+        asyncio.run(factory.afetch())
+
+
+def test_direct_token_factory_refuses_an_empty_assertion(monkeypatch) -> None:
+    class ClearedSolver:
+        """Accepts reCAPTCHA but clears the page without producing a token."""
+
+        def supports(self, observation):
+            return True
+
+        async def asolve(self, page, observation=None):
+            return CaptchaAttempt(backend="wait", cleared=True)
+
+    class FakePage:
+        url = "https://arena.ai/text/direct?model_a=max"
+
+        async def goto(self, url, **kwargs):
+            return None
+
+    class FakeEnvironment:
+        def __init__(self, options):
+            self.options = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def new_page(self):
+            return FakePage()
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnvironment)
+    factory = DirectVerificationToken(
+        AutoOptions(captcha_solver=ClearedSolver(), solve_captchas=False)
+    )
+
+    with pytest.raises(AuthenticationError, match="produced no assertion"):
         asyncio.run(factory.afetch())
 
 
@@ -1331,3 +1616,464 @@ def test_cli_defaults_to_automatic_solving(tmp_path, monkeypatch) -> None:
     assert options.verify is True
     assert options.interactive is True
     assert options.use_browser_profiles is True
+
+
+# --------------------------------------------------------------------------- #
+# interactive_login: sign in once, by hand
+# --------------------------------------------------------------------------- #
+
+
+def stub_login(monkeypatch, result: LoginResult) -> dict:
+    """Replace :func:`login_and_save` and record the call."""
+    calls: dict = {}
+
+    def fake(**kwargs):
+        calls.update(kwargs)
+        return result
+
+    monkeypatch.setattr(auto_module, "login_and_save", fake)
+    return calls
+
+
+def saved_result(path: Path) -> LoginResult:
+    return LoginResult(
+        cookies=({"name": "session", "value": "abc", "domain": "arena.ai"},),
+        path=path,
+        saved=True,
+        accepted=True,
+        attempts=1,
+        domains=("arena.ai",),
+    )
+
+
+def test_interactive_login_saves_then_verifies_the_saved_file(tmp_path, monkeypatch) -> None:
+    destination = tmp_path / "state" / "cookies.json"
+    calls = stub_login(monkeypatch, saved_result(destination))
+    seen: list = []
+
+    def fake_client(options=None, **kwargs):
+        seen.append(options)
+        return DummyClient([ModelInfo(id="max", display_name="Max")])
+
+    monkeypatch.setattr(auto_module, "auto_client", fake_client)
+    monkeypatch.setattr(
+        auto_module, "probe", lambda client, path: ProbeResult(True, f"accepted via {path}")
+    )
+
+    outcome = interactive_login(AutoOptions(), path=destination)
+
+    assert isinstance(outcome, LoginOutcome)
+    assert outcome.ok is True
+    assert outcome.path == destination
+    assert outcome.verification is not None and outcome.verification.ok is True
+    assert calls["path"] == destination
+    # the probe must test exactly what was written, and must not heal itself
+    probe_options = seen[0]
+    assert probe_options.storage_path == destination  # normalised to a Path
+    assert probe_options.cookies is None
+    assert probe_options.use_browser_profiles is False
+    assert probe_options.interactive is False
+    assert probe_options.verify is False
+    assert "accepted via /config" in outcome.describe()
+
+
+def test_interactive_login_verifies_nothing_when_no_session_was_saved(tmp_path, monkeypatch) -> None:
+    calls = stub_login(
+        monkeypatch,
+        LoginResult(cookies=({"name": "cf", "value": "1", "domain": "arena.ai"},), attempts=2),
+    )
+    output = io.StringIO()
+
+    def boom(options=None, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("verification should be skipped")
+
+    monkeypatch.setattr(auto_module, "auto_client", boom)
+    outcome = interactive_login(AutoOptions(output=output), path=tmp_path / "c.json")
+
+    assert outcome.ok is False
+    assert outcome.verification is None
+    assert outcome.path is None
+    assert calls["rounds"] == 5
+    assert "skipping verification" in output.getvalue()
+
+
+def test_interactive_login_reports_a_rejected_session(tmp_path, monkeypatch) -> None:
+    destination = tmp_path / "cookies.json"
+    stub_login(monkeypatch, saved_result(destination))
+    monkeypatch.setattr(auto_module, "auto_client", lambda options=None, **kwargs: DummyClient())
+    monkeypatch.setattr(
+        auto_module,
+        "probe",
+        lambda client, path: ProbeResult(False, "session rejected", auth_problem=True),
+    )
+    output = io.StringIO()
+
+    outcome = interactive_login(AutoOptions(output=output), path=destination)
+
+    assert outcome.ok is False
+    assert outcome.verification is not None and outcome.verification.auth_problem is True
+    assert "did not verify" in output.getvalue()
+
+
+def test_interactive_login_maps_a_bootstrap_error_onto_the_probe_result(tmp_path, monkeypatch) -> None:
+    """A broken state file must not escape as an exception from a login call."""
+    destination = tmp_path / "cookies.json"
+    stub_login(monkeypatch, saved_result(destination))
+
+    def boom(options=None, **kwargs):
+        raise AuthenticationError("the stored session could not be read")
+
+    monkeypatch.setattr(auto_module, "auto_client", boom)
+
+    outcome = interactive_login(AutoOptions(), path=destination)
+
+    assert outcome.ok is False
+    assert outcome.verification is not None
+    assert "rejected or expired" in outcome.verification.reason
+
+
+def test_interactive_login_can_skip_verification(tmp_path, monkeypatch) -> None:
+    destination = tmp_path / "cookies.json"
+    stub_login(monkeypatch, saved_result(destination))
+    monkeypatch.setattr(auto_module, "auto_client", lambda options=None, **kwargs: DummyClient())
+    monkeypatch.setattr(auto_module, "probe", lambda client, path: ProbeResult(True, "unused"))
+
+    outcome = interactive_login(AutoOptions(verify=False), path=destination, verify=None)
+
+    assert outcome.verification is None
+    assert outcome.ok is True
+
+
+def test_interactive_login_forwards_the_solver_and_the_form_flow(tmp_path, monkeypatch) -> None:
+    calls = stub_login(monkeypatch, saved_result(tmp_path / "c.json"))
+    solver = object()
+    flow = FormLoginFlow(
+        login_url="https://arena.ai/login",
+        username_selector="#u",
+        password_selector="#p",
+        submit_selector="#s",
+    )
+    monkeypatch.setattr(auto_module, "resolve_solver", lambda options: solver)
+    monkeypatch.setattr(auto_module, "login_flow_from_env", lambda options: flow)
+
+    interactive_login(AutoOptions(base_url="https://arena.ai"), path=tmp_path / "c.json")
+
+    assert calls["captcha_solver"] is solver
+    assert calls["login_flow"] is flow
+    assert calls["base_url"] == "https://arena.ai"
+    assert calls["domains"] == ("arena.ai", "lmarena.ai")
+    assert calls["headless"] is False
+    assert calls["reuse_existing"] is True
+
+
+def test_interactive_login_fresh_start_ignores_the_old_session(tmp_path, monkeypatch) -> None:
+    calls = stub_login(monkeypatch, saved_result(tmp_path / "c.json"))
+
+    interactive_login(AutoOptions(), path=tmp_path / "c.json", fresh=True, rounds=2, headless=True)
+
+    assert calls["reuse_existing"] is False
+    assert calls["rounds"] == 2
+    assert calls["headless"] is True
+
+
+def test_interactive_login_destination_precedence(tmp_path, monkeypatch) -> None:
+    calls = stub_login(monkeypatch, LoginResult())
+
+    interactive_login(AutoOptions())
+    assert calls["path"] == DEFAULT_STATE_PATH
+
+    interactive_login(AutoOptions(storage_path=str(tmp_path / "stored.json")))
+    assert calls["path"] == tmp_path / "stored.json"
+
+    explicit = tmp_path / "explicit.json"
+    interactive_login(AutoOptions(storage_path="ignored.json"), path=explicit)
+    assert calls["path"] == explicit
+
+
+def test_interactive_login_accepts_option_overrides(tmp_path, monkeypatch) -> None:
+    calls = stub_login(monkeypatch, saved_result(tmp_path / "c.json"))
+    monkeypatch.setattr(auto_module, "auto_client", lambda options=None, **kwargs: DummyClient())
+    monkeypatch.setattr(auto_module, "probe", lambda client, path: ProbeResult(True, "ok"))
+
+    interactive_login(AutoOptions(base_url="https://arena.ai"), base_url="https://lmarena.ai")
+
+    assert calls["base_url"] == "https://lmarena.ai"
+
+
+def test_login_outcome_describe_mentions_both_parts(tmp_path) -> None:
+    outcome = LoginOutcome(
+        login=saved_result(tmp_path / "c.json"),
+        verification=ProbeResult(True, "session accepted"),
+        path=tmp_path / "c.json",
+    )
+
+    assert "login:" in outcome.describe()
+    assert "verification: ok: session accepted" in outcome.describe()
+    assert outcome.ok is True
+
+
+# --------------------------------------------------------------------------- #
+# ``arena-api --login``
+# --------------------------------------------------------------------------- #
+
+
+def stub_cli_login(monkeypatch, outcome: LoginOutcome) -> dict:
+    calls: dict = {}
+
+    def fake(options=None, **kwargs):
+        calls["options"] = options
+        calls.update(kwargs)
+        return outcome
+
+    monkeypatch.setattr(auto_module, "interactive_login", fake)
+    return calls
+
+
+def test_cli_login_reports_a_saved_and_verified_session(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    destination = tmp_path / "state" / "cookies.json"
+    stub_cli_login(
+        monkeypatch,
+        LoginOutcome(
+            login=saved_result(destination),
+            verification=ProbeResult(True, "session accepted"),
+            path=destination,
+        ),
+    )
+
+    assert main(["--login"]) == 0
+
+    out = capsys.readouterr().out
+    assert out.startswith("login               : ")
+    assert "verification" in out
+    assert str(destination) in out
+
+
+def test_cli_login_exits_2_when_the_server_rejects_the_session(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    stub_cli_login(
+        monkeypatch,
+        LoginOutcome(
+            login=saved_result(tmp_path / "c.json"),
+            verification=ProbeResult(False, "session rejected", auth_problem=True),
+            path=tmp_path / "c.json",
+        ),
+    )
+
+    assert main(["--login"]) == 2
+    assert "not ok: session rejected" in capsys.readouterr().out
+
+
+def test_cli_login_exits_0_without_verification(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    stub_cli_login(
+        monkeypatch, LoginOutcome(login=saved_result(tmp_path / "c.json"), path=tmp_path / "c.json")
+    )
+
+    assert main(["--login", "--no-verify"]) == 0
+    assert "verification" not in capsys.readouterr().out
+
+
+def test_cli_login_exits_1_when_no_cookies_came_back(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    stub_cli_login(monkeypatch, LoginOutcome(login=LoginResult()))
+
+    assert main(["--login"]) == 1
+    assert "no cookies captured" in capsys.readouterr().out
+
+
+def test_cli_login_exits_1_when_nothing_was_written(tmp_path, monkeypatch, capsys) -> None:
+    """Anonymous cookies are not a session: say so instead of reporting success."""
+    monkeypatch.chdir(tmp_path)
+    stub_cli_login(
+        monkeypatch,
+        LoginOutcome(
+            login=LoginResult(
+                cookies=({"name": "cf", "value": "1", "domain": "arena.ai"},), attempts=5
+            )
+        ),
+    )
+
+    assert main(["--login"]) == 1
+
+    out = capsys.readouterr().out
+    assert "not written" in out
+    assert "no sign-in detected" in out
+
+
+def test_cli_login_maps_its_flags(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    calls = stub_cli_login(
+        monkeypatch, LoginOutcome(login=saved_result(tmp_path / "saved.json"), path=tmp_path / "saved.json")
+    )
+
+    assert main(["--login", "--storage", "saved.json", "--fresh", "--headless", "--login-rounds", "2"]) == 0
+
+    assert calls["path"] == Path("saved.json")  # the CLI keeps the path as given
+    assert calls["fresh"] is True
+    assert calls["headless"] is True
+    assert calls["rounds"] == 2
+
+
+def test_cli_login_defaults_to_the_discoverable_state_file(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    calls = stub_cli_login(monkeypatch, LoginOutcome(login=LoginResult()))
+
+    assert main(["--login"]) == 1
+    assert calls["path"] == DEFAULT_STATE_PATH
+
+
+def test_cli_login_can_continue_into_a_task(tmp_path, monkeypatch, capsys) -> None:
+    """``--login --models``: sign in, then use the session right away."""
+    monkeypatch.chdir(tmp_path)
+    destination = tmp_path / "state" / "cookies.json"
+    stub_cli_login(
+        monkeypatch,
+        LoginOutcome(
+            login=saved_result(destination),
+            verification=ProbeResult(True, "session accepted"),
+            path=destination,
+        ),
+    )
+    seen: list = []
+
+    def fake_client(options=None, **kwargs):
+        seen.append(options)
+        return DummyClient([ModelInfo(id="max", display_name="Max")])
+
+    monkeypatch.setattr(auto_module, "auto_client", fake_client)
+
+    assert main(["--login", "--models"]) == 0
+
+    out = capsys.readouterr().out
+    assert "login" in out and "max — Max" in out
+    assert seen[0].storage_path == DEFAULT_STATE_PATH
+    assert seen[0].cookies is None
+    assert seen[0].use_browser_profiles is False
+
+
+def test_cli_login_stops_before_a_task_when_it_failed(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    stub_cli_login(monkeypatch, LoginOutcome(login=LoginResult()))
+
+    def boom(options=None, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("the task should not run after a failed login")
+
+    monkeypatch.setattr(auto_module, "auto_client", boom)
+
+    assert main(["--login", "--models"]) == 1
+    assert "no cookies captured" in capsys.readouterr().out
+
+
+def test_cli_login_reports_a_browser_error_on_stderr(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    def boom(options=None, **kwargs):
+        raise AuthenticationError("chromium is not installed; run playwright install chromium")
+
+    monkeypatch.setattr(auto_module, "interactive_login", boom)
+
+    assert main(["--login"]) == 1
+    captured = capsys.readouterr()
+    assert "playwright install chromium" in captured.err
+    assert captured.out == ""
+
+
+def test_cli_help_documents_the_login_flags() -> None:
+    text = build_arg_parser().format_help()
+    for flag in ("--login", "--fresh", "--headless", "--login-rounds", "--storage"):
+        assert flag in text
+
+
+# --------------------------------------------------------------------------- #
+# Other challenge kinds: waiting instead of tokens
+# --------------------------------------------------------------------------- #
+
+
+def test_the_wait_solver_covers_every_kind_a_token_cannot() -> None:
+    from arena_api.auth.captcha import WAITABLE_CHALLENGE_KINDS
+
+    assert WAITABLE_CHALLENGE_KINDS == (
+        ChallengeKind.TURNSTILE,
+        ChallengeKind.CLOUDFLARE_MANAGED,
+        ChallengeKind.HCAPTCHA,
+        ChallengeKind.DATADOME,
+        ChallengeKind.INTERSTITIAL,
+        ChallengeKind.UNKNOWN,
+    )
+    solver = ChallengeWaitSolver()
+    for kind in WAITABLE_CHALLENGE_KINDS:
+        assert solver.supports(_observation(kind)) is True
+    assert solver.supports(_observation(ChallengeKind.RECAPTCHA)) is False
+    assert solver.supports(_observation(ChallengeKind.RATE_LIMIT)) is False
+    assert solver.supports(_observation(ChallengeKind.NONE)) is False
+
+
+def test_the_composite_solver_leaves_reCAPTCHA_to_the_toolkit(monkeypatch) -> None:
+    monkeypatch.setattr(
+        auto_module,
+        "_has_spec",
+        lambda name: name in {"playwright", "playwright_recaptcha", "playwright_stealth"},
+    )
+    solver = resolve_solver(AutoOptions())
+
+    assert solver.supports(_observation(ChallengeKind.RECAPTCHA)) is True
+    assert solver.supports(_observation(ChallengeKind.DATADOME)) is True
+    assert solver.supports(_observation(ChallengeKind.NONE)) is False
+    assert solver.select(_observation(ChallengeKind.RATE_LIMIT)) is None
+
+
+def test_cli_explain_reports_the_solver_that_will_actually_run(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(auto_module, "_has_spec", lambda name: False)
+
+    assert main(["--explain"]) == 0
+    out = capsys.readouterr().out
+    assert "dependencies missing" in out
+    assert "-> wait[" in out
+
+    capsys.readouterr()
+    assert main(["--explain", "--no-wait"]) == 0
+    out = capsys.readouterr().out
+    assert "-> off" in out
+
+
+def test_cli_wait_flags_map_onto_options(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    options = _options_from_args(
+        build_arg_parser().parse_args(["--no-wait", "--wait-timeout", "7.5"])
+    )
+    assert options.wait_out_challenges is False
+    assert options.challenge_wait_timeout == 7.5
+
+    options = _options_from_args(build_arg_parser().parse_args([]))
+    assert options.wait_out_challenges is True
+    assert options.challenge_wait_timeout == 30.0
+
+
+def test_cli_help_documents_the_wait_flags() -> None:
+    text = build_arg_parser().format_help()
+    for flag in ("--no-wait", "--wait-timeout"):
+        assert flag in text
+
+
+def test_cli_login_translates_a_browser_failure_into_one_line(tmp_path, monkeypatch, capsys) -> None:
+    """A missing browser binary must read as a one-command fix, not a traceback."""
+    monkeypatch.chdir(tmp_path)
+
+    def boom(options=None, **kwargs):
+        raise RuntimeError(
+            "BrowserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/x\n"
+            "Looks like Playwright was just installed or updated.\n"
+            "Please run the following command to download new browsers"
+        )
+
+    monkeypatch.setattr(auto_module, "interactive_login", boom)
+
+    assert main(["--login"]) == 1
+
+    captured = capsys.readouterr()
+    assert "Executable doesn't exist" in captured.err
+    assert "playwright install chromium" in captured.err
+    assert len(captured.err.strip().splitlines()) == 1, "the hint must stay one line"
+    assert captured.out == ""

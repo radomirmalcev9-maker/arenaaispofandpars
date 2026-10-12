@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
 import pytest
 
 from arena_api.exceptions import (
+    ArenaError,
     AuthenticationError,
     ChallengeRequiredError,
+    ClientClosedError,
     ProtocolError,
     RateLimitError,
 )
 from arena_api.transport import (
     ArenaTransport,
+    AsyncArenaTransport,
     SSEParser,
     _raise_for_status,
     normalize_cookies,
@@ -145,3 +149,62 @@ def test_transport_reports_interactive_challenge_without_retrying() -> None:
         assert calls == 1
     finally:
         transport.close()
+
+
+def _json_transport() -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/json"},
+            content=b"{}",
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def test_requests_through_a_closed_sync_transport_are_library_errors() -> None:
+    transport = ArenaTransport("https://arena.test", http_transport=_json_transport())
+    transport.close()
+    transport.close()  # idempotent
+    with pytest.raises(ClientClosedError) as info:
+        transport.get_json("/config")
+    assert isinstance(info.value, ArenaError)
+    assert "closed" in str(info.value)
+
+
+def test_streams_through_a_closed_sync_transport_are_library_errors() -> None:
+    transport = ArenaTransport("https://arena.test", http_transport=_json_transport())
+    transport.close()
+    with pytest.raises(ClientClosedError):
+        with transport.stream_request("GET", "/queue/data"):
+            pass  # pragma: no cover - the guard fires before the body runs
+
+
+def test_closed_transport_still_reports_its_url() -> None:
+    transport = ArenaTransport("https://arena.test", http_transport=_json_transport())
+    transport.close()
+    assert transport.url("/config") == "https://arena.test/config"
+
+
+def test_requests_through_a_closed_async_transport_are_library_errors() -> None:
+    async def run() -> list[str]:
+        transport = AsyncArenaTransport(
+            "https://arena.test", http_transport=_json_transport()
+        )
+        await transport.close()
+        await transport.close()  # idempotent
+        errors = []
+        try:
+            await transport.get_json("/config")
+        except ClientClosedError as exc:
+            errors.append(f"request: {exc}")
+        try:
+            async with transport.stream_request("GET", "/queue/data"):
+                pass  # pragma: no cover
+        except ClientClosedError as exc:
+            errors.append(f"stream: {exc}")
+        return errors
+
+    errors = asyncio.run(run())
+    assert len(errors) == 2, errors
