@@ -265,6 +265,13 @@ class AutoOptions:
     login_flow: LoginFlow | None = None
     login_from_env: bool = True
 
+    #: Browser build the ``--login`` window runs in. ``None`` uses Playwright's
+    #: bundled Chromium, from which Google refuses to sign an account in ("this
+    #: browser or app may not be secure"). ``"chrome"`` (or ``"msedge"`` on
+    #: Windows) drives the real, installed browser instead -- the usual fix when
+    #: the account signs in *through Google* rather than with a password.
+    channel: str | None = None
+
     #: ``True``/``False`` force challenge solving on or off; ``"auto"`` (the
     #: default) enables it when the solver dependencies are importable.
     solve_captchas: bool | Literal["auto"] = "auto"
@@ -788,7 +795,10 @@ def interactive_login(
         ``options.verify``).
     :param login_flow: fill the sign-in form first (``FormLoginFlow``). Without
         it, a complete ``ARENA_*`` configuration is used when present.
-    :param overrides: any other :class:`AutoOptions` field.
+    :param overrides: any other :class:`AutoOptions` field -- including
+        ``channel`` (e.g. ``"chrome"``), which is how you sign in to an account
+        that authenticates *through Google*: Google rejects Playwright's bundled
+        Chromium but accepts a real, installed browser.
     :returns: a :class:`LoginOutcome`; :attr:`LoginOutcome.ok` is ``False`` when
         nothing was captured or the server rejected it.
 
@@ -807,6 +817,7 @@ def interactive_login(
         path=destination,
         domains=options.cookie_domains(),
         headless=headless,
+        channel=options.channel,
         reuse_existing=not fresh,
         rounds=rounds,
         login_flow=flow,
@@ -1440,6 +1451,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--headless", action="store_true", help="keep the --login window hidden (not recommended)"
     )
     parser.add_argument(
+        "--channel",
+        default=None,
+        help=(
+            "browser build for --login: chrome or msedge runs the real installed "
+            "browser instead of Playwright's bundled Chromium, which Google "
+            "refuses to sign an account in from"
+        ),
+    )
+    parser.add_argument(
         "--login-rounds",
         type=int,
         default=5,
@@ -1470,6 +1490,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         challenge_wait_timeout=args.wait_timeout,
         probe_path=args.probe_path,
         verify=not args.no_verify,
+        channel=args.channel,
     )
 
 
@@ -1538,9 +1559,17 @@ def _login(
         # its own multi-line error, which reads as a crash rather than as the
         # one-command fix it is.
         detail = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        if options.channel:
+            # With a channel the bundled download would not help: the window
+            # needs the real Chrome/Edge the user asked for.
+            hint = (
+                "Install Google Chrome (or drop --channel to use Playwright's "
+                "bundled Chromium: `python -m playwright install chromium`)."
+            )
+        else:
+            hint = "Install it with `python -m playwright install chromium`."
         raise AuthenticationError(
-            f"the login browser could not be started: {detail} Install it with "
-            "`python -m playwright install chromium`."
+            f"the login browser could not be started: {detail} {hint}"
         ) from exc
     login = outcome.login
     if not login.cookies:

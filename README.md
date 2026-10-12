@@ -75,6 +75,7 @@ python -m arena_api --login              # то же самое: arena-api --log
 python -m arena_api --login --models     # войти и сразу воспользоваться сессией
 python -m arena_api --login --fresh      # войти под другим аккаунтом
 python -m arena_api --login --storage my-state/cookies.json
+python -m arena_api --login --channel chrome   # в настоящем Chrome (если аккаунт гугловый)
 ```
 
 ```python
@@ -92,6 +93,8 @@ if outcome.ok:
 
 1. открывается **headed** Chromium с настройками обычного браузера
    (`identify_automation=False`, без детерминизма тестов) — вы видите страницу;
+   при `--channel chrome`/`msedge` вместо него запускается установленный у вас
+   браузер;
 2. вы входите так, как привыкли: менеджер паролей, 2FA, «запомнить устройство».
    **Учётные данные через библиотеку не проходят** — она ничего не печатает и не
    сохраняет, кроме cookie;
@@ -105,6 +108,33 @@ if outcome.ok:
 
 Коды возврата `--login`: `0` — сессия сохранена и принята (или проверка
 отключена `--no-verify`), `1` — сохранить нечего, `2` — сервер сессию отверг.
+
+### Если Google не даёт войти: «этот браузер или приложение может быть небезопасным»
+
+Выбор «Войти через Google» упирается в защиту самого Google, а не сайта:
+встроенный Chromium из `playwright install chromium` для Google — анонимная
+сборка без фирменных компонентов, и вход из неё он отклоняет. Пароль от
+аккаунта тут не поможет — это не про Arena. Три выхода, от лучшего к худшему:
+
+1. **Войти в аккаунт своим обычным браузером — и вовсе не открывать окно
+   `--login`.** Google доверяет браузеру, в котором вы уже вошли, а библиотеке
+   от него нужны только cookie:
+   - Firefox: `python example_firefox.py` или `auto_client()` — профиль Firefox
+     в «лестнице» источников есть по умолчанию, ничего ставить не нужно;
+   - Chrome/Chromium/Edge/Brave/Vivaldi/Opera: `pip install '.[firefox]'`
+     (имя extra обманчиво — оно добавляет `rookiepy`, читающий профили всех этих
+     браузеров), затем `auto_client()`.
+   Дальше работает `arena-api --status` / `--models` / `--prompt` без всякого
+   Playwright.
+2. **Дать окну входа настоящий браузер:** `--channel chrome` (или `msedge` на
+   Windows) — Playwright запускает установленный у вас Google Chrome, и Google
+   такой вход принимает. Из Python то же самое:
+   `interactive_login(channel="chrome")` или `login_and_save(channel="chrome")`.
+   Если Chrome не установлен, команда скажет именно это, а не «поставьте
+   chromium».
+3. **Сначала войти в Google в этом же окне** (например, через другой вход на
+   странице), а уже потом выбирать «Войти через Arena» — работает не всегда и
+   потому стоит последним.
 
 ### Где ищется сессия (по порядку, берётся первый найденный)
 
@@ -162,6 +192,7 @@ client = auto_client(
 | `profiles_root`, `profile_name`, `cookie_database` | `None` | нестандартное расположение Firefox |
 | `interactive`, `prompt` | `True`, `input` | ждать ли входа и как именно спрашивать |
 | `login_flow`, `login_from_env` | `None`, `True` | свой сценарий входа вместо переменных окружения |
+| `channel` | `None` | в каком браузере открывать окно `--login`: `chrome`/`msedge` вместо встроенного Chromium (нужно, когда аккаунт входит через Google) |
 | `solve_captchas`, `captcha_backend`, `captcha_solver` | `"auto"`, `"audio"`, `None` | решение reCAPTCHA (токен) |
 | `wait_out_challenges`, `challenge_wait_timeout` | `True`, `30.0` | ждать ли челленджи без токена: Turnstile, managed Cloudflare, hCaptcha, DataDome |
 | `probe_path`, `verify` | `/config`, `True` | каким запросом проверять сессию |

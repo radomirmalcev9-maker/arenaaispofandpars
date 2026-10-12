@@ -3,6 +3,36 @@
 Формат: краткий список по версиям. Версии до 0.3.0 в этом файле не описаны —
 смотрите историю git.
 
+## Unreleased
+
+### `--login` в настоящем браузере: `--channel chrome`
+
+- `AutoOptions.channel` + флаг CLI `--channel chrome|msedge`: окно входа
+  запускается в установленном браузере, а не во встроенном Chromium. Это
+  единственный способ войти в аккаунт, который авторизуется **через Google**:
+  Google отклоняет вход из анонимной сборки Playwright («этот браузер или
+  приложение может быть небезопасным»), а установленный Chrome принимает.
+  Раньше этот путь был доступен только из Python (`login_and_save(channel=...)`),
+  CLI его не умел.
+- Подсказка при неудачном запуске окна различает случаи: без `--channel` —
+  «`playwright install chromium`», с `--channel` — «поставьте Google Chrome либо
+  уберите `--channel`», потому что скачивание встроенной сборки такой запуск не
+  починит.
+- README: раздел «Если Google не даёт войти» — три выхода, включая
+  рекомендуемый: войти своим обычным браузером и дать библиотеке прочитать его
+  cookie (`auto_client()`, профиль Firefox, `rookiepy` для Chrome/Edge/…), вообще
+  не используя Playwright.
+- Тесты: `channel` в `AutoOptions`/CLI/override и текст подсказки
+  (`tests/test_auto.py`).
+
+### Тесты
+
+- `test_a_saved_result_names_the_file` больше не сравнивает вывод `describe()` с
+  POSIX-литералом: `LoginResult.describe()` печатает путь платформо-нативно, и на
+  `windows-latest` тот же `Path('state/cookies.json')` читается как
+  `state\cookies.json`. Из-за этого CI на `main` был красным — падал только этот
+  тест.
+
 ## 0.4.0
 
 ### Вход руками один раз: `arena-api --login`
