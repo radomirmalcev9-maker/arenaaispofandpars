@@ -46,7 +46,7 @@ from .auth import (
     inspect_response,
     login_and_save,
 )
-from .client import ArenaClient, AsyncArenaClient
+from .client import ArenaClient, AsyncArenaClient, resolve_impersonation
 from .direct import (
     AsyncDirectArenaClient,
     AsyncDirectChatSession,
@@ -75,9 +75,11 @@ from .models import (
 )
 from .session import AsyncChatSession, ChatSession
 from .transport import (
+    IMPERSONATE_EXTRA,
     ArenaTransport,
     AsyncArenaTransport,
     SSEParser,
+    impersonation_available,
     normalize_cookies,
     parse_cookie_header,
 )
@@ -95,7 +97,10 @@ from .auto import (  # noqa: E402
     auto_client,
     auto_direct_client,
     discover_session,
+    explain_impersonation,
+    impersonation_profile,
     interactive_login,
+    profile_for_source,
 )
 
 # Short aliases for applications that do not need to distinguish the backend.
@@ -130,6 +135,7 @@ __all__ = [
     "CompositeSolver",
     "ChallengeRequiredError",
     "ChatSession",
+    "IMPERSONATE_EXTRA",
     "Client",
     "ClientClosedError",
     "DeterminismOptions",
@@ -143,6 +149,9 @@ __all__ = [
     "FormLoginFlow",
     "GenerationConfig",
     "KinematicMouse",
+    "explain_impersonation",
+    "impersonation_available",
+    "impersonation_profile",
     "KinematicMouseSync",
     "LoginResult",
     "Message",
@@ -150,6 +159,8 @@ __all__ = [
     "ModelUnavailableError",
     "ProbeResult",
     "ProtocolError",
+    "profile_for_source",
+    "resolve_impersonation",
     "QueueEndpoint",
     "QueueTimeoutError",
     "RateLimitError",

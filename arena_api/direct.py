@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from .client import SessionSource, _resolve_session_source
+from .client import SessionSource, _resolve_session_source, resolve_impersonation
 from .constants import (
     DEFAULT_BASE_URL,
     DEFAULT_QUEUE_TIMEOUT,
@@ -519,6 +519,7 @@ class DirectArenaClient(_DirectMixin):
         direct_page_path: str = DIRECT_PAGE_PATH,
         direct_stream_path: str = DIRECT_STREAM_PATH,
         http_transport: httpx.BaseTransport | None = None,
+        impersonate: str | bool | None = None,
         max_auth_refreshes: int = 2,
     ) -> None:
         session = _resolve_session_source(session_source, base_url)
@@ -536,6 +537,11 @@ class DirectArenaClient(_DirectMixin):
             http2=http2,
             verify=verify,
             http_transport=http_transport,
+            impersonate=resolve_impersonation(
+                impersonate,
+                session.impersonate if session is not None else None,
+                http_transport=http_transport,
+            ),
             session_refresher=(
                 session.manager.refresh_session if session is not None else None
             ),
@@ -752,6 +758,7 @@ class AsyncDirectArenaClient(_DirectMixin):
         direct_page_path: str = DIRECT_PAGE_PATH,
         direct_stream_path: str = DIRECT_STREAM_PATH,
         http_transport: httpx.AsyncBaseTransport | None = None,
+        impersonate: str | bool | None = None,
         max_auth_refreshes: int = 2,
     ) -> None:
         session = _resolve_session_source(session_source, base_url)
@@ -769,6 +776,11 @@ class AsyncDirectArenaClient(_DirectMixin):
             http2=http2,
             verify=verify,
             http_transport=http_transport,
+            impersonate=resolve_impersonation(
+                impersonate,
+                session.impersonate if session is not None else None,
+                http_transport=http_transport,
+            ),
             session_refresher=(
                 session.manager.refresh_session if session is not None else None
             ),

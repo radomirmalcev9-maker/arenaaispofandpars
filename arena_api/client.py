@@ -43,7 +43,12 @@ from .models import (
     QueueEndpoint,
     StreamChunk,
 )
-from .transport import ArenaTransport, AsyncArenaTransport, CookieInput
+from .transport import (
+    ArenaTransport,
+    AsyncArenaTransport,
+    CookieInput,
+    impersonation_available,
+)
 
 if TYPE_CHECKING:
     from .session import AsyncChatSession, ChatSession
@@ -65,10 +70,57 @@ class _ResolvedSessionSource:
     manager: SessionManager
     cookies: dict[str, str]
     headers: dict[str, str]
+    #: curl_cffi profile matching the browser this session came from, when the
+    #: source knows it -- a Firefox manager knows it is Firefox.
+    impersonate: str | None = None
 
 
 def _base_host(base_url: str) -> str | None:
     return urlparse(base_url).hostname
+
+
+def _derived_impersonation(manager: SessionManager, *, from_string: bool) -> str | None:
+    """The profile that matches a session source, if it can be identified.
+
+    ``session_source="firefox"`` and a :class:`FirefoxSessionManager` are
+    Firefox by construction. Any other manager may say so itself through an
+    ``impersonate`` attribute (``BrowserSessionManager`` has the field, and
+    ``arena_api.auto`` fills it in from the browser it discovered).
+    """
+    if from_string or isinstance(manager, FirefoxSessionManager):
+        return "firefox"
+    value = getattr(manager, "impersonate", None)
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def resolve_impersonation(
+    requested: str | bool | None,
+    derived: str | None,
+    *,
+    http_transport: object | None = None,
+) -> str | None:
+    """Decide which fingerprint a client should present.
+
+    Cases, in order:
+
+    * ``http_transport=`` -- the caller brought their own wire, so nothing is
+      derived on top of it (an explicit ``impersonate=`` still collides loudly,
+      because impersonation *is* a transport);
+    * ``False`` -- never impersonate, whatever the session source says;
+    * a profile name -- use exactly that (missing dependencies then raise);
+    * ``None`` -- follow the session source (``derived``), but only when the
+      optional dependency is actually installed, because this branch is a
+      silent default and must never turn a working setup into an error.
+    """
+    if requested is False:
+        return None
+    if isinstance(requested, str) and requested.strip():
+        return requested.strip()
+    if http_transport is not None:
+        return None
+    if requested is None and derived and impersonation_available():
+        return derived
+    return None
 
 
 def _resolve_session_source(
@@ -127,6 +179,7 @@ def _resolve_session_source(
         manager=manager,
         cookies=cookies,
         headers=manager.firefox_headers(),
+        impersonate=_derived_impersonation(manager, from_string=from_firefox),
     )
 
 
@@ -505,6 +558,13 @@ class ArenaClient(_ArenaClientMixin):
     stale, the client prints guidance, waits for you to re-verify in Firefox,
     re-reads the profile, and retries the request transparently (up to
     ``max_auth_refreshes`` times).
+
+    ``impersonate`` decides which wire the request travels on. ``None`` (the
+    default) follows the session source: a Firefox session is sent with
+    Firefox's TLS and HTTP/2 fingerprint when the optional ``[impersonate]``
+    extra is installed, because an edge that issued the cookies may otherwise
+    answer a correct session with a challenge. ``False`` turns that off and a
+    profile name (``"firefox"``, ``"chrome"``, ``"firefox147"``) forces one.
     """
 
     def __init__(
@@ -522,6 +582,7 @@ class ArenaClient(_ArenaClientMixin):
         chat_payload_factory: ChatPayloadFactory | None = None,
         battle_payload_factory: BattlePayloadFactory | None = None,
         http_transport: httpx.BaseTransport | None = None,
+        impersonate: str | bool | None = None,
         max_auth_refreshes: int = 2,
     ) -> None:
         session = _resolve_session_source(session_source, base_url)
@@ -539,6 +600,11 @@ class ArenaClient(_ArenaClientMixin):
             http2=http2,
             verify=verify,
             http_transport=http_transport,
+            impersonate=resolve_impersonation(
+                impersonate,
+                session.impersonate if session is not None else None,
+                http_transport=http_transport,
+            ),
             session_refresher=(
                 session.manager.refresh_session if session is not None else None
             ),
@@ -744,9 +810,10 @@ class ArenaClient(_ArenaClientMixin):
 class AsyncArenaClient(_ArenaClientMixin):
     """Async client with parity to :class:`ArenaClient`.
 
-    Supports the same ``session_source="firefox"`` option. The interactive
-    refresh (console message + waiting for Enter) runs in a worker thread so
-    the event loop keeps serving other tasks while you re-verify in Firefox.
+    Supports the same ``session_source="firefox"`` and ``impersonate=`` options
+    as :class:`ArenaClient`. The interactive refresh (console message + waiting
+    for Enter) runs in a worker thread so the event loop keeps serving other
+    tasks while you re-verify in Firefox.
     """
 
     def __init__(
@@ -764,6 +831,7 @@ class AsyncArenaClient(_ArenaClientMixin):
         chat_payload_factory: ChatPayloadFactory | None = None,
         battle_payload_factory: BattlePayloadFactory | None = None,
         http_transport: httpx.AsyncBaseTransport | None = None,
+        impersonate: str | bool | None = None,
         max_auth_refreshes: int = 2,
     ) -> None:
         session = _resolve_session_source(session_source, base_url)
@@ -781,6 +849,11 @@ class AsyncArenaClient(_ArenaClientMixin):
             http2=http2,
             verify=verify,
             http_transport=http_transport,
+            impersonate=resolve_impersonation(
+                impersonate,
+                session.impersonate if session is not None else None,
+                http_transport=http_transport,
+            ),
             session_refresher=(
                 session.manager.refresh_session if session is not None else None
             ),

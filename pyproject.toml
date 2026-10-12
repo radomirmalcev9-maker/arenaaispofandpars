@@ -53,6 +53,12 @@ captcha-selenium = [
 ]
 # Local YOLO solver (pulls ultralytics + torch; large download).
 vision = ["vision-ai-recaptcha-solver>=0.1"]
+# Send requests with a real browser's TLS/HTTP2 fingerprint instead of Python's.
+# This is what a cookie-aware edge (Cloudflare and the cf_clearance cookie it
+# issues) actually checks: a session copied from Firefox but presented with
+# httpx's fingerprint can be challenged even though every cookie is correct.
+# arena_api.transport imports it lazily, so the base install stays light.
+impersonate = ["curl-cffi>=0.7", "httpx-curl-cffi>=0.1.5"]
 # arena_api.auth bridge: solve a reCAPTCHA met during an E2E/refresh run.
 # Everything is imported lazily, so the base install stays dependency-free.
 auth-captcha = [
@@ -61,11 +67,13 @@ auth-captcha = [
     "playwright-stealth>=2.0",
 ]
 # One extra for the whole zero-config path (arena_api.auto): read Chrome/Edge/
-# Brave/... profiles, validate fast with curl_cffi, solve challenges on refresh.
-# Still `playwright install chromium` afterwards.
+# Brave/... profiles, validate fast with curl_cffi, solve challenges on refresh,
+# and send the session's own TLS fingerprint. Still `playwright install
+# chromium` afterwards.
 auto = [
     "rookiepy>=0.5",
     "curl_cffi>=0.7",
+    "httpx-curl-cffi>=0.1.5",
     "playwright>=1.44",
     "playwright-recaptcha>=0.5",
     "playwright-stealth>=2.0",

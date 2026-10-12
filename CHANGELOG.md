@@ -5,6 +5,45 @@
 
 ## Unreleased
 
+### Отпечаток браузера, а не только его cookie: `impersonate`
+
+- Новая причина `ChallengeRequiredError` при формально верной сессии: `cf_clearance`
+  и родственные cookie привязаны не только к IP и User-Agent, но и к отпечатку
+  соединения (TLS ClientHello + настройки HTTP/2), а у httpx он свой, «питоновский».
+  Сессия, аккуратно перенесённая из Firefox, из-за одного этого может получить
+  страницу проверки — именно то, что видно в `example_firefox.py` после успешного
+  чтения профиля (`arena-auth-prod-v1.0`, `cf_clearance`, `__cf_bm` читаются, а
+  запрос к `/config` отбит челленджем).
+- `arena_api.transport` умеет отдавать запросы через `curl_cffi` с профилем
+  браузера: `ArenaTransport(impersonate="firefox")` строит
+  `httpx_curl_cffi.CurlTransport` (async — `AsyncCurlTransport`), не меняя ни
+  одного внешнего API: httpx-клиент, SSE-парсер, ретраи и обновление сессии
+  работают как раньше. Зависимость ленивая, extra — `[impersonate]`
+  (`curl-cffi` + `httpx-curl-cffi`), он же добавлен в `[auto]`.
+- Выбор профиля: `impersonate=None` (по умолчанию) следует за источником сессии —
+  Firefox-менеджер даёт `firefox`, `BrowserSessionManager` передаёт своё поле
+  `impersonate` (его заполняет `arena_api.auto` по найденному браузеру); `False`
+  выключает, строка (`"firefox147"`, `"chrome"`) задаёт явно. Если extra не
+  установлен, производное значение молча остаётся выключенным, а явное — падает с
+  подсказкой `pip install 'arena-api[impersonate]'`; `impersonate=` вместе с
+  `http_transport=` — ошибка (impersonation и есть транспорт).
+- `auto_client()` / `python -m arena_api` включают это сами: `AutoOptions.impersonate
+  = "auto"`, CLI-флаг `--impersonate auto|off|chrome|firefox|…`, строка
+  `fingerprint` в `--explain`, уведомление в stderr о выбранном профиле.
+  Отображение источников: Firefox → `firefox`; Chrome/Chromium/Brave/Vivaldi/Opera
+  → `chrome`; `state/cookies.json`, `ARENA_COOKIE`, `cookies=` → `chrome`
+  (заголовки в этих путях и так Chromium-shaped); неизвестный источник — ничего.
+- Валидация сессии (`BrowserSessionManager`) использует тот же профиль, что и
+  клиент: проба и рабочие запросы больше не идут разными стеками.
+- Тесты: `tests/test_impersonate.py` — политика выбора профиля, наличие/отсутствие
+  зависимости, сборка sync/async транспорта (записывающий двойник), взаимоисключение
+  с `http_transport`, обвязка bootstrap через менеджер, CLI-флаг, а также проверки
+  на **реальном сокете**: запрос через curl-транспорт сохраняет наши заголовки и
+  cookie, а SSE приходит инкрементально, а не одним куском. CI ставит
+  extra `[impersonate]` и гоняет их на всех платформах.
+- README: раздел «Отпечаток вместо „нейтрального“ клиента» с таблицей выбора;
+  `example_firefox.py` печатает, какой отпечаток ушёл на сервер.
+
 ### `--login` в настоящем браузере: `--channel chrome`
 
 - `AutoOptions.channel` + флаг CLI `--channel chrome|msedge`: окно входа

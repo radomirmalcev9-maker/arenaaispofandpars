@@ -5,14 +5,24 @@ are reported as :class:`ChallengeRequiredError`. When a ``session_refresher``
 hook is installed (see the ``session_source`` option of the clients), an
 authentication failure first asks that hook for fresh cookies — e.g. after the
 user re-verified in their browser — and transparently retries the request.
+
+A browser session is more than its cookies: an anti-bot edge (Cloudflare, and
+the ``cf_clearance`` cookie it hands out) also looks at the *dialect* the client
+speaks — the TLS ClientHello and the HTTP/2 settings frame. ``httpx`` has
+Python's dialect, so a session copied out of Firefox can be challenged even
+though every cookie is correct. ``impersonate="firefox"`` swaps the wire for
+``curl_cffi``'s, which reproduces that dialect; the httpx API, the SSE
+machinery and the callers stay exactly as they are.
 """
 
 from __future__ import annotations
 
 import asyncio
 import codecs
+import importlib.util
 import json
 import math
+import ssl
 import time
 from collections.abc import (
     AsyncIterator,
@@ -63,6 +73,81 @@ _CHALLENGE_MARKERS = (
     "just a moment...",
     "cf-error-details",
 )
+
+#: How to get the optional curl_cffi transport. Named in the error message, so
+#: a caller who asked for impersonation but never installed it gets one command
+#: instead of a traceback from an import inside a constructor.
+IMPERSONATE_EXTRA = "pip install 'arena-api[impersonate]'"
+
+_IMPERSONATION_PACKAGES = ("curl_cffi", "httpx_curl_cffi")
+
+
+def impersonation_available() -> bool:
+    """Whether the curl_cffi transport can be built on this machine.
+
+    Never imports anything: callers use it to decide *silently* whether the
+    derived (``impersonate=None``) path is possible. An explicit
+    ``impersonate=`` does not consult it -- it either works or explains itself.
+    """
+    return all(
+        importlib.util.find_spec(name) is not None for name in _IMPERSONATION_PACKAGES
+    )
+
+
+def validate_impersonate(value: Any) -> str:
+    """Coerce and check an ``impersonate`` value, with an actionable message."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "impersonate must be a curl_cffi browser profile name such as "
+            "'firefox', 'chrome' or 'firefox133'"
+        )
+    return value.strip()
+
+
+def _adapt_verify(verify: bool | str) -> bool | str:
+    """Translate httpx's ``verify=`` into what curl accepts.
+
+    ``httpx`` also allows an ``ssl.SSLContext``; curl has its own TLS stack and
+    cannot take one, so that combination fails loudly instead of quietly
+    verifying against the system store.
+    """
+    if isinstance(verify, ssl.SSLContext):
+        raise ArenaError(
+            "impersonate= uses curl's own TLS stack, which cannot take an "
+            "ssl.SSLContext; pass the CA bundle path as verify='path/to/ca.pem'"
+        )
+    if isinstance(verify, Path):  # pragma: no cover - defensive, httpx types say str
+        return str(verify)
+    if not isinstance(verify, (bool, str)):
+        raise ArenaError(
+            f"verify must be a bool or a CA bundle path when impersonating, got "
+            f"{type(verify).__name__}"
+        )
+    return verify
+
+
+def build_impersonation_transport(
+    impersonate: str, *, verify: bool | str = True, asynchronous: bool = False
+) -> Any:
+    """Return a curl_cffi-backed ``httpx`` transport for one browser profile.
+
+    :param impersonate: curl_cffi profile, e.g. ``"firefox"`` (the newest
+        supported Firefox), ``"firefox147"`` (an exact build) or ``"chrome"``.
+    :param verify: TLS verification, following ``httpx.Client(verify=...)``.
+    :param asynchronous: build the ``AsyncCurlTransport`` instead of the sync one.
+    :raises ArenaError: the optional dependency is not installed.
+    """
+    profile = validate_impersonate(impersonate)
+    try:
+        from httpx_curl_cffi import AsyncCurlTransport, CurlTransport
+    except ImportError as exc:  # pragma: no cover - dependency path
+        raise ArenaError(
+            f"impersonate={profile!r} needs the optional curl_cffi transport, "
+            f"which is not installed ({IMPERSONATE_EXTRA}, or drop impersonate= "
+            "to send the request with httpx's own TLS fingerprint)"
+        ) from exc
+    options: dict[str, Any] = {"impersonate": profile, "verify": _adapt_verify(verify)}
+    return AsyncCurlTransport(**options) if asynchronous else CurlTransport(**options)
 
 
 def parse_cookie_header(value: str) -> dict[str, str]:
@@ -369,7 +454,14 @@ class ArenaTransport:
     ``session_cookies`` holds the browser-session cookie set (it overlays
     ``cookies``); ``session_refresher`` is consulted on auth failures to
     refresh that set before a transparent retry.
+
+    ``impersonate`` sends the request through curl_cffi with that browser's TLS
+    and HTTP/2 fingerprint (see the module docstring); it needs the optional
+    ``[impersonate]`` extra and is mutually exclusive with ``http_transport``.
     """
+
+    #: curl_cffi profile in use, or ``None`` for httpx's own fingerprint.
+    impersonate: str | None
 
     def __init__(
         self,
@@ -382,18 +474,31 @@ class ArenaTransport:
         http2: bool = True,
         verify: bool | str = True,
         http_transport: httpx.BaseTransport | None = None,
+        impersonate: str | None = None,
         session_refresher: SessionRefresher | None = None,
         max_auth_refreshes: int = 2,
     ) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a finite, positive number")
         _validate_max_auth_refreshes(max_auth_refreshes)
+        if impersonate is not None and http_transport is not None:
+            raise ValueError(
+                "pass either http_transport= or impersonate=, not both: "
+                "impersonation *is* a transport"
+            )
         self.base_url = _normalize_base_url(base_url)
         merged_headers = _merged_default_headers(headers)
         self._base_cookies = normalize_cookies(cookies)
         self._session_cookies: dict[str, str] = dict(session_cookies or {})
         self._session_refresher = session_refresher
         self._max_auth_refreshes = max_auth_refreshes
+        self.impersonate = (
+            validate_impersonate(impersonate) if impersonate is not None else None
+        )
+        if self.impersonate is not None:
+            http_transport = build_impersonation_transport(
+                self.impersonate, verify=verify
+            )
         self.session = httpx.Client(
             headers=merged_headers,
             cookies=self._effective_cookies(),
@@ -613,6 +718,9 @@ class AsyncArenaTransport:
     thread so the event loop stays responsive.
     """
 
+    #: curl_cffi profile in use, or ``None`` for httpx's own fingerprint.
+    impersonate: str | None
+
     def __init__(
         self,
         base_url: str,
@@ -624,18 +732,31 @@ class AsyncArenaTransport:
         http2: bool = True,
         verify: bool | str = True,
         http_transport: httpx.AsyncBaseTransport | None = None,
+        impersonate: str | None = None,
         session_refresher: SessionRefresher | None = None,
         max_auth_refreshes: int = 2,
     ) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a finite, positive number")
         _validate_max_auth_refreshes(max_auth_refreshes)
+        if impersonate is not None and http_transport is not None:
+            raise ValueError(
+                "pass either http_transport= or impersonate=, not both: "
+                "impersonation *is* a transport"
+            )
         self.base_url = _normalize_base_url(base_url)
         merged_headers = _merged_default_headers(headers)
         self._base_cookies = normalize_cookies(cookies)
         self._session_cookies: dict[str, str] = dict(session_cookies or {})
         self._session_refresher = session_refresher
         self._max_auth_refreshes = max_auth_refreshes
+        self.impersonate = (
+            validate_impersonate(impersonate) if impersonate is not None else None
+        )
+        if self.impersonate is not None:
+            http_transport = build_impersonation_transport(
+                self.impersonate, verify=verify, asynchronous=True
+            )
         self.session = httpx.AsyncClient(
             headers=merged_headers,
             cookies=self._effective_cookies(),

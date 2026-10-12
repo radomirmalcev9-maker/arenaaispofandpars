@@ -52,6 +52,7 @@ playwright install chromium               # для решения капчи и 
 python -m pip install '.[firefox]'        # чтение профилей Chrome/Edge/Brave/...
 python -m pip install '.[auth-captcha]'   # автоматическое решение reCAPTCHA
 python -m pip install '.[e2e]'            # быстрая валидация сессии через curl_cffi
+python -m pip install '.[impersonate]'    # отпечаток браузера на TLS/HTTP2 (см. ниже)
 ```
 
 ```python
@@ -201,6 +202,7 @@ client = auto_client(
 | `profiles_root`, `profile_name`, `cookie_database` | `None` | нестандартное расположение Firefox |
 | `interactive`, `prompt` | `True`, `input` | ждать ли входа и как именно спрашивать |
 | `login_flow`, `login_from_env` | `None`, `True` | свой сценарий входа вместо переменных окружения |
+| `impersonate` | `"auto"` | чей отпечаток TLS/HTTP2 нести: `auto` (следовать за источником сессии), `firefox`/`chrome`/`firefox147`, `off` |
 | `channel` | `None` | в каком браузере открывать окно `--login`: `chrome`/`msedge` вместо встроенного Chromium (нужно, когда аккаунт входит через Google) |
 | `hide_automation` | `False` | убрать в окне `--login` признаки автоматизации, которые читает Google (`--enable-automation`, `navigator.webdriver`); включать вместе с `channel="chrome"` |
 | `solve_captchas`, `captcha_backend`, `captcha_solver` | `"auto"`, `"audio"`, `None` | решение reCAPTCHA (токен) |
@@ -223,7 +225,8 @@ python -m arena_api --prompt "Привет"
 (игнорировать сохранённую сессию при входе), `--headless` (спрятать окно входа —
 почти никогда не нужно), `--login-rounds 5` (сколько нажатий Enter предложить),
 `--channel chrome` и `--hide-automation` (окно входа как настоящий браузер — см.
-«Если Google не даёт войти»).
+«Если Google не даёт войти»), `--impersonate chrome|firefox|off` (каким отпечатком
+идти к сервису — см. «Отпечаток вместо „нейтрального“ клиента»).
 
 Коды возврата: `0` — всё работает, `1` — сессию найти не удалось, `2` — сессия
 найдена, но сервер её отверг.
@@ -248,6 +251,49 @@ client = auto_direct_client(verification_token="auto")
 обновляется и запрос повторяется автоматически. `probe_path` должен указывать на
 JSON/API-эндпоинт: HTML-страница со следами капчи читается как challenge
 (исключение — страница Direct Chat, она и должна содержать v3-assertion).
+
+## Отпечаток вместо «нейтрального» клиента (`impersonate`)
+
+Сервис за Cloudflare выдаёт cookie `cf_clearance`, привязанную не только к IP и
+User-Agent, но и к **отпечатку соединения** — порядку TLS ClientHello и настройкам
+HTTP/2. `httpx` (и любой Python-клиент) говорит на своём диалекте, поэтому сессия,
+безупречно перенесённая из браузера, всё равно может получить страницу проверки:
+cookie верны, заголовки верны, а «рукопожатие» не то. Это ровно тот случай, когда
+`arena-api --status` пишет `session: found`, а запрос падает на
+`ChallengeRequiredError`.
+
+```bash
+python -m pip install 'arena-api[impersonate]'   # curl-cffi + httpx-curl-cffi
+```
+
+```python
+from arena_api import ArenaClient, auto_client
+
+# Ноль настроек: сессию нашли в Firefox -> поедет на отпечатке Firefox.
+with auto_client() as arena:
+    print(arena.get_models())
+    print(arena.transport.impersonate)        # 'firefox'
+
+# Явно и независимо от источника:
+with ArenaClient(cookies=cookies, impersonate="chrome") as arena: ...
+with ArenaClient(session_source="firefox", impersonate="firefox147") as arena: ...
+with ArenaClient(session_source="firefox", impersonate=False) as arena: ...  # выключить
+```
+
+Что выбирается в режиме `auto` (по умолчанию):
+
+| Источник сессии | Профиль | Почему |
+| --- | --- | --- |
+| Firefox (профиль или `session_source="firefox"`) | `firefox` | этим же менеджером строятся и заголовки |
+| Chrome/Chromium/Brave/Vivaldi/Opera/Edge | `chrome` | библиотека представляет их Chromium-заголовками |
+| `state/cookies.json`, `ARENA_COOKIE`, `cookies=` | `chrome` | заголовки в этом пути тоже Chromium-shaped |
+| источник неизвестен | ничего | лучше честный нейтральный стек, чем Firefox-байты с Chrome-заголовками |
+| extra `[impersonate]` не установлен | ничего | молчаливое поведение не имеет права ломать рабочую установку |
+
+Явный `impersonate="…"` без установленного extra — ошибка с подсказкой, а не тихое
+игнорирование. `impersonate=` и `http_transport=` взаимоисключающи (impersonation — это
+и есть транспорт). В CLI: `python -m arena_api --impersonate chrome|firefox|off`;
+состояние видно в `python -m arena_api --explain` (строка `fingerprint`).
 
 ## Cookie-сессия
 
@@ -296,6 +342,7 @@ with ArenaClient(session_source="firefox") as arena:
 
 - **Извлечение cookie** — через `rookiepy` (`python -m pip install '.[firefox]'`): `rookiepy.firefox(domains=["arena.ai", "lmarena.ai"])` и нормализация записей в плоский `dict[str, str]`, готовый для прямой передачи в `curl_cffi.requests.Session` или `httpx.Client`. Если `rookiepy` не установлен, cookie-база заблокирована запущенным Firefox (SQLite lock) или вернула пустой результат, включается встроенный fallback без внешних зависимостей: снимок `cookies.sqlite` вместе с `-wal`/`-shm` во временную папку и чтение через стандартный `sqlite3` — без борьбы за блокировки с браузером. Профиль по умолчанию определяется по `profiles.ini` (секция `[Install...]` → `Default`, затем профиль с `Default=1`), с fallback'ом на каталог `*.default-release` и, в крайнем случае, на профиль с самым свежим `cookies.sqlite`.
 - **Заголовки** — `FirefoxSessionManager.firefox_headers()` строит User-Agent под текущую ОС и версию Firefox из `compatibility.ini` профиля (с замороженным `rv:109.0`, как в реальном Firefox), плюс `Accept-Language` (из профиля/системы или параметр `language`), `Sec-GPC: 1` и `Sec-Fetch-*` (вариант `fetch`/XHR по умолчанию, `navigation=True` для документных запросов) — отпечаток заголовков совпадает с реальным браузером. `Accept-Encoding` не подставляется: его согласует сам HTTP-бэкенд (httpx/curl_cffi) в соответствии с доступными декодерами.
+- **Но не только заголовки** — строка User-Agent это половина отпечатка; вторая это то, *как* клиент говорит по TLS и HTTP/2. Поэтому при установленном extra `[impersonate]` (`pip install 'arena-api[impersonate]'`, он же входит в `[auto]`) клиент по умолчанию отправляет запрос через `curl_cffi` с профилем Firefox, а не через нейтральный стек httpx. Это и есть лечение от «куки верные, а сервис отдаёт страницу проверки»: `cf_clearance` и родственные cookie привязаны к отпечатку, и челлендж прилетает именно из-за его несовпадения. Отключить: `impersonate=False`; задать явно: `impersonate="firefox147"` или `impersonate="chrome"`.
 - **403 / `ChallengeRequiredError`** — клиент печатает «Сессия устарела. Откройте arena.ai в Firefox, обновите страницу, затем нажмите Enter...», ждёт Enter, перечитывает cookie через `rookiepy` и прозрачно повторяет запрос (до `max_auth_refreshes=2` попыток по умолчанию, для sync- и async-методов, включая стримы).
 
 Cookie из Firefox перекрывают одноимённые значения из `cookies=`, а явные `headers=` перекрывают заголовки Firefox. Для headless-окружений создайте менеджер с `interactive=False` (без ожидания Enter, cookie перечитываются сразу) и передайте сам объект:
@@ -806,7 +853,7 @@ with DirectArenaClient(
 - `example.py` — Gradio queue/SSE;
 - `example_auto_login.py` — ноль настроек: `auto_client()` сам находит сессию, проверяет и обновляет её;
 - `example_direct.py` — Direct Chat с assertion, переданной пользователем;
-- `example_firefox.py` — сессия из локального профиля Firefox;
+- `example_firefox.py` — сессия из локального профиля Firefox (и печатает, какой отпечаток ушёл на сервер);
 - `example_e2e.py` — синтетический мониторинг на `arena_api.auth`: быстрая валидация через `curl_cffi` (`--check`, без браузера), обновление через реальный логин, детерминированный контекст, кинематический ввод, детектор challenge;
 - `example_auth_captcha.py` — opt-in решение reCAPTCHA в E2E-прогоне: `with_captcha_solving`, challenge-only обновление сессии и явный `solve_challenge()`;
 - `example_login.py` — вход руками один раз: `interactive_login()` открывает headed-браузер, дожидается входа, сохраняет `state/cookies.json` и проверяет его;

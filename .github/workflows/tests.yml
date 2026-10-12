@@ -23,9 +23,10 @@ jobs:
       - name: Install (test + E2E extras)
         run: |
           python -m pip install --upgrade pip
-          # playwright-stealth is imported by the vendored toolkit's bridge tests.
+          # playwright-stealth is imported by the vendored toolkit's bridge tests;
+          # the [impersonate] extra lets the curl_cffi transport be built for real.
           # Browser binaries are NOT needed: the whole suite is offline.
-          python -m pip install -e '.[test,e2e]' playwright-stealth
+          python -m pip install -e '.[test,e2e,impersonate]' playwright-stealth
 
       - name: Run tests
         run: python -m pytest -q
@@ -49,7 +50,7 @@ jobs:
       - name: Install (test + E2E extras)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e '.[test,e2e]' playwright-stealth
+          python -m pip install -e '.[test,e2e,impersonate]' playwright-stealth
 
       - name: Run tests
         run: python -m pytest -q

@@ -106,12 +106,16 @@ def test_console_script_points_at_a_callable(pyproject: dict) -> None:
 
 def test_documented_extras_exist(pyproject: dict) -> None:
     extras = pyproject["project"]["optional-dependencies"]
-    for name in ("test", "dev", "firefox", "e2e", "captcha", "auth-captcha", "auto", "vision"):
+    for name in ("test", "dev", "firefox", "e2e", "captcha", "auth-captcha", "auto", "vision", "impersonate"):
         assert name in extras, name
     # The zero-config extra must cover both halves of the promise.
     assert any("rookiepy" in item for item in extras["auto"])
     assert any("playwright-recaptcha" in item for item in extras["auto"])
     assert any("curl_cffi" in item for item in extras["auto"])
+    # The zero-config path must be able to send the session's own fingerprint.
+    assert any("httpx-curl-cffi" in item for item in extras["auto"])
+    assert any("curl-cffi" in item for item in extras["impersonate"])
+    assert any("httpx-curl-cffi" in item for item in extras["impersonate"])
     # The base install stays dependency-light.
     assert pyproject["project"]["dependencies"] == ["httpx[http2]>=0.27,<1"]
 

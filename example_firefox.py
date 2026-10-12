@@ -3,6 +3,13 @@
 Requires a local Firefox profile that is signed in to arena.ai. The
 recommended cookie backend is rookiepy (python -m pip install '.[firefox]');
 without it the built-in lock-safe cookies.sqlite reader is used.
+
+```python -m pip install '.[impersonate]'``` additionally sends the requests
+with Firefox's own TLS/HTTP2 fingerprint, which is what a cookie-aware edge
+(Cloudflare and the cf_clearance cookie) also looks at: a session copied out of
+Firefox but presented from Python's TLS stack can be answered with a challenge
+page even though every cookie is correct. The client picks it up by itself once
+the extra is installed; ``impersonate=False`` turns it off.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ def main() -> None:
     # The client loads the session itself; session_source accepts the manager
     # object too, e.g. FirefoxSessionManager(interactive=False) for headless runs.
     with ArenaClient(session_source="firefox") as arena:
+        print("TLS fingerprint:", arena.transport.impersonate or "httpx (no impersonation)")
         models = arena.get_models()
         print("Known model choices:", ", ".join(model.id for model in models[:10]))
         print("Chat queue endpoint:", arena.get_endpoint("chat").fn_index)

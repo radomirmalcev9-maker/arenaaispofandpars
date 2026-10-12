@@ -92,7 +92,12 @@ from .exceptions import (
     ChallengeRequiredError,
     RateLimitError,
 )
-from .transport import CookieInput, normalize_cookies
+from .transport import (
+    IMPERSONATE_EXTRA,
+    CookieInput,
+    impersonation_available,
+    normalize_cookies,
+)
 
 __all__ = [
     "AutoOptions",
@@ -108,11 +113,14 @@ __all__ = [
     "auto_direct_client",
     "discover_session",
     "explain_login",
+    "explain_impersonation",
     "explain_sources",
     "interactive_login",
     "login_flow_from_env",
     "main",
     "probe",
+    "impersonation_profile",
+    "profile_for_source",
     "resolve_solver",
     "solver_dependencies_available",
 ]
@@ -280,6 +288,16 @@ class AutoOptions:
     #: then reads is the same either way.
     hide_automation: bool = False
 
+    #: Which browser's TLS/HTTP2 fingerprint the requests should carry, so a
+    #: cookie-aware edge does not answer a *correct* session with a challenge
+    #: page. ``"auto"`` follows the browser the session was found in
+    #: (Firefox -> ``"firefox"``, a Chrome-family profile -> ``"chrome"``) as
+    #: soon as the optional ``[impersonate]`` extra is installed; an unknown
+    #: source (an explicit ``cookies=``, a stored file) stays as it is, since
+    #: guessing the browser would mismatch the headers we send. Pass ``"off"``
+    #: to disable, or a profile name (``"firefox147"``) to force one.
+    impersonate: str | None = "auto"
+
     #: ``True``/``False`` force challenge solving on or off; ``"auto"`` (the
     #: default) enables it when the solver dependencies are importable.
     solve_captchas: bool | Literal["auto"] = "auto"
@@ -321,6 +339,15 @@ class AutoOptions:
             raise ValueError("solve_captchas must be True, False or 'auto'")
         if self.challenge_wait_timeout <= 0:
             raise ValueError("challenge_wait_timeout must be positive")
+        # ``off``/``False``/"" all mean "do not impersonate"; "auto" is kept and
+        # resolved later, once the session has been discovered.
+        if self.impersonate is False or self.impersonate in ("off", ""):
+            self.impersonate = None
+        if self.impersonate is not None and not isinstance(self.impersonate, str):
+            raise ValueError(
+                "impersonate must be 'auto', a curl_cffi profile name, or "
+                "None/'off' to disable it"
+            )
 
     @property
     def site(self) -> str:
@@ -961,11 +988,84 @@ def _emit_note(manager: AutoSessionManager, message: str) -> None:
     print(f"[arena-api] {message}", file=sys.stderr, flush=True)
 
 
+#: Which curl_cffi profile matches a discovered source. A source is mapped only
+#: when both halves of the fingerprint agree: Firefox writes Firefox headers, and
+#: every other source is presented with the Chromium headers
+#: :meth:`~arena_api.auth.session.BrowserSessionManager.headers` builds (a real
+#: Edge profile is presented as Chromium too, so it gets Chromium's wire, not
+#: Edge's slightly different one).
+_SOURCE_PROFILES: dict[str, str] = {
+    "firefox": "firefox",
+    "browser:chrome": "chrome",
+    "browser:chromium": "chrome",
+    "browser:brave": "chrome",
+    "browser:vivaldi": "chrome",
+    "browser:opera": "chrome",
+    "browser:edge": "chrome",
+    "cookies": "chrome",
+    "env": "chrome",
+    "storage": "chrome",
+}
+
+
+def profile_for_source(source: str | None) -> str | None:
+    """The curl_cffi profile that matches a discovered session source."""
+    if not source:
+        return None
+    return _SOURCE_PROFILES.get(source)
+
+
+def impersonation_profile(
+    options: AutoOptions, discovered: DiscoveredSession | None = None
+) -> str | None:
+    """Turn :attr:`AutoOptions.impersonate` into a profile name or ``None``.
+
+    ``"auto"`` is silent by design: when the optional dependency is missing, or
+    the browser behind the cookies cannot be identified, it resolves to ``None``
+    -- the request goes out exactly as it did before this option existed.
+    """
+    value = options.impersonate
+    if value is None:
+        return None
+    if value != "auto":
+        return value
+    if not impersonation_available():
+        return None
+    return profile_for_source(discovered.source if discovered is not None else None)
+
+
+def explain_impersonation(options: AutoOptions) -> str:
+    """One line for ``--explain``: what the wire will look like, and why."""
+    value = options.impersonate
+    if value is None:
+        return "off"
+    if value != "auto":
+        if not impersonation_available():
+            return (
+                f"{value} (requested, but the optional curl_cffi transport is "
+                f"missing: {IMPERSONATE_EXTRA})"
+            )
+        return value
+    if not impersonation_available():
+        return (
+            "auto -> off (the optional curl_cffi transport is not installed; "
+            f"{IMPERSONATE_EXTRA} to send the session's own TLS fingerprint)"
+        )
+    return "auto -> follow the discovered session (firefox / chrome / edge)"
+
+
 def build_session_manager(
     options: AutoOptions, discovered: DiscoveredSession
 ) -> AutoSessionManager:
     """Wire a discovered session into the manager the clients consume."""
     solver = resolve_solver(options)
+    impersonate = impersonation_profile(options, discovered)
+    if impersonate:
+        _emit(
+            options,
+            f"[arena-api] requests will impersonate {impersonate} "
+            f"(session found in {discovered.source})",
+        )
     capture_dir = (
         Path(options.artifacts_dir) / "challenges" if options.artifacts_dir else None
     )
@@ -988,6 +1088,10 @@ def build_session_manager(
         captcha_url=options.base_url,
         timeout=options.timeout,
         fallback=discovered.manager,
+        # Both halves matter: the client derives its wire from this field, and
+        # the manager's own session probe uses it too, so the validation request
+        # matches the traffic that follows it.
+        impersonate=impersonate,
     )
     if discovered.source != "storage":
         manager.adopt(discovered.cookies)
@@ -1470,6 +1574,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--impersonate",
+        default="auto",
+        metavar="PROFILE",
+        help=(
+            "TLS/HTTP2 fingerprint to send: auto (follow the browser the session "
+            "was found in), a curl_cffi profile such as firefox, chrome or "
+            "firefox147, or off (httpx's own fingerprint). Needs the "
+            "'[impersonate]' extra"
+        ),
+    )
+    parser.add_argument(
         "--hide-automation",
         action="store_true",
         help=(
@@ -1511,6 +1626,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         verify=not args.no_verify,
         channel=args.channel,
         hide_automation=args.hide_automation,
+        impersonate=args.impersonate,
     )
 
 
@@ -1527,6 +1643,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for line in explain_sources(options):
             print(line)
         print(_report_line("login flow", _login_state(options)))
+        print(_report_line("fingerprint", explain_impersonation(options)))
         available = solver_dependencies_available(options.captcha_backend)
         detail = (
             f"{options.solve_captchas} (backend {options.captcha_backend}, "
