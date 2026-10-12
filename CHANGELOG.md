@@ -3,6 +3,99 @@
 Формат: краткий список по версиям. Версии до 0.3.0 в этом файле не описаны —
 смотрите историю git.
 
+## Unreleased
+
+### Отпечаток браузера, а не только его cookie: `impersonate`
+
+- Новая причина `ChallengeRequiredError` при формально верной сессии: `cf_clearance`
+  и родственные cookie привязаны не только к IP и User-Agent, но и к отпечатку
+  соединения (TLS ClientHello + настройки HTTP/2), а у httpx он свой, «питоновский».
+  Сессия, аккуратно перенесённая из Firefox, из-за одного этого может получить
+  страницу проверки — именно то, что видно в `example_firefox.py` после успешного
+  чтения профиля (`arena-auth-prod-v1.0`, `cf_clearance`, `__cf_bm` читаются, а
+  запрос к `/config` отбит челленджем).
+- `arena_api.transport` умеет отдавать запросы через `curl_cffi` с профилем
+  браузера: `ArenaTransport(impersonate="firefox")` строит
+  `httpx_curl_cffi.CurlTransport` (async — `AsyncCurlTransport`), не меняя ни
+  одного внешнего API: httpx-клиент, SSE-парсер, ретраи и обновление сессии
+  работают как раньше. Зависимость ленивая, extra — `[impersonate]`
+  (`curl-cffi` + `httpx-curl-cffi`), он же добавлен в `[auto]`.
+- Выбор профиля: `impersonate=None` (по умолчанию) следует за источником сессии —
+  Firefox-менеджер даёт `firefox`, `BrowserSessionManager` передаёт своё поле
+  `impersonate` (его заполняет `arena_api.auto` по найденному браузеру); `False`
+  выключает, строка (`"firefox147"`, `"chrome"`) задаёт явно. Если extra не
+  установлен, производное значение молча остаётся выключенным, а явное — падает с
+  подсказкой `pip install 'arena-api[impersonate]'`; `impersonate=` вместе с
+  `http_transport=` — ошибка (impersonation и есть транспорт).
+- `auto_client()` / `python -m arena_api` включают это сами: `AutoOptions.impersonate
+  = "auto"`, CLI-флаг `--impersonate auto|off|chrome|firefox|…`, строка
+  `fingerprint` в `--explain`, уведомление в stderr о выбранном профиле.
+  Отображение источников: Firefox → `firefox`; Chrome/Chromium/Brave/Vivaldi/Opera
+  → `chrome`; `state/cookies.json`, `ARENA_COOKIE`, `cookies=` → `chrome`
+  (заголовки в этих путях и так Chromium-shaped); неизвестный источник — ничего.
+- Валидация сессии (`BrowserSessionManager`) использует тот же профиль, что и
+  клиент: проба и рабочие запросы больше не идут разными стеками.
+- Тесты: `tests/test_impersonate.py` — политика выбора профиля, наличие/отсутствие
+  зависимости, сборка sync/async транспорта (записывающий двойник), взаимоисключение
+  с `http_transport`, обвязка bootstrap через менеджер, CLI-флаг, а также проверки
+  на **реальном сокете**: запрос через curl-транспорт сохраняет наши заголовки и
+  cookie, а SSE приходит инкрементально, а не одним куском. CI ставит
+  extra `[impersonate]` и гоняет их на всех платформах.
+- README: раздел «Отпечаток вместо „нейтрального“ клиента» с таблицей выбора;
+  `example_firefox.py` печатает, какой отпечаток ушёл на сервер.
+
+### `--login` в настоящем браузере: `--channel chrome`
+
+- `AutoOptions.channel` + флаг CLI `--channel chrome|msedge`: окно входа
+  запускается в установленном браузере, а не во встроенном Chromium. Это
+  единственный способ войти в аккаунт, который авторизуется **через Google**:
+  Google отклоняет вход из анонимной сборки Playwright («этот браузер или
+  приложение может быть небезопасным»), а установленный Chrome принимает.
+  Раньше этот путь был доступен только из Python (`login_and_save(channel=...)`),
+  CLI его не умел.
+- Подсказка при неудачном запуске окна различает случаи: без `--channel` —
+  «`playwright install chromium`», с `--channel` — «поставьте Google Chrome либо
+  уберите `--channel`», потому что скачивание встроенной сборки такой запуск не
+  починит.
+- README: раздел «Если Google не даёт войти» — три выхода, включая
+  рекомендуемый: войти своим обычным браузером и дать библиотеке прочитать его
+  cookie (`auto_client()`, профиль Firefox, `rookiepy` для Chrome/Edge/…), вообще
+  не используя Playwright.
+- Тесты: `channel` в `AutoOptions`/CLI/override и текст подсказки
+  (`tests/test_auto.py`).
+
+### `--hide-automation`: окно входа перестаёт представляться роботом
+
+- `login_environment_options(hide_automation=True)` (и `--hide-automation` в CLI,
+  `AutoOptions.hide_automation`) убирает из окна `--login` то, по чему Google
+  отличает управляемый браузер: `--enable-automation` уходит в
+  `ignore_default_args`, добавляется `--disable-blink-features=AutomationControlled`,
+  а на страницу ставится init-скрипт `HIDE_WEBDRIVER_SCRIPT`, снимающий
+  `navigator.webdriver` (удаление из прототипа, с `defineProperty` для сборок,
+  где `delete` запрещён). Пара `--channel chrome --hide-automation` — рабочая
+  комбинация для аккаунта, который входит **через Google**.
+- Новое поле `BrowserEnvironmentOptions.extra_init_scripts` — init-скрипты,
+  которые ставятся на каждую страницу из `new_page()` **до** первой навигации
+  (маска ставится только так: скрипт, добавленный после `goto`, уже опоздал).
+  Явные `ignore_default_args`/`launch_args`/`extra_init_scripts`, переданные в
+  `login_environment_options`, не затираются, а дополняются.
+- Маскировка остаётся opt-in и не проникает в обычный путь: `build_init_script`
+  по-прежнему не содержит ни одного стелс-маркера (это стережёт отдельный тест),
+  `hide_automation=False` по умолчанию, а при явном `environment_options=`
+  вариант вызывающего используется как есть.
+- `HIDE_WEBDRIVER_SCRIPT` экспортируется из `arena_api.auth`; заодно убраны
+  дубликаты `TOOLKIT_PACKAGE`/`inspect_page` в его `__all__` и добавлен тест
+  гигиены (`arena_api.auth` как и верхний уровень: всё импортированное
+  объявлено, ничего не объявлено дважды).
+
+### Тесты
+
+- `test_a_saved_result_names_the_file` больше не сравнивает вывод `describe()` с
+  POSIX-литералом: `LoginResult.describe()` печатает путь платформо-нативно, и на
+  `windows-latest` тот же `Path('state/cookies.json')` читается как
+  `state\cookies.json`. Из-за этого CI на `main` был красным — падал только этот
+  тест.
+
 ## 0.4.0
 
 ### Вход руками один раз: `arena-api --login`

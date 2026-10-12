@@ -9,6 +9,7 @@ import pytest
 from arena_api.auth.environment import (
     ANIMATION_FREEZE_CSS,
     DEFAULT_INIT_SCRIPT,
+    HIDE_WEBDRIVER_SCRIPT,
     DeterminismOptions,
     build_init_script,
 )
@@ -51,6 +52,25 @@ def test_script_contains_no_stealth_or_fingerprint_spoofing() -> None:
     )
     for marker in STEALTH_MARKERS:
         assert marker not in script, f"init script must not contain {marker!r}"
+
+
+def test_the_default_script_stays_honest() -> None:
+    """The webdriver mask is opt-in, so it must never leak into the default.
+
+    ``test_script_contains_no_stealth_or_fingerprint_spoofing`` already checks
+    the markers; this pins the reason: the mask exists, and is downloadable on
+    purpose (the sign-in window), not by accident.
+    """
+    assert "webdriver" in HIDE_WEBDRIVER_SCRIPT
+    assert "webdriver" not in DEFAULT_INIT_SCRIPT
+    assert "webdriver" not in build_init_script(DeterminismOptions(identify_automation=False))
+
+
+def test_the_webdriver_mask_survives_a_refusing_delete() -> None:
+    """A hardened build can throw on ``delete``; the script must still mask."""
+    assert "try {" in HIDE_WEBDRIVER_SCRIPT
+    assert "Object.defineProperty" in HIDE_WEBDRIVER_SCRIPT
+    assert "configurable: true" in HIDE_WEBDRIVER_SCRIPT
 
 
 def test_script_freezes_animations_and_caret() -> None:

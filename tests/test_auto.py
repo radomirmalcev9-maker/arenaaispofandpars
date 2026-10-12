@@ -1766,6 +1766,35 @@ def test_interactive_login_forwards_the_solver_and_the_form_flow(tmp_path, monke
     assert calls["reuse_existing"] is True
 
 
+def test_interactive_login_forwards_the_browser_channel(tmp_path, monkeypatch) -> None:
+    """Google refuses sign-in from Playwright's Chromium build, not from Chrome."""
+    calls = stub_login(monkeypatch, saved_result(tmp_path / "c.json"))
+
+    interactive_login(AutoOptions(), path=tmp_path / "c.json")
+    assert calls["channel"] is None  # the bundled build stays the default
+
+    interactive_login(AutoOptions(channel="chrome"), path=tmp_path / "c.json")
+    assert calls["channel"] == "chrome"
+
+    # ...and it is reachable as an override too, without touching AutoOptions.
+    interactive_login(AutoOptions(), path=tmp_path / "c.json", channel="msedge")
+    assert calls["channel"] == "msedge"
+
+
+def test_interactive_login_forwards_hide_automation(tmp_path, monkeypatch) -> None:
+    """Google's check is about the window, not about the session it yields."""
+    calls = stub_login(monkeypatch, saved_result(tmp_path / "c.json"))
+
+    interactive_login(AutoOptions(), path=tmp_path / "c.json")
+    assert calls["hide_automation"] is False  # honest by default
+
+    interactive_login(AutoOptions(hide_automation=True), path=tmp_path / "c.json")
+    assert calls["hide_automation"] is True
+
+    interactive_login(AutoOptions(), path=tmp_path / "c.json", hide_automation=True)
+    assert calls["hide_automation"] is True
+
+
 def test_interactive_login_fresh_start_ignores_the_old_session(tmp_path, monkeypatch) -> None:
     calls = stub_login(monkeypatch, saved_result(tmp_path / "c.json"))
 
@@ -1907,12 +1936,27 @@ def test_cli_login_maps_its_flags(tmp_path, monkeypatch) -> None:
         monkeypatch, LoginOutcome(login=saved_result(tmp_path / "saved.json"), path=tmp_path / "saved.json")
     )
 
-    assert main(["--login", "--storage", "saved.json", "--fresh", "--headless", "--login-rounds", "2"]) == 0
+    assert main(
+        [
+            "--login",
+            "--storage",
+            "saved.json",
+            "--fresh",
+            "--headless",
+            "--login-rounds",
+            "2",
+            "--channel",
+            "chrome",
+            "--hide-automation",
+        ]
+    ) == 0
 
     assert calls["path"] == Path("saved.json")  # the CLI keeps the path as given
     assert calls["fresh"] is True
     assert calls["headless"] is True
     assert calls["rounds"] == 2
+    assert calls["options"].channel == "chrome"  # the window will be real Chrome
+    assert calls["options"].hide_automation is True
 
 
 def test_cli_login_defaults_to_the_discoverable_state_file(tmp_path, monkeypatch) -> None:
@@ -1981,8 +2025,37 @@ def test_cli_login_reports_a_browser_error_on_stderr(tmp_path, monkeypatch, caps
 
 def test_cli_help_documents_the_login_flags() -> None:
     text = build_arg_parser().format_help()
-    for flag in ("--login", "--fresh", "--headless", "--login-rounds", "--storage"):
+    for flag in (
+        "--login",
+        "--fresh",
+        "--headless",
+        "--login-rounds",
+        "--storage",
+        "--channel",
+        "--hide-automation",
+    ):
         assert flag in text
+
+
+def test_cli_channel_failure_suggests_the_right_browser(tmp_path, monkeypatch, capsys) -> None:
+    """With ``--channel chrome`` the bundled download would not help: say what does."""
+    monkeypatch.chdir(tmp_path)
+
+    def boom(options=None, **kwargs):
+        raise RuntimeError(
+            "BrowserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/x\n"
+            "Please run the following command to download new browsers"
+        )
+
+    monkeypatch.setattr(auto_module, "interactive_login", boom)
+
+    assert main(["--login", "--channel", "chrome"]) == 1
+
+    captured = capsys.readouterr()
+    assert "Google Chrome" in captured.err
+    assert "drop --channel" in captured.err
+    assert len(captured.err.strip().splitlines()) == 1, "the hint must stay one line"
+    assert captured.out == ""
 
 
 # --------------------------------------------------------------------------- #

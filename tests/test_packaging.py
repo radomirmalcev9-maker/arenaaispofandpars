@@ -61,6 +61,29 @@ def test_every_reexport_is_listed_in_all() -> None:
     assert sorted(imported - set(arena_api.__all__)) == []
 
 
+def test_the_auth_subpackage_exports_match_its_list() -> None:
+    """Same hygiene as the top level, one level down.
+
+    ``arena_api/auth/__init__.py`` re-exports a hundred names by hand; without
+    this, a missed entry silently disappears from ``from arena_api.auth import *``
+    and a duplicated one makes the package look like it lost track of itself.
+    """
+    from arena_api import auth
+
+    tree = ast.parse((PACKAGE / "auth" / "__init__.py").read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 1:
+            imported.update(alias.asname or alias.name for alias in node.names)
+
+    assert sorted(imported - set(auth.__all__)) == []
+    duplicates = sorted(
+        name for name in set(auth.__all__) if auth.__all__.count(name) > 1
+    )
+    assert duplicates == []
+    assert [name for name in auth.__all__ if not hasattr(auth, name)] == []
+
+
 def test_importing_the_package_pulls_no_heavy_dependency() -> None:
     code = (
         "import sys, arena_api\n"
@@ -83,12 +106,16 @@ def test_console_script_points_at_a_callable(pyproject: dict) -> None:
 
 def test_documented_extras_exist(pyproject: dict) -> None:
     extras = pyproject["project"]["optional-dependencies"]
-    for name in ("test", "dev", "firefox", "e2e", "captcha", "auth-captcha", "auto", "vision"):
+    for name in ("test", "dev", "firefox", "e2e", "captcha", "auth-captcha", "auto", "vision", "impersonate"):
         assert name in extras, name
     # The zero-config extra must cover both halves of the promise.
     assert any("rookiepy" in item for item in extras["auto"])
     assert any("playwright-recaptcha" in item for item in extras["auto"])
     assert any("curl_cffi" in item for item in extras["auto"])
+    # The zero-config path must be able to send the session's own fingerprint.
+    assert any("httpx-curl-cffi" in item for item in extras["auto"])
+    assert any("curl-cffi" in item for item in extras["impersonate"])
+    assert any("httpx-curl-cffi" in item for item in extras["impersonate"])
     # The base install stays dependency-light.
     assert pyproject["project"]["dependencies"] == ["httpx[http2]>=0.27,<1"]
 
