@@ -14,7 +14,7 @@
 
 Быстрый старт (Playwright, синхронно)::
 
-    from recaptcha_toolkit import PlaywrightBot
+    from arena_api._vendor.recaptcha_toolkit import PlaywrightBot
 
     with PlaywrightBot() as bot:
         page = bot.new_page()
@@ -23,7 +23,7 @@
 
 Быстрый старт (Selenium)::
 
-    from recaptcha_toolkit import SeleniumBot
+    from arena_api._vendor.recaptcha_toolkit import SeleniumBot
 
     with SeleniumBot.launch_chrome() as bot:
         bot.driver.get("https://www.google.com/recaptcha/api2/demo")

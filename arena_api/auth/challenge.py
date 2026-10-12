@@ -32,8 +32,13 @@ Opting in to solving
 reporting it, but only when you ask for it: pass a ``captcha_solver`` (see
 :mod:`arena_api.auth.captcha`) and set ``solve_on_detection=True``. The handler
 then solves, re-scans the page, and reports only a challenge that survived --
-with every attempt's failure reason attached to the error. Kinds outside
-:data:`SOLVABLE_CHALLENGE_KINDS` are never solved. The fast HTTP path
+with every attempt's failure reason attached to the error. Which kinds are in
+reach is the *solver's* decision (:meth:`ChallengeHandler.can_solve` asks
+``solver.supports(observation)`` first): a token bridge such as
+:class:`~arena_api.auth.captcha.RecaptchaToolkitSolver` covers
+:data:`SOLVABLE_CHALLENGE_KINDS`, while
+:class:`~arena_api.auth.captcha.ChallengeWaitSolver` covers the kinds that have
+no token to produce. The fast HTTP path
 (:func:`inspect_response`, :meth:`ChallengeHandler.check_response`) has no page
 to act on, so it stays observational in all configurations.
 """
@@ -42,7 +47,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -55,6 +60,9 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
 
 __all__ = [
     "CLOUDFLARE_FRAME_HOSTS",
+    "DATADOME_FRAME_HOSTS",
+    "DATADOME_HEADERS",
+    "DATADOME_SELECTORS",
     "ChallengeHandler",
     "ChallengeKind",
     "ChallengeObservation",
@@ -66,6 +74,7 @@ __all__ = [
     "STATUS_TEXT_MARKERS",
     "TURNSTILE_SELECTORS",
     "inspect_page",
+    "inspect_page_sync",
     "inspect_response",
 ]
 
@@ -91,12 +100,29 @@ RECAPTCHA_SELECTORS: tuple[str, ...] = (
     "[data-recaptcha-widget-id]",
 )
 
+DATADOME_SELECTORS: tuple[str, ...] = (
+    "iframe[src*='captcha-delivery.com']",
+    "iframe[src*='datadome']",
+    ".datadome-widget",
+    "[data-datadome-widget-id]",
+)
+
 #: Frame hosts that indicate a Cloudflare interstitial rather than page content.
 CLOUDFLARE_FRAME_HOSTS: tuple[str, ...] = (
     "challenges.cloudflare.com",
     "cf-assets.com",
     "cdn-cgi/challenge-platform",
 )
+
+#: DataDome serves its captcha from these hosts, and answers a blocked request
+#: with ``x-datadome``/``x-datadome-cid`` headers.
+DATADOME_FRAME_HOSTS: tuple[str, ...] = (
+    "captcha-delivery.com",
+    "geo.captcha-delivery.com",
+)
+
+#: Response headers that identify a DataDome block page.
+DATADOME_HEADERS: tuple[str, ...] = ("x-datadome", "x-datadome-cid")
 
 #: Substrings matched case-insensitively against the visible body text.
 STATUS_TEXT_MARKERS: tuple[str, ...] = (
@@ -142,15 +168,19 @@ class ChallengeKind(str, Enum):
     CLOUDFLARE_MANAGED = "cloudflare_managed"
     RECAPTCHA = "recaptcha"
     HCAPTCHA = "hcaptcha"
+    DATADOME = "datadome"
     INTERSTITIAL = "interstitial"
     RATE_LIMIT = "rate_limit"
     UNKNOWN = "unknown"
 
 
-#: Kinds a solver bridge can act on (see :mod:`arena_api.auth.captcha`).
-#: :mod:`recaptcha_toolkit` solves reCAPTCHA only: Turnstile, hCaptcha and a
-#: managed Cloudflare interstitial have no token to produce here, so they keep
-#: the detect-and-report path even when a solver is configured.
+#: Kinds solvable **by producing a token** (see :mod:`arena_api.auth.captcha`).
+#: The vendored toolkit solves reCAPTCHA only. The other challenge kinds have no
+#: token to forge here, but they are not hopeless: :class:`~arena_api.auth.captcha.
+#: ChallengeWaitSolver` clears Turnstile and a managed Cloudflare interstitial by
+#: waiting them out, and hands hCaptcha/DataDome to a person in a headed browser.
+#: Such a solver declares its own reach through ``supports()``, which
+#: :meth:`ChallengeHandler.can_solve` prefers over this constant.
 SOLVABLE_CHALLENGE_KINDS: frozenset[ChallengeKind] = frozenset({ChallengeKind.RECAPTCHA})
 
 
@@ -233,6 +263,12 @@ identify_automation is enabled.
      stable than replaying a user's cookies.
   5. If you must exercise production, do it at a human-scale cadence and
      identify the traffic so the operator can tune their rule.
+
+Where you are authorized to complete the check yourself, this package can help: \
+Turnstile and a managed Cloudflare interstitial are waited out, hCaptcha and \
+DataDome are handed to you in a headed browser (``arena-api --login``, or \
+``ChallengeWaitSolver(interactive=True)``), and reCAPTCHA can be solved with \
+``RecaptchaToolkitSolver`` -- see :mod:`arena_api.auth.captcha`.
 """
 
 
@@ -276,6 +312,7 @@ def _classify(signals: Sequence[ChallengeSignal]) -> ChallengeKind:
         ChallengeKind.TURNSTILE,
         ChallengeKind.RECAPTCHA,
         ChallengeKind.HCAPTCHA,
+        ChallengeKind.DATADOME,
         ChallengeKind.RATE_LIMIT,
         ChallengeKind.INTERSTITIAL,
     )
@@ -346,6 +383,16 @@ def inspect_response(
                 "body-text", "cdn-cgi/challenge-platform", ChallengeKind.CLOUDFLARE_MANAGED
             )
         )
+    if any(host in body_lower for host in DATADOME_FRAME_HOSTS):
+        signals.append(
+            ChallengeSignal("body-text", "captcha-delivery.com reference", ChallengeKind.DATADOME)
+        )
+    for name in DATADOME_HEADERS:
+        if _header_value(headers, name):
+            signals.append(
+                ChallengeSignal("header", f"{name} present", ChallengeKind.DATADOME)
+            )
+            break
     if "hcaptcha.com" in body_lower:
         signals.append(ChallengeSignal("body-text", "hcaptcha.com", ChallengeKind.HCAPTCHA))
     if "google.com/recaptcha" in body_lower or "grecaptcha" in body_lower:
@@ -417,7 +464,74 @@ async def inspect_page(
     This only *observes*. It does not locate, focus, or interact with any
     widget inside the challenge frame.
     """
-    target_url = url if url is not None else str(getattr(page, "url", "") or "")
+    target_url = _page_url(page, url)
+    signals, frame_urls = _frame_signals(page)
+
+    scan = _empty_scan()
+    try:
+        evaluated = await page.evaluate(
+            _PAGE_SCAN_JS, list(_all_selectors(extra_selectors))
+        )
+        if isinstance(evaluated, dict):
+            scan = evaluated
+    except Exception:
+        scan = _empty_scan()
+
+    extra_signals, frames = _scan_signals(scan, frame_urls, extra_text_markers)
+    signals.extend(extra_signals)
+
+    observation = _observation(target_url, signals, frames)
+    if observation.is_challenge and capture_dir is not None:
+        observation = await _capture(page, observation, capture_dir, screenshot)
+    return observation
+
+
+def inspect_page_sync(
+    page: Any,
+    *,
+    capture_dir: str | Path | None = None,
+    screenshot: bool = True,
+    extra_selectors: Sequence[str] = (),
+    extra_text_markers: Sequence[str] = (),
+    url: str | None = None,
+) -> ChallengeObservation:
+    """Sync twin of :func:`inspect_page` for ``playwright.sync_api`` pages.
+
+    Same signals, same classification, same diagnostics on disk. It exists so
+    that a solver driven from synchronous code -- :meth:`arena_api.auth.captcha.
+    ChallengeWaitSolver.solve`, for instance -- can re-check a page between
+    waits instead of guessing from the initial observation.
+    """
+    target_url = _page_url(page, url)
+    signals, frame_urls = _frame_signals(page)
+
+    scan = _empty_scan()
+    try:
+        evaluated = page.evaluate(_PAGE_SCAN_JS, list(_all_selectors(extra_selectors)))
+        if isinstance(evaluated, dict):
+            scan = evaluated
+    except Exception:
+        scan = _empty_scan()
+
+    extra_signals, frames = _scan_signals(scan, frame_urls, extra_text_markers)
+    signals.extend(extra_signals)
+
+    observation = _observation(target_url, signals, frames)
+    if observation.is_challenge and capture_dir is not None:
+        observation = _capture_sync(page, observation, capture_dir, screenshot)
+    return observation
+
+
+def _page_url(page: Any, url: str | None) -> str:
+    return url if url is not None else str(getattr(page, "url", "") or "")
+
+
+def _empty_scan() -> dict[str, Any]:
+    return {"selectors": [], "frames": [], "text": "", "title": ""}
+
+
+def _frame_signals(page: Any) -> tuple[list[ChallengeSignal], list[str]]:
+    """Signals from the frames the page already holds (sync- and async-safe)."""
     signals: list[ChallengeSignal] = []
     frame_urls: list[str] = []
 
@@ -434,26 +548,30 @@ async def inspect_page(
                 break
         if "hcaptcha.com" in lowered:
             signals.append(ChallengeSignal("frame", frame_url, ChallengeKind.HCAPTCHA))
+        if any(host in lowered for host in DATADOME_FRAME_HOSTS):
+            signals.append(ChallengeSignal("frame", frame_url, ChallengeKind.DATADOME))
         if "recaptcha" in lowered:
             signals.append(ChallengeSignal("frame", frame_url, ChallengeKind.RECAPTCHA))
 
-    scan: dict[str, Any] = {"selectors": [], "frames": [], "text": "", "title": ""}
-    try:
-        evaluated = await page.evaluate(
-            _PAGE_SCAN_JS, list(_all_selectors(extra_selectors))
-        )
-        if isinstance(evaluated, dict):
-            scan = evaluated
-    except Exception:
-        scan = {"selectors": [], "frames": [], "text": "", "title": ""}
+    return signals, frame_urls
+
+
+def _scan_signals(
+    scan: Mapping[str, Any],
+    frame_urls: Sequence[str],
+    extra_text_markers: Sequence[str],
+) -> tuple[list[ChallengeSignal], list[str]]:
+    """Signals from a ``_PAGE_SCAN_JS`` result, plus any frames it adds."""
+    signals: list[ChallengeSignal] = []
+    frames = list(frame_urls)
 
     for selector in scan.get("selectors", []):
         signals.append(
             ChallengeSignal("dom", f"matched {selector}", _kind_for_selector(selector))
         )
     for frame_url in scan.get("frames", []):
-        if frame_url not in frame_urls:
-            frame_urls.append(str(frame_url))
+        if frame_url not in frames:
+            frames.append(str(frame_url))
 
     haystack = "\n".join(
         part for part in (scan.get("title", ""), scan.get("text", "")) if part
@@ -467,16 +585,19 @@ async def inspect_page(
             ChallengeSignal("dom-text", f"custom marker {marker!r}", ChallengeKind.UNKNOWN)
         )
 
-    observation = ChallengeObservation(
-        url=target_url,
+    return signals, frames
+
+
+def _observation(
+    url: str, signals: Sequence[ChallengeSignal], frame_urls: Sequence[str]
+) -> ChallengeObservation:
+    return ChallengeObservation(
+        url=url,
         kind=_classify(signals),
         signals=tuple(signals),
         frame_urls=tuple(frame_urls[:50]),
         detected_at=_utc_now(),
     )
-    if observation.is_challenge and capture_dir is not None:
-        observation = await _capture(page, observation, capture_dir, screenshot)
-    return observation
 
 
 def _all_selectors(extra: Sequence[str]) -> list[str]:
@@ -485,6 +606,7 @@ def _all_selectors(extra: Sequence[str]) -> list[str]:
         *TURNSTILE_SELECTORS,
         *RECAPTCHA_SELECTORS,
         *HCAPTCHA_SELECTORS,
+        *DATADOME_SELECTORS,
         *extra,
     ):
         if selector not in seen:
@@ -493,51 +615,57 @@ def _all_selectors(extra: Sequence[str]) -> list[str]:
 
 
 def _kind_for_selector(selector: str) -> ChallengeKind:
-    lowered = selector.lower()
-    if "turnstile" in lowered or "cloudflare" in lowered:
+    """Map a matched selector back to the vendor it belongs to.
+
+    Comparison ignores punctuation, so ``.h-captcha`` and ``.hcaptcha-widget``
+    both read as hCaptcha. That matters: ``.h-captcha`` is the documented widget
+    class in :data:`HCAPTCHA_SELECTORS`, and a literal ``"hcaptcha"`` substring
+    test misses it, which used to downgrade a real hCaptcha page to ``UNKNOWN``.
+    """
+    compact = re.sub(r"[^a-z0-9]+", "", selector.lower())
+    if "turnstile" in compact or "cloudflare" in compact:
         return ChallengeKind.TURNSTILE
-    if "hcaptcha" in lowered:
+    if "hcaptcha" in compact:
         return ChallengeKind.HCAPTCHA
-    if "recaptcha" in lowered:
+    if "datadome" in compact or "captchadelivery" in compact:
+        return ChallengeKind.DATADOME
+    if "recaptcha" in compact:
         return ChallengeKind.RECAPTCHA
     return ChallengeKind.UNKNOWN
 
 
-async def _capture(
-    page: Any, observation: ChallengeObservation, capture_dir: str | Path, screenshot: bool
-) -> ChallengeObservation:
-    """Write screenshot/HTML/metadata for a detected challenge."""
+def _capture_target(
+    observation: ChallengeObservation, capture_dir: str | Path
+) -> tuple[Path, str]:
+    """Directory and artefact prefix for one detected challenge."""
     directory = Path(capture_dir)
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     host = re.sub(r"[^a-z0-9]+", "-", observation.url.lower())[:48].strip("-") or "page"
-    base = f"challenge-{stamp}-{host}"
+    return directory, f"challenge-{stamp}-{host}"
 
-    html_path: str | None = None
+
+def _write_html(html: str, directory: Path, base: str) -> str | None:
+    if not html:
+        return None
     try:
-        html_path = str(directory / f"{base}.html")
-        Path(html_path).write_text(await page.content(), encoding="utf-8")
+        path = str(directory / f"{base}.html")
+        Path(path).write_text(html, encoding="utf-8")
+        return path
     except Exception:
-        html_path = None
+        return None
 
-    screenshot_path: str | None = None
-    if screenshot:
-        try:
-            screenshot_path = str(directory / f"{base}.png")
-            await page.screenshot(path=screenshot_path, full_page=True)
-        except Exception:
-            screenshot_path = None
 
-    observation = ChallengeObservation(
-        url=observation.url,
-        kind=observation.kind,
-        signals=observation.signals,
-        status=observation.status,
-        headers=observation.headers,
-        frame_urls=observation.frame_urls,
-        html_path=html_path,
-        screenshot_path=screenshot_path,
-        detected_at=observation.detected_at,
+def _finish_capture(
+    observation: ChallengeObservation,
+    directory: Path,
+    base: str,
+    html_path: str | None,
+    screenshot_path: str | None,
+) -> ChallengeObservation:
+    """Attach the artefact paths and drop a JSON summary next to them."""
+    observation = replace(
+        observation, html_path=html_path, screenshot_path=screenshot_path
     )
     try:
         (directory / f"{base}.json").write_text(
@@ -547,6 +675,52 @@ async def _capture(
     except Exception:
         pass
     return observation
+
+
+async def _capture(
+    page: Any, observation: ChallengeObservation, capture_dir: str | Path, screenshot: bool
+) -> ChallengeObservation:
+    """Write screenshot/HTML/metadata for a detected challenge."""
+    directory, base = _capture_target(observation, capture_dir)
+
+    try:
+        html = await page.content()
+    except Exception:
+        html = ""
+    html_path = _write_html(html, directory, base)
+
+    screenshot_path: str | None = None
+    if screenshot:
+        try:
+            screenshot_path = str(directory / f"{base}.png")
+            await page.screenshot(path=screenshot_path, full_page=True)
+        except Exception:
+            screenshot_path = None
+
+    return _finish_capture(observation, directory, base, html_path, screenshot_path)
+
+
+def _capture_sync(
+    page: Any, observation: ChallengeObservation, capture_dir: str | Path, screenshot: bool
+) -> ChallengeObservation:
+    """Sync twin of :func:`_capture`."""
+    directory, base = _capture_target(observation, capture_dir)
+
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+    html_path = _write_html(html, directory, base)
+
+    screenshot_path: str | None = None
+    if screenshot:
+        try:
+            screenshot_path = str(directory / f"{base}.png")
+            page.screenshot(path=screenshot_path, full_page=True)
+        except Exception:
+            screenshot_path = None
+
+    return _finish_capture(observation, directory, base, html_path, screenshot_path)
 
 
 # --------------------------------------------------------------------------- #

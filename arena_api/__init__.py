@@ -1,8 +1,16 @@
 """Unofficial, cookie-authenticated sync/async clients for Arena frontends.
 
-This package uses caller-provided credentials — or, opt-in via
-``session_source="firefox"``, the signed-in session of your local Firefox
-profile. See the project README for protocol caveats.
+The quickest start is :func:`arena_api.auto_client`: it finds the session of the
+browser you are already signed in to, matches its fingerprint, verifies it and
+keeps it fresh. This package uses caller-provided credentials — or your own
+local browser profile (``auto_client()``, ``session_source="firefox"``); nothing
+is collected anywhere else. See the project README for protocol caveats.
+
+On a machine with no profile of yours on it, sign in once by hand --
+:func:`arena_api.interactive_login` from Python, or ``arena-api --login`` in a
+terminal. It opens a real browser window, waits for you, saves the session to
+``state/cookies.json`` and verifies it, after which ``auto_client()`` works with
+no arguments at all.
 
 ``arena_api.auth`` additionally ships E2E/synthetic-monitoring tooling
 (Playwright wrapper, pointer kinematics, determinism init scripts, session
@@ -19,19 +27,24 @@ from .auth import (
     ChallengeHandler,
     ChallengeKind,
     ChallengeObservation,
+    ChallengeWaitSolver,
+    CompositeSolver,
     DeterminismOptions,
     FirefoxSessionError,
     FirefoxSessionManager,
     FormLoginFlow,
     KinematicMouse,
     KinematicMouseSync,
+    LoginResult,
     RecaptchaToolkitSolver,
     SessionManager,
     SessionValidation,
     TrajectoryPlanner,
+    alogin_and_save,
     build_init_script,
     inspect_page,
     inspect_response,
+    login_and_save,
 )
 from .client import ArenaClient, AsyncArenaClient
 from .direct import (
@@ -45,6 +58,7 @@ from .exceptions import (
     AuthenticationError,
     CaptchaSolveError,
     ChallengeRequiredError,
+    ClientClosedError,
     ModelUnavailableError,
     ProtocolError,
     QueueTimeoutError,
@@ -74,12 +88,14 @@ from .auto import (  # noqa: E402
     AutoSessionManager,
     DirectVerificationToken,
     DiscoveredSession,
+    LoginOutcome,
     ProbeResult,
     auto_async_client,
     auto_async_direct_client,
     auto_client,
     auto_direct_client,
     discover_session,
+    interactive_login,
 )
 
 # Short aliases for applications that do not need to distinguish the backend.
@@ -101,19 +117,34 @@ __all__ = [
     "AutoSessionManager",
     "BattleResponse",
     "BattleStreamChunk",
+    "BrowserEnvironment",
+    "BrowserEnvironmentOptions",
+    "BrowserSessionManager",
     "CaptchaAttempt",
     "CaptchaSolveError",
     "CaptchaSolver",
+    "ChallengeHandler",
+    "ChallengeKind",
+    "ChallengeObservation",
+    "ChallengeWaitSolver",
+    "CompositeSolver",
     "ChallengeRequiredError",
     "ChatSession",
     "Client",
+    "ClientClosedError",
+    "DeterminismOptions",
     "DirectArenaClient",
     "DirectChatSession",
     "DirectVerificationToken",
     "DiscoveredSession",
+    "LoginOutcome",
     "FirefoxSessionError",
     "FirefoxSessionManager",
+    "FormLoginFlow",
     "GenerationConfig",
+    "KinematicMouse",
+    "KinematicMouseSync",
+    "LoginResult",
     "Message",
     "ModelInfo",
     "ModelUnavailableError",
@@ -125,12 +156,20 @@ __all__ = [
     "RecaptchaToolkitSolver",
     "SSEParser",
     "SessionManager",
+    "SessionValidation",
     "StreamChunk",
+    "TrajectoryPlanner",
     "auto_async_client",
     "auto_async_direct_client",
     "auto_client",
     "auto_direct_client",
+    "alogin_and_save",
+    "build_init_script",
     "discover_session",
+    "interactive_login",
+    "inspect_page",
+    "inspect_response",
+    "login_and_save",
     "normalize_cookies",
     "parse_cookie_header",
 ]

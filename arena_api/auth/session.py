@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 from urllib.parse import urljoin, urlparse
 
 from ..constants import DEFAULT_BASE_URL
-from ..exceptions import AuthenticationError, ChallengeRequiredError
+from ..exceptions import AuthenticationError
 from .browser import BrowserEnvironment, BrowserEnvironmentOptions
 from .challenge import ChallengeHandler, ChallengeObservation, inspect_response
 from .kinematics import KinematicMouse

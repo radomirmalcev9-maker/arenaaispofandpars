@@ -1,4 +1,4 @@
-# Примеры использования recaptcha_toolkit
+# Примеры использования arena_api._vendor.recaptcha_toolkit
 
 Запуск — из корня репозитория:
 

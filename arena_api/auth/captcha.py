@@ -1,4 +1,4 @@
-"""Opt-in bridge from ``arena_api.auth`` to :mod:`recaptcha_toolkit`.
+"""Opt-in challenge solving: a token for reCAPTCHA, patience for the rest.
 
 Posture
 -------
@@ -10,9 +10,20 @@ This module is the single place where that stance is relaxed, and it is relaxed
 only when you ask for it: nothing here is active unless you construct a solver
 and hand it to a handler, an environment or a session manager.
 
-Only :data:`~arena_api.auth.challenge.ChallengeKind.RECAPTCHA` is covered,
-because that is what :mod:`recaptcha_toolkit` can solve. Turnstile, hCaptcha and
-Cloudflare managed challenges keep the detect-and-report path -- see
+Two solvers live here, and they cover the classified kinds between them:
+
+* :class:`RecaptchaToolkitSolver` produces a real ``g-recaptcha-response`` token
+  for :data:`~arena_api.auth.challenge.ChallengeKind.RECAPTCHA` through the
+  vendored toolkit (audio, image or local-YOLO backend).
+* :class:`ChallengeWaitSolver` handles everything that has *no* token to forge:
+  Turnstile and a Cloudflare managed interstitial usually pass on their own in a
+  real browser, so it re-scans the page until they do; hCaptcha, DataDome and
+  anything unrecognised are handed to a person, which a headed browser window
+  makes possible (``interactive=True`` announces the wait and lets you extend it).
+
+:class:`CompositeSolver` dispatches between them by kind, and
+:func:`arena_api.auto.resolve_solver` builds exactly that pair by default. When
+neither can help, the detect-and-report path still applies -- see
 :data:`~arena_api.auth.challenge.REMEDIATION_TEMPLATE` for the durable fixes.
 
 No second browser
@@ -36,26 +47,42 @@ backend. Set ``apply_stealth=False`` to opt out -- and prefer
 which also drops the synthetic-monitor announcement so the two postures do not
 contradict each other.
 
-Dependencies stay optional: :mod:`recaptcha_toolkit` is imported lazily inside
-the methods that need it, so importing this module (and therefore
-``arena_api``) requires nothing beyond the standard library.
+Dependencies stay optional: :mod:`arena_api._vendor.recaptcha_toolkit` is
+imported lazily inside the methods that need it, so importing this module (and
+therefore ``arena_api``) requires nothing beyond the standard library. The wait
+solver needs no third-party package at all -- only the Playwright page it is
+given.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import time
+import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    IO,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 from ..exceptions import CaptchaSolveError
 from .challenge import (
     SOLVABLE_CHALLENGE_KINDS,
     ChallengeKind,
     ChallengeObservation,
+    inspect_page,
+    inspect_page_sync,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
-    from recaptcha_toolkit import (
+    from arena_api._vendor.recaptcha_toolkit import (
         PlaywrightSolverOptions,
         RecaptchaVersion,
         SolverBackend,
@@ -66,16 +93,22 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
 __all__ = [
     "SOLVABLE_CHALLENGE_KINDS",
     "TOOLKIT_PACKAGE",
+    "WAITABLE_CHALLENGE_KINDS",
     "CaptchaAttempt",
     "CaptchaSolver",
+    "ChallengeWaitSolver",
+    "CompositeSolver",
     "RecaptchaToolkitSolver",
     "detect_recaptcha_version",
     "detect_recaptcha_version_sync",
+    "describe_solver",
     "observation_targets_recaptcha",
+    "solver_for",
 ]
 
-#: Distribution that provides the solver backends.
-TOOLKIT_PACKAGE = "recaptcha_toolkit"
+#: Distribution that provides the toolkit's own dependencies. The toolkit code
+#: itself is vendored, so only its backends ever need installing.
+TOOLKIT_PACKAGE = "arena_api._vendor.recaptcha_toolkit"
 
 #: Distinguish a visible v2 checkbox from an invisible/v3 widget.
 #:
@@ -108,14 +141,16 @@ _VERSION_DETECT_JS = """
 
 
 def _toolkit() -> Any:
-    """Import :mod:`recaptcha_toolkit` lazily, with an actionable error."""
+    """Import the vendored toolkit lazily, with an actionable error."""
     try:
-        import recaptcha_toolkit
+        from .._vendor import recaptcha_toolkit
     except ImportError as exc:  # pragma: no cover - depends on the install
         raise CaptchaSolveError(
-            f"Solving challenges requires the {TOOLKIT_PACKAGE} package; install "
-            "it with `pip install '.[auth-captcha]'` (add `.[vision]` for the "
-            "local YOLO backend)."
+            "Solving reCAPTCHA needs the vendored toolkit's backends "
+            f"({TOOLKIT_PACKAGE} failed to import: {exc}); install them with "
+            "`pip install '.[auth-captcha]'` (add `.[vision]` for the local "
+            "YOLO backend). Waiting a challenge out needs no extra install: "
+            "see ChallengeWaitSolver."
         ) from exc
     return recaptcha_toolkit
 
@@ -155,26 +190,48 @@ class CaptchaAttempt:
     stealth_applied: bool = False
     observation: ChallengeObservation | None = None
 
+    #: ``True`` when the challenge disappeared without a token being produced --
+    #: what :class:`ChallengeWaitSolver` reports after a Turnstile or a managed
+    #: Cloudflare interstitial passes on its own.
+    cleared: bool = False
+
     @property
     def ok(self) -> bool:
-        """Whether a usable ``g-recaptcha-response`` token was produced."""
-        return bool(self.token)
+        """Whether the attempt achieved something: a token, or a cleared page."""
+        return bool(self.token) or self.cleared
 
     def describe(self) -> str:
         """One-line summary suitable for a CI log."""
         label = f"{self.backend or 'solver'}/{self.version or '?'}"
-        outcome = "solved" if self.ok else f"failed ({self.error})"
+        if self.cleared and not self.token:
+            outcome = f"cleared after {self.attempts} check(s)"
+        elif self.ok:
+            outcome = "solved"
+        else:
+            outcome = f"failed ({self.error})"
         return f"{label} in {self.duration:.1f}s: {outcome}"
 
     def raise_for_status(self) -> str:
-        """Return the token, or raise :class:`CaptchaSolveError`."""
+        """Return the token (``""`` when the page merely cleared), or raise.
+
+        :raises CaptchaSolveError: when the attempt neither produced a token nor
+            cleared the challenge. The hint depends on the backend: a token
+            backend usually means missing dependencies, a wait usually means the
+            page needs a person.
+        """
         if self.ok:
-            return str(self.token)
+            return str(self.token or "")
+        hint = (
+            "The challenge did not clear by itself. Open a headed browser "
+            "(``headless=False``) and solve it there, raise ``timeout``, or "
+            "set ``interactive=True`` so the wait can be extended."
+            if self.backend == ChallengeWaitSolver.backend
+            else "Check the solver backend, its dependencies (FFmpeg for the "
+            "audio backend, CAPSOLVER_API_KEY for the image backend) and that "
+            "the page really hosts a reCAPTCHA widget."
+        )
         raise CaptchaSolveError(
-            f"reCAPTCHA was not solved ({self.describe()}). "
-            "Check the solver backend, its dependencies (FFmpeg for the audio "
-            "backend, CAPSOLVER_API_KEY for the image backend) and that the "
-            "page really hosts a reCAPTCHA widget."
+            f"the challenge was not solved ({self.describe()}). {hint}"
         )
 
 
@@ -205,12 +262,12 @@ class CaptchaSolver(Protocol):
 
 @dataclass
 class RecaptchaToolkitSolver:
-    """Solve reCAPTCHA on an ``arena_api.auth`` page via :mod:`recaptcha_toolkit`.
+    """Solve reCAPTCHA on an ``arena_api.auth`` page via the vendored toolkit.
 
     Parameters
     ----------
     backend:
-        :class:`~recaptcha_toolkit.SolverBackend` (or its string value):
+        :class:`~arena_api._vendor.recaptcha_toolkit.SolverBackend` (or its value):
         ``"audio"`` (Google Speech, needs FFmpeg), ``"image"`` (CapSolver, needs
         ``CAPSOLVER_API_KEY``) or ``"vision_ai"`` (local YOLO, own browser).
     version:
@@ -218,13 +275,13 @@ class RecaptchaToolkitSolver:
         and picks one -- a visible checkbox is v2, an invisible widget is
         handled by the v3 token interception.
     solver:
-        :class:`~recaptcha_toolkit.PlaywrightSolverOptions` (attempts, timeouts,
+        :class:`~arena_api._vendor.recaptcha_toolkit.PlaywrightSolverOptions` (attempts,
         CapSolver key).
     vision_ai:
-        :class:`~recaptcha_toolkit.VisionAIOptions` for the YOLO backend. Give
+        :class:`~arena_api._vendor.recaptcha_toolkit.VisionAIOptions` for the YOLO backend. Give
         concurrent solvers distinct ``server_port``/``download_dir`` values.
     stealth:
-        :class:`~recaptcha_toolkit.StealthOptions` applied to the page before
+        :class:`~arena_api._vendor.recaptcha_toolkit.StealthOptions` applied to the page before
         solving. ``None`` uses the toolkit defaults.
     apply_stealth:
         Set to ``False`` to solve without masking ``navigator.webdriver`` and
@@ -278,7 +335,7 @@ class RecaptchaToolkitSolver:
         """Human-readable backend label for logs."""
         version = "auto" if self.version is None else str(getattr(self.version, "value", self.version))
         stealth = "stealth" if self.apply_stealth else "no-stealth"
-        return f"recaptcha_toolkit[{self.backend}/{version}/{stealth}]"
+        return f"recaptcha-toolkit[{self.backend}/{version}/{stealth}]"
 
     # ------------------------------------------------------------------ #
     # Async path
@@ -298,6 +355,9 @@ class RecaptchaToolkitSolver:
         started = time.perf_counter()
         version = await detect_recaptcha_version(page, toolkit=toolkit, override=self.version)
         stealth_applied = False
+        # Only VisionAI learns the site key; the Playwright backends do not.
+        token: str
+        site_key: str | None
         try:
             stealth_applied = await self._apply_stealth_async(page, toolkit, backend)
             if backend is toolkit.SolverBackend.VISION_AI:
@@ -330,7 +390,7 @@ class RecaptchaToolkitSolver:
             # patching this page would change nothing; its user agent is
             # forwarded from the stealth options instead.
             return False
-        from recaptcha_toolkit.stealth import apply_stealth_async
+        from .._vendor.recaptcha_toolkit.stealth import apply_stealth_async
 
         await apply_stealth_async(page, self.stealth)
         return True
@@ -395,6 +455,9 @@ class RecaptchaToolkitSolver:
         started = time.perf_counter()
         version = detect_recaptcha_version_sync(page, toolkit=toolkit, override=self.version)
         stealth_applied = False
+        # Only VisionAI learns the site key; the Playwright backends do not.
+        token: str
+        site_key: str | None
         try:
             stealth_applied = self._apply_stealth_sync(page, toolkit, backend)
             if backend is toolkit.SolverBackend.VISION_AI:
@@ -423,7 +486,7 @@ class RecaptchaToolkitSolver:
     def _apply_stealth_sync(self, page: Any, toolkit: Any, backend: Any) -> bool:
         if not self.apply_stealth or backend is toolkit.SolverBackend.VISION_AI:
             return False
-        from recaptcha_toolkit.stealth import apply_stealth_sync
+        from .._vendor.recaptcha_toolkit.stealth import apply_stealth_sync
 
         apply_stealth_sync(page, self.stealth)
         return True
@@ -466,6 +529,404 @@ class RecaptchaToolkitSolver:
 
 
 # --------------------------------------------------------------------------- #
+# Challenges that have no token to produce
+# --------------------------------------------------------------------------- #
+
+
+#: Kinds :class:`ChallengeWaitSolver` acts on: everything a reCAPTCHA token
+#: cannot fix. Turnstile and a managed Cloudflare interstitial usually pass on
+#: their own once a real browser sits on them for a few seconds; hCaptcha and
+#: DataDome need a person, which a headed browser provides. ``RATE_LIMIT`` is
+#: deliberately absent -- waiting on a 429 is a retry policy, not a solve.
+WAITABLE_CHALLENGE_KINDS: tuple[ChallengeKind, ...] = (
+    ChallengeKind.TURNSTILE,
+    ChallengeKind.CLOUDFLARE_MANAGED,
+    ChallengeKind.HCAPTCHA,
+    ChallengeKind.DATADOME,
+    ChallengeKind.INTERSTITIAL,
+    ChallengeKind.UNKNOWN,
+)
+
+#: Announced before an interactive wait, so a headed run is not a silent stall.
+CHALLENGE_WAIT_PROMPT = (
+    "[arena-api] {kind} challenge at {url}: solve it in the browser window; "
+    "waiting up to {timeout:g}s, checking every {poll:g}s"
+)
+
+#: Offered when an interactive wait runs out of time.
+CHALLENGE_WAIT_MORE = (
+    "[arena-api] the {kind} challenge is still up after {timeout:g}s. Finish it "
+    "in the browser, then press Enter to keep waiting (Ctrl-C to give up)..."
+)
+
+#: Printed when that offer is declined.
+CHALLENGE_WAIT_CANCELLED = "[arena-api] challenge wait cancelled"
+
+
+@dataclass
+class ChallengeWaitSolver:
+    """Clear a challenge by waiting for it instead of producing a token.
+
+    Half of the classified challenge kinds have no token this library could
+    forge, and that is fine: a Cloudflare managed interstitial or a Turnstile
+    widget typically passes by itself in a real browser within seconds, and an
+    hCaptcha or DataDome box is something a *person* clears in a headed window.
+    Both reduce to the same mechanism -- re-scan the page until it stops looking
+    like a challenge -- so this solver implements it once:
+
+    * headless: wait up to :attr:`timeout`, polling every :attr:`poll` seconds;
+    * ``interactive=True``: announce what is on screen, wait, and when the time
+      runs out offer another window in exchange for an Enter press (up to
+      :attr:`rounds` windows). The prompt runs in a worker thread, so the event
+      loop -- and therefore Playwright -- keeps running while you click.
+
+    The result is a :class:`CaptchaAttempt` with ``cleared=True`` and no token:
+    :class:`~arena_api.auth.challenge.ChallengeHandler` decides success from its
+    own re-scan, so nothing downstream needs to know that no token existed.
+
+    :ivar timeout: seconds to wait per round before giving up.
+    :ivar poll: seconds between re-scans. Kept at 1s: a re-scan evaluates
+        JavaScript on the page, so polling faster buys little.
+    :ivar interactive: tell a human what to do and let them extend the wait.
+    :ivar rounds: how many wait windows an interactive run may use.
+    :ivar solve_kinds: kinds accepted; defaults to
+        :data:`WAITABLE_CHALLENGE_KINDS`.
+    :ivar prompt: called with the "keep waiting?" text (``input`` by default).
+    :ivar output: stream for the announcements (``sys.stderr`` by default).
+    :ivar recheck: custom ``page -> ChallengeObservation`` callable, sync or
+        async. Tests use it; the default re-scans with
+        :func:`~arena_api.auth.challenge.inspect_page` (no screenshot -- the
+        handler captures its own diagnostics).
+    """
+
+    timeout: float = 30.0
+    poll: float = 1.0
+    interactive: bool = False
+    rounds: int = 2
+    solve_kinds: tuple[ChallengeKind, ...] = WAITABLE_CHALLENGE_KINDS
+    prompt: Callable[[str], Any] = input
+    output: IO[str] | None = None
+    recheck: Callable[[Any], Any] | None = None
+
+    #: Label used in :attr:`CaptchaAttempt.backend`.
+    backend: ClassVar[str] = "wait"
+
+    def __post_init__(self) -> None:
+        if not self.solve_kinds:
+            raise ValueError("solve_kinds must contain at least one ChallengeKind")
+        unknown = [kind for kind in self.solve_kinds if not isinstance(kind, ChallengeKind)]
+        if unknown:
+            raise TypeError(f"solve_kinds must be ChallengeKind members, got {unknown!r}")
+        if ChallengeKind.NONE in self.solve_kinds:
+            raise ValueError("ChallengeKind.NONE is never a challenge; drop it from solve_kinds")
+        if self.timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if self.poll <= 0:
+            raise ValueError("poll must be positive")
+        if self.rounds < 1:
+            raise ValueError("rounds must be at least 1")
+
+    # ------------------------------------------------------------------ #
+    # Capability
+    # ------------------------------------------------------------------ #
+
+    def supports(self, observation: ChallengeObservation) -> bool:
+        """Whether this solver will wait out ``observation``."""
+        return observation.is_challenge and observation.kind in self.solve_kinds
+
+    def describe(self) -> str:
+        """Human-readable label for logs."""
+        mode = "/interactive" if self.interactive else ""
+        return (
+            f"wait[{len(self.solve_kinds)} kinds/{self.timeout:g}s"
+            f"/{self.poll:g}s poll{mode}]"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Async path
+    # ------------------------------------------------------------------ #
+
+    async def asolve(
+        self, page: Any, observation: ChallengeObservation | None = None
+    ) -> CaptchaAttempt:
+        """Wait for the challenge on ``page`` to clear.
+
+        :param page: an open Playwright page (``playwright.async_api``).
+        :param observation: the challenge to wait out; ``None`` scans the page.
+        :returns: an attempt with ``cleared=True`` on success, otherwise one
+            carrying the reason in :attr:`CaptchaAttempt.error`.
+        """
+        started = time.monotonic()
+        current = observation if observation is not None else await self._ascan(page)
+        if not current.is_challenge:
+            return self._attempt(current, started=started, checks=0, cleared=True)
+        if self.interactive:
+            self._announce(current)
+
+        rounds = max(1, int(self.rounds))
+        checks = 0
+        for index in range(1, rounds + 1):
+            cleared, used = await self._await_clearance(page)
+            checks += used
+            if cleared:
+                return self._attempt(current, started=started, checks=checks, cleared=True)
+            if not self.interactive or index >= rounds:
+                break
+            if not await self._offer_more_async(current):
+                break
+        return self._attempt(current, started=started, checks=checks, cleared=False)
+
+    async def _await_clearance(self, page: Any) -> tuple[bool, int]:
+        """Poll until the page stops looking like a challenge, or time runs out."""
+        deadline = time.monotonic() + self.timeout
+        checks = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, checks
+            await asyncio.sleep(min(self.poll, remaining))
+            checks += 1
+            observation = await self._ascan(page)
+            if not observation.is_challenge:
+                return True, checks
+
+    async def _ascan(self, page: Any) -> ChallengeObservation:
+        if self.recheck is not None:
+            outcome = self.recheck(page)
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+            return outcome
+        return await inspect_page(page, screenshot=False)
+
+    async def _offer_more_async(self, observation: ChallengeObservation) -> bool:
+        """Ask for another window; ``False`` ends the wait.
+
+        The prompt runs in a worker thread: blocking the event loop here would
+        also block Playwright, and the page could not finish clearing.
+        """
+        try:
+            await asyncio.to_thread(self.prompt, self._more_message(observation))
+        except (EOFError, KeyboardInterrupt):
+            self._note(CHALLENGE_WAIT_CANCELLED)
+            return False
+        return True
+
+    # ------------------------------------------------------------------ #
+    # Sync path
+    # ------------------------------------------------------------------ #
+
+    def solve(
+        self, page: Any, observation: ChallengeObservation | None = None
+    ) -> CaptchaAttempt:
+        """Synchronous twin of :meth:`asolve` for ``playwright.sync_api`` pages."""
+        started = time.monotonic()
+        current = observation if observation is not None else self._scan_sync(page)
+        if not current.is_challenge:
+            return self._attempt(current, started=started, checks=0, cleared=True)
+        if self.interactive:
+            self._announce(current)
+
+        rounds = max(1, int(self.rounds))
+        checks = 0
+        for index in range(1, rounds + 1):
+            cleared, used = self._wait_sync(page)
+            checks += used
+            if cleared:
+                return self._attempt(current, started=started, checks=checks, cleared=True)
+            if not self.interactive or index >= rounds:
+                break
+            if not self._offer_more_sync(current):
+                break
+        return self._attempt(current, started=started, checks=checks, cleared=False)
+
+    def _wait_sync(self, page: Any) -> tuple[bool, int]:
+        deadline = time.monotonic() + self.timeout
+        checks = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, checks
+            time.sleep(min(self.poll, remaining))
+            checks += 1
+            if not self._scan_sync(page).is_challenge:
+                return True, checks
+
+    def _scan_sync(self, page: Any) -> ChallengeObservation:
+        if self.recheck is not None:
+            outcome = self.recheck(page)
+            if inspect.isawaitable(outcome):
+                raise CaptchaSolveError(
+                    "ChallengeWaitSolver.solve() cannot await an async recheck; "
+                    "pass a synchronous callable or use asolve()"
+                )
+            return outcome
+        return inspect_page_sync(page, screenshot=False)
+
+    def _offer_more_sync(self, observation: ChallengeObservation) -> bool:
+        try:
+            self.prompt(self._more_message(observation))
+        except (EOFError, KeyboardInterrupt):
+            self._note(CHALLENGE_WAIT_CANCELLED)
+            return False
+        return True
+
+    # ------------------------------------------------------------------ #
+    # Reporting
+    # ------------------------------------------------------------------ #
+
+    def _attempt(
+        self,
+        observation: ChallengeObservation,
+        *,
+        started: float,
+        checks: int,
+        cleared: bool,
+    ) -> CaptchaAttempt:
+        duration = time.monotonic() - started
+        error = (
+            None
+            if cleared
+            else (
+                f"{observation.kind.value} challenge still present after "
+                f"{duration:.1f}s and {checks} check(s)"
+            )
+        )
+        return CaptchaAttempt(
+            backend=self.backend,
+            version=observation.kind.value,
+            attempts=max(checks, 1),
+            duration=duration,
+            error=error,
+            cleared=cleared,
+            observation=observation,
+        )
+
+    def _announce(self, observation: ChallengeObservation) -> None:
+        self._note(
+            CHALLENGE_WAIT_PROMPT.format(
+                kind=observation.kind.value,
+                url=observation.url,
+                timeout=self.timeout,
+                poll=self.poll,
+            )
+        )
+
+    def _more_message(self, observation: ChallengeObservation) -> str:
+        return CHALLENGE_WAIT_MORE.format(
+            kind=observation.kind.value, timeout=self.timeout
+        )
+
+    def _note(self, message: str) -> None:
+        stream = self.output if self.output is not None else sys.stderr
+        print(message, file=stream, flush=True)
+
+
+def _solver_supports(solver: Any, observation: ChallengeObservation) -> bool:
+    """``solver.supports(observation)``, with the token-kind default as a fallback."""
+    supports = getattr(solver, "supports", None)
+    if callable(supports):
+        return bool(supports(observation))
+    return observation.kind in SOLVABLE_CHALLENGE_KINDS
+
+
+def solver_for(
+    solvers: Sequence[Any], observation: ChallengeObservation
+) -> Any | None:
+    """The first solver that accepts ``observation``, or ``None``."""
+    for solver in solvers:
+        if _solver_supports(solver, observation):
+            return solver
+    return None
+
+
+def describe_solver(solver: Any) -> str:
+    """``solver.describe()`` when it has one, else its class name.
+
+    Solvers are duck-typed (:class:`CaptchaSolver`), so reporting must not
+    assume a ``describe`` method exists.
+    """
+    describe = getattr(solver, "describe", None)
+    return str(describe()) if callable(describe) else type(solver).__name__
+
+
+class CompositeSolver:
+    """Route each challenge kind to whichever solver can actually handle it.
+
+    ``CompositeSolver(RecaptchaToolkitSolver(), ChallengeWaitSolver())`` covers
+    the whole classified surface: reCAPTCHA gets a token from the vendored
+    toolkit, and Turnstile, a managed Cloudflare interstitial, hCaptcha,
+    DataDome and anything unrecognised get waited out (or handed to a person in
+    a headed browser). Order matters -- the first solver whose
+    :meth:`~CaptchaSolver.supports` accepts the observation wins -- so put the
+    more specific one first.
+
+    A composite is itself a :class:`CaptchaSolver`, so it can be handed to
+    :meth:`~arena_api.auth.browser.BrowserEnvironmentOptions.with_captcha_solving`,
+    to :class:`~arena_api.auth.challenge.ChallengeHandler`, or to
+    :data:`~arena_api.auto.AutoOptions` as ``captcha_solver=``.
+    """
+
+    #: Label used in :attr:`CaptchaAttempt.backend` when nobody accepts.
+    backend: ClassVar[str] = "composite"
+
+    def __init__(self, *solvers: Any) -> None:
+        if not solvers:
+            raise ValueError("CompositeSolver needs at least one solver")
+        self.solvers: tuple[Any, ...] = tuple(solvers)
+
+    def supports(self, observation: ChallengeObservation) -> bool:
+        """Whether any member solver accepts ``observation``."""
+        return self.select(observation) is not None
+
+    def select(self, observation: ChallengeObservation) -> Any | None:
+        """The member that will handle ``observation`` (public for reporting)."""
+        return solver_for(self.solvers, observation)
+
+    async def asolve(
+        self, page: Any, observation: ChallengeObservation | None = None
+    ) -> CaptchaAttempt:
+        """Hand the page to the first solver that accepts it."""
+        current = (
+            observation
+            if observation is not None
+            else await inspect_page(page, screenshot=False)
+        )
+        solver = self.select(current)
+        if solver is None:
+            return self._unsupported(current)
+        return await solver.asolve(page, current)
+
+    def solve(
+        self, page: Any, observation: ChallengeObservation | None = None
+    ) -> CaptchaAttempt:
+        """Synchronous twin of :meth:`asolve` for ``playwright.sync_api`` pages."""
+        current = (
+            observation
+            if observation is not None
+            else inspect_page_sync(page, screenshot=False)
+        )
+        solver = self.select(current)
+        if solver is None:
+            return self._unsupported(current)
+        return solver.solve(page, current)
+
+    def describe(self) -> str:
+        """Every member's label, in dispatch order."""
+        return "composite[" + ", ".join(describe_solver(item) for item in self.solvers) + "]"
+
+    def _unsupported(self, observation: ChallengeObservation) -> CaptchaAttempt:
+        return CaptchaAttempt(
+            backend=self.backend,
+            version=observation.kind.value,
+            error=(
+                f"no solver accepts a {observation.kind.value} challenge "
+                f"({self.describe()})"
+            ),
+            observation=observation,
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Version detection
 # --------------------------------------------------------------------------- #
 
@@ -484,7 +945,7 @@ async def detect_recaptcha_version(page: Any, *, toolkit: Any = None, override: 
 
     The heuristic is intentionally conservative: anything it cannot classify is
     treated as v2, because the v2 solver waits for a visible widget and reports
-    a clear :class:`~recaptcha_toolkit.RecaptchaNotFoundError` instead of
+    a clear :class:`~arena_api._vendor.recaptcha_toolkit.RecaptchaNotFoundError` instead of
     silently intercepting nothing.
     """
     toolkit = toolkit or _toolkit()

@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from recaptcha_toolkit import (
+from arena_api._vendor.recaptcha_toolkit import (
     AsyncPlaywrightBot,
     BrowserOptions,
     CaptchaError,

@@ -157,7 +157,7 @@ def test_to_curl_cffi_groups_by_domain(tmp_path) -> None:
 
 
 def test_to_curl_cffi_session_carries_cookies_and_headers(tmp_path) -> None:
-    curl_cffi = pytest.importorskip("curl_cffi")
+    pytest.importorskip("curl_cffi")
     manager = make_manager(storage_path=tmp_path / "s.json")
     manager.import_cookies({"session": "abc"})
     session = manager.to_curl_cffi_session()

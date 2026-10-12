@@ -1,4 +1,4 @@
-"""Tests for the opt-in reCAPTCHA bridge (arena_api.auth <-> recaptcha_toolkit).
+"""Tests for the opt-in reCAPTCHA bridge (arena_api.auth <-> the vendored toolkit).
 
 Everything here runs offline: the toolkit's solver backends are stubbed at the
 seam the bridge uses (its bot factory, the stealth applier, the site-key
@@ -9,24 +9,31 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import io
 import json
+import time
 from pathlib import Path
 
 import pytest
 
-import recaptcha_toolkit
+from arena_api._vendor import recaptcha_toolkit
 from arena_api.auth.browser import (
     SYNTHETIC_MONITOR_HEADER,
     BrowserEnvironment,
     BrowserEnvironmentOptions,
 )
 from arena_api.auth.captcha import (
+    WAITABLE_CHALLENGE_KINDS,
     CaptchaAttempt,
     CaptchaSolver,
+    ChallengeWaitSolver,
+    CompositeSolver,
     RecaptchaToolkitSolver,
+    describe_solver,
     detect_recaptcha_version,
     detect_recaptcha_version_sync,
     observation_targets_recaptcha,
+    solver_for,
 )
 from arena_api.auth.challenge import (
     SOLVABLE_CHALLENGE_KINDS,
@@ -272,21 +279,71 @@ class FakeBot:
 class SyncFakePage:
     """Sync twin of :class:`FakePage` for the blocking solver path."""
 
-    def __init__(self, version: str = "v2", url: str = "https://example.test/login") -> None:
+    def __init__(
+        self,
+        version: str = "v2",
+        url: str = "https://example.test/login",
+        scan: dict | None = None,
+    ) -> None:
         self.version = version
         self.url = url
         self.context = None
+        self.scan = dict(scan if scan is not None else RECAPTCHA_SCAN)
+        self.frames = [FakeFrame(item) for item in self.scan.get("frames", [])]
         self.evaluations: list[str] = []
+        self.screenshots: list[str] = []
 
     def evaluate(self, script: str, arg=None):
         if "data-size" in script or "getBoundingClientRect" in script:
             return self.version
         self.evaluations.append(script)
-        return dict(RECAPTCHA_SCAN)
+        return dict(self.scan)
+
+    def clear_challenge(self) -> None:
+        self.scan = dict(CLEAN_SCAN)
+        self.frames = []
+
+    def content(self) -> str:
+        return "<html><body>app</body></html>"
+
+    def screenshot(self, path: str | None = None, **kwargs) -> None:
+        self.screenshots.append(str(path))
+
+
+class ClearingPage(FakePage):
+    """A Turnstile page that passes on its own after ``clear_after`` scans."""
+
+    def __init__(self, clear_after: int = 2, **kwargs) -> None:
+        super().__init__(scan=dict(TURNSTILE_SCAN), **kwargs)
+        self.clear_after = clear_after
+        self.scans = 0
+
+    async def evaluate(self, script: str, arg=None):
+        if "data-size" not in script and "getBoundingClientRect" not in script:
+            self.scans += 1
+            if self.scans > self.clear_after:
+                self.clear_challenge()
+        return await super().evaluate(script, arg)
+
+
+class ScriptedRecheck:
+    """Stands in for ``recheck=``: scripted observations, one per call."""
+
+    def __init__(self, *observations: ChallengeObservation) -> None:
+        self.observations = list(observations)
+        self.calls = 0
+
+    def __call__(self, page) -> ChallengeObservation:
+        index = min(self.calls, len(self.observations) - 1)
+        self.calls += 1
+        return self.observations[index]
+
+
+CLEAN = ChallengeObservation(url="https://example.test/login", kind=ChallengeKind.NONE, signals=())
 
 
 class FakeVisionSolver:
-    """Stands in for ``recaptcha_toolkit.VisionAISolver``."""
+    """Stands in for the vendored ``VisionAISolver``."""
 
     last: "FakeVisionSolver | None" = None
 
@@ -397,9 +454,9 @@ def test_solver_protocol_is_satisfied() -> None:
 
 
 def test_describe_reports_backend_and_posture() -> None:
-    assert RecaptchaToolkitSolver().describe() == "recaptcha_toolkit[audio/auto/stealth]"
+    assert RecaptchaToolkitSolver().describe() == "recaptcha-toolkit[audio/auto/stealth]"
     stealthless = RecaptchaToolkitSolver(backend="vision_ai", apply_stealth=False)
-    assert stealthless.describe() == "recaptcha_toolkit[vision_ai/auto/no-stealth]"
+    assert stealthless.describe() == "recaptcha-toolkit[vision_ai/auto/no-stealth]"
 
 
 # --------------------------------------------------------------------------- #
@@ -1202,10 +1259,513 @@ def test_stealth_appliers_take_a_page_and_options() -> None:
 
 def test_recaptcha_solver_signatures_accept_an_external_page() -> None:
     """The facade trick relies on ``page`` being the first positional arg."""
-    from recaptcha_toolkit import AsyncPlaywrightBot, PlaywrightBot
+    from arena_api._vendor.recaptcha_toolkit import AsyncPlaywrightBot, PlaywrightBot
 
     for bot_class in (AsyncPlaywrightBot, PlaywrightBot):
         for name in ("solve_recaptcha_v2", "solve_recaptcha_v3"):
             parameters = inspect.signature(getattr(bot_class, name)).parameters
             assert list(parameters)[1] == "page", f"{bot_class.__name__}.{name}"
 
+
+
+# --------------------------------------------------------------------------- #
+# Waiting out the challenges a token cannot fix
+# --------------------------------------------------------------------------- #
+
+
+def test_waitable_kinds_are_the_ones_without_a_token() -> None:
+    assert WAITABLE_CHALLENGE_KINDS == (
+        ChallengeKind.TURNSTILE,
+        ChallengeKind.CLOUDFLARE_MANAGED,
+        ChallengeKind.HCAPTCHA,
+        ChallengeKind.DATADOME,
+        ChallengeKind.INTERSTITIAL,
+        ChallengeKind.UNKNOWN,
+    )
+    assert not set(WAITABLE_CHALLENGE_KINDS) & set(SOLVABLE_CHALLENGE_KINDS)
+    assert ChallengeKind.RATE_LIMIT not in WAITABLE_CHALLENGE_KINDS
+
+
+def test_wait_solver_accepts_only_what_it_can_help() -> None:
+    solver = ChallengeWaitSolver()
+    assert solver.supports(turnstile_observation()) is True
+    assert solver.supports(recaptcha_observation()) is False
+    assert solver.supports(CLEAN) is False
+    assert isinstance(solver, CaptchaSolver)
+
+
+def test_wait_solver_describes_its_posture() -> None:
+    assert ChallengeWaitSolver(timeout=12.5).describe() == "wait[6 kinds/12.5s/1s poll]"
+    assert "/interactive" in ChallengeWaitSolver(interactive=True).describe()
+
+
+def test_wait_solver_validates_its_configuration() -> None:
+    with pytest.raises(ValueError):
+        ChallengeWaitSolver(solve_kinds=())
+    with pytest.raises(TypeError):
+        ChallengeWaitSolver(solve_kinds=("turnstile",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ChallengeWaitSolver(solve_kinds=(ChallengeKind.NONE,))
+    with pytest.raises(ValueError):
+        ChallengeWaitSolver(timeout=0)
+    with pytest.raises(ValueError):
+        ChallengeWaitSolver(poll=-1)
+    with pytest.raises(ValueError):
+        ChallengeWaitSolver(rounds=0)
+
+
+def test_wait_solver_polls_until_the_challenge_clears() -> None:
+    recheck = ScriptedRecheck(turnstile_observation(), CLEAN)
+    solver = ChallengeWaitSolver(timeout=1.0, poll=0.01, recheck=recheck)
+
+    attempt = asyncio.run(solver.asolve(FakePage(), turnstile_observation()))
+
+    assert attempt.cleared is True
+    assert attempt.ok is True
+    assert attempt.token is None
+    assert attempt.backend == "wait"
+    assert attempt.version == "turnstile"
+    assert attempt.attempts == 2
+    assert attempt.error is None
+    assert attempt.duration > 0
+    assert "cleared after 2 check(s)" in attempt.describe()
+    assert recheck.calls == 2
+
+
+def test_wait_solver_reports_a_timeout_instead_of_raising() -> None:
+    solver = ChallengeWaitSolver(timeout=0.03, poll=0.01, recheck=ScriptedRecheck(turnstile_observation()))
+
+    attempt = asyncio.run(solver.asolve(FakePage(), turnstile_observation()))
+
+    assert attempt.cleared is False
+    assert attempt.ok is False
+    assert "still present" in (attempt.error or "")
+    assert "failed" in attempt.describe()
+    with pytest.raises(CaptchaSolveError) as info:
+        attempt.raise_for_status()
+    # the hint must point at the real remedy for a waited-out challenge
+    assert "headed browser" in str(info.value)
+
+
+def test_a_token_backend_keeps_its_own_hint() -> None:
+    attempt = CaptchaAttempt(backend="audio", version="v2", error="RecaptchaTimeoutError")
+    with pytest.raises(CaptchaSolveError) as info:
+        attempt.raise_for_status()
+    assert "FFmpeg" in str(info.value)
+
+
+def test_a_cleared_attempt_has_no_token_but_is_successful() -> None:
+    attempt = CaptchaAttempt(backend="wait", version="hcaptcha", cleared=True, attempts=3)
+    assert attempt.ok is True
+    assert attempt.raise_for_status() == ""
+    assert attempt.describe().startswith("wait/hcaptcha")
+
+
+def test_wait_solver_returns_at_once_on_a_clean_page() -> None:
+    recheck = ScriptedRecheck(CLEAN)
+    solver = ChallengeWaitSolver(timeout=1.0, poll=0.01, recheck=recheck)
+
+    attempt = asyncio.run(solver.asolve(FakePage(), CLEAN))
+
+    assert attempt.cleared is True
+    assert attempt.attempts == 1
+    assert recheck.calls == 0
+
+
+def test_wait_solver_uses_the_real_page_inspector_by_default() -> None:
+    """No injected ``recheck``: the wait must re-scan the live DOM."""
+    page = ClearingPage(clear_after=2)
+    solver = ChallengeWaitSolver(timeout=2.0, poll=0.01)
+
+    attempt = asyncio.run(solver.asolve(page))
+
+    assert attempt.cleared is True
+    assert attempt.version == "turnstile"
+    assert page.scans == 3  # one before the loop, two polls
+    assert page.evaluations  # inspect_page really evaluated the scan script
+
+
+def test_wait_solver_never_screenshots_while_polling() -> None:
+    """Diagnostics belong to the handler; polling must stay cheap."""
+    page = ClearingPage(clear_after=1)
+    asyncio.run(ChallengeWaitSolver(timeout=2.0, poll=0.01).asolve(page))
+    assert page.screenshots == []
+
+
+def test_an_interactive_wait_announces_itself() -> None:
+    output = io.StringIO()
+    solver = ChallengeWaitSolver(
+        timeout=0.03,
+        poll=0.01,
+        interactive=True,
+        rounds=1,
+        output=output,
+        recheck=ScriptedRecheck(turnstile_observation()),
+    )
+
+    asyncio.run(solver.asolve(FakePage(), turnstile_observation()))
+
+    note = output.getvalue()
+    assert "turnstile challenge at https://example.test/login" in note
+    assert "solve it in the browser window" in note
+
+
+def test_an_interactive_wait_offers_another_window() -> None:
+    prompts: list[str] = []
+    solver = ChallengeWaitSolver(
+        timeout=0.03,
+        poll=0.01,
+        interactive=True,
+        rounds=3,
+        prompt=prompts.append,
+        output=io.StringIO(),
+        recheck=ScriptedRecheck(turnstile_observation()),
+    )
+
+    attempt = asyncio.run(solver.asolve(FakePage(), turnstile_observation()))
+
+    assert len(prompts) == 2  # after round 1 and round 2, never after the last
+    assert "still up after" in prompts[0]
+    assert attempt.cleared is False
+    assert attempt.attempts >= 3
+
+
+def test_a_declined_extension_ends_the_wait() -> None:
+    prompts: list[str] = []
+    output = io.StringIO()
+
+    def cancel(message: str) -> None:
+        prompts.append(message)
+        raise KeyboardInterrupt
+
+    solver = ChallengeWaitSolver(
+        timeout=0.03,
+        poll=0.01,
+        interactive=True,
+        rounds=3,
+        prompt=cancel,
+        output=output,
+        recheck=ScriptedRecheck(turnstile_observation()),
+    )
+
+    attempt = asyncio.run(solver.asolve(FakePage(), turnstile_observation()))
+
+    assert len(prompts) == 1
+    assert "cancelled" in output.getvalue()
+    assert attempt.cleared is False
+
+
+def test_the_prompt_does_not_block_the_event_loop() -> None:
+    """Playwright runs on this loop: a blocking ``input()`` would freeze the
+    very page that is supposed to clear."""
+
+    async def scenario() -> tuple[int, CaptchaAttempt]:
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        task = asyncio.create_task(ticker())
+        solver = ChallengeWaitSolver(
+            timeout=0.02,
+            poll=0.01,
+            interactive=True,
+            rounds=2,
+            prompt=lambda message: time.sleep(0.1),
+            output=io.StringIO(),
+            recheck=ScriptedRecheck(turnstile_observation()),
+        )
+        attempt = await solver.asolve(FakePage(), turnstile_observation())
+        task.cancel()
+        return ticks, attempt
+
+    ticks, attempt = asyncio.run(scenario())
+
+    assert ticks > 0, "the wait blocked the event loop"
+    assert attempt.cleared is False
+
+
+def test_the_sync_twin_waits_too() -> None:
+    class ClearingSyncPage(SyncFakePage):
+        """A sync Turnstile page that passes on its own after two scans."""
+
+        def __init__(self) -> None:
+            super().__init__(scan=dict(TURNSTILE_SCAN))
+            self.scans = 0
+
+        def evaluate(self, script: str, arg=None):
+            self.scans += 1
+            if self.scans > 2:
+                self.clear_challenge()
+            return super().evaluate(script, arg)
+
+    page = ClearingSyncPage()
+    attempt = ChallengeWaitSolver(timeout=2.0, poll=0.01).solve(page)
+
+    assert attempt.cleared is True
+    assert attempt.backend == "wait"
+    assert page.scans == 3
+
+
+def test_the_sync_twin_refuses_an_async_recheck() -> None:
+    class Awaitable:
+        def __await__(self):
+            return iter(())
+
+    solver = ChallengeWaitSolver(timeout=0.02, poll=0.01, recheck=lambda page: Awaitable())
+
+    with pytest.raises(CaptchaSolveError) as info:
+        solver.solve(SyncFakePage(scan=dict(TURNSTILE_SCAN)))
+    assert "asolve()" in str(info.value)
+
+
+def test_the_sync_twin_reports_a_timeout() -> None:
+    solver = ChallengeWaitSolver(
+        timeout=0.03, poll=0.01, recheck=ScriptedRecheck(turnstile_observation())
+    )
+
+    attempt = solver.solve(SyncFakePage(scan=dict(TURNSTILE_SCAN)), turnstile_observation())
+
+    assert attempt.cleared is False
+    assert "still present" in (attempt.error or "")
+
+
+# --------------------------------------------------------------------------- #
+# Dispatching between solvers
+# --------------------------------------------------------------------------- #
+
+
+def test_composite_routes_each_kind_to_the_solver_that_can_help() -> None:
+    toolkit = FakeSolver(kinds=(ChallengeKind.RECAPTCHA,), token="recaptcha-token")
+    wait = FakeSolver(kinds=WAITABLE_CHALLENGE_KINDS, token="")
+    composite = CompositeSolver(toolkit, wait)
+
+    assert composite.supports(recaptcha_observation()) is True
+    assert composite.select(recaptcha_observation()) is toolkit
+    assert composite.select(turnstile_observation()) is wait
+    assert composite.supports(CLEAN) is False
+    assert isinstance(composite, CaptchaSolver)
+
+
+def test_composite_order_decides_the_winner() -> None:
+    first = FakeSolver(kinds=(ChallengeKind.TURNSTILE,), token="first")
+    second = FakeSolver(kinds=(ChallengeKind.TURNSTILE,), token="second")
+
+    attempt = asyncio.run(CompositeSolver(first, second).asolve(FakePage(), turnstile_observation()))
+
+    assert attempt.token == "first"
+    assert second.pages == []
+
+
+def test_composite_needs_at_least_one_solver() -> None:
+    with pytest.raises(ValueError):
+        CompositeSolver()
+
+
+def test_composite_reports_when_nobody_accepts_the_kind() -> None:
+    composite = CompositeSolver(FakeSolver(kinds=(ChallengeKind.RECAPTCHA,)))
+    rate_limited = ChallengeObservation(
+        url="https://example.test/config",
+        kind=ChallengeKind.RATE_LIMIT,
+        signals=(ChallengeSignal("status", "status 429", ChallengeKind.RATE_LIMIT),),
+    )
+
+    attempt = asyncio.run(composite.asolve(FakePage(), rate_limited))
+
+    assert attempt.ok is False
+    assert attempt.backend == "composite"
+    assert "no solver accepts a rate_limit challenge" in (attempt.error or "")
+
+
+def test_composite_scans_the_page_when_given_no_observation() -> None:
+    toolkit = FakeSolver(kinds=(ChallengeKind.RECAPTCHA,), token="recaptcha-token")
+    wait = FakeSolver(kinds=WAITABLE_CHALLENGE_KINDS, token="")
+    page = FakePage(scan=dict(TURNSTILE_SCAN))
+
+    attempt = asyncio.run(CompositeSolver(toolkit, wait).asolve(page))
+
+    assert attempt is wait.attempts[-1]
+    assert toolkit.pages == []
+    assert wait.pages == [page]
+
+
+def test_composite_describe_lists_members_in_dispatch_order() -> None:
+    composite = CompositeSolver(RecaptchaToolkitSolver(), ChallengeWaitSolver(timeout=5))
+    assert composite.describe() == (
+        "composite[recaptcha-toolkit[audio/auto/stealth], wait[6 kinds/5s/1s poll]]"
+    )
+
+
+def test_composite_sync_twin_dispatches_to_the_sync_solve() -> None:
+    toolkit = FakeSolver(kinds=(ChallengeKind.RECAPTCHA,), token="recaptcha-token")
+    page = SyncFakePage()
+
+    attempt = CompositeSolver(toolkit).solve(page, recaptcha_observation())
+
+    assert attempt.token == "recaptcha-token"
+    assert toolkit.pages == [page]
+
+
+def test_solver_for_falls_back_to_the_token_kinds() -> None:
+    """A solver without ``supports`` is treated as the classic token bridge."""
+
+    class Legacy:
+        async def asolve(self, page, observation=None):  # pragma: no cover - unused here
+            return CaptchaAttempt(token="legacy")
+
+    legacy = Legacy()
+    assert solver_for([legacy], recaptcha_observation()) is legacy
+    assert solver_for([legacy], turnstile_observation()) is None
+    assert solver_for([], recaptcha_observation()) is None
+
+
+def test_describe_solver_tolerates_a_solver_without_a_label() -> None:
+    class Bare:
+        pass
+
+    assert describe_solver(Bare()) == "Bare"
+    assert describe_solver(ChallengeWaitSolver(timeout=3)) == "wait[6 kinds/3s/1s poll]"
+
+
+# --------------------------------------------------------------------------- #
+# Handler integration
+# --------------------------------------------------------------------------- #
+
+
+def test_handler_waits_out_a_turnstile_without_a_token() -> None:
+    """The handler decides success from its own re-scan, so a tokenless solve
+    is indistinguishable from a solved one downstream."""
+    page = ClearingPage(clear_after=1)
+    handler = ChallengeHandler(
+        captcha_solver=ChallengeWaitSolver(timeout=2.0, poll=0.01),
+        solve_on_detection=True,
+        raise_on_detection=False,
+    )
+
+    observation = asyncio.run(handler.solve_page(page))
+
+    assert observation.is_challenge is False
+    assert handler.can_solve(turnstile_observation()) is True
+    attempt = handler.solve_attempts[-1]
+    assert attempt.backend == "wait"
+    assert attempt.cleared is True
+    assert attempt.token is None
+
+
+def test_handler_reports_a_challenge_that_never_clears() -> None:
+    handler = ChallengeHandler(
+        captcha_solver=ChallengeWaitSolver(
+            timeout=0.03, poll=0.01, recheck=ScriptedRecheck(turnstile_observation())
+        ),
+        solve_on_detection=True,
+        raise_on_detection=True,
+    )
+
+    with pytest.raises(ChallengeRequiredError) as info:
+        asyncio.run(handler.solve_page(FakePage(scan=dict(TURNSTILE_SCAN))))
+
+    assert "still present" in str(info.value)
+
+
+def test_a_composite_solver_can_be_installed_through_the_environment_options() -> None:
+    solver = CompositeSolver(RecaptchaToolkitSolver(), ChallengeWaitSolver())
+
+    options = BrowserEnvironmentOptions.with_captcha_solving(solver)
+
+    assert options.captcha_solver is solver
+    assert options.solve_challenges is True
+    assert options.identify_automation is False
+
+
+def test_an_async_recheck_is_awaited() -> None:
+    """``recheck=`` may be async: the wait runs inside an event loop anyway."""
+
+    class AsyncRecheck:
+        def __init__(self, *observations: ChallengeObservation) -> None:
+            self.observations = list(observations)
+            self.calls = 0
+
+        async def __call__(self, page) -> ChallengeObservation:
+            index = min(self.calls, len(self.observations) - 1)
+            self.calls += 1
+            return self.observations[index]
+
+    recheck = AsyncRecheck(turnstile_observation(), CLEAN)
+    solver = ChallengeWaitSolver(timeout=1.0, poll=0.01, recheck=recheck)
+
+    attempt = asyncio.run(solver.asolve(FakePage(), turnstile_observation()))
+
+    assert attempt.cleared is True
+    assert recheck.calls == 2
+
+
+def test_the_sync_twin_returns_at_once_on_a_clean_page() -> None:
+    recheck = ScriptedRecheck(CLEAN)
+    solver = ChallengeWaitSolver(timeout=1.0, poll=0.01, recheck=recheck)
+
+    attempt = solver.solve(SyncFakePage(), CLEAN)
+
+    assert attempt.cleared is True
+    assert attempt.attempts == 1
+    assert recheck.calls == 0
+
+
+def test_the_sync_twin_announces_and_extends_an_interactive_wait() -> None:
+    """A person can drive the sync API too: same announcement, same extension."""
+    output = io.StringIO()
+    prompts: list[str] = []
+    solver = ChallengeWaitSolver(
+        timeout=0.03,
+        poll=0.01,
+        interactive=True,
+        rounds=3,
+        prompt=prompts.append,
+        output=output,
+        recheck=ScriptedRecheck(turnstile_observation()),
+    )
+
+    attempt = solver.solve(SyncFakePage(scan=dict(TURNSTILE_SCAN)), turnstile_observation())
+
+    assert "turnstile challenge at" in output.getvalue()
+    assert "solve it in the browser window" in output.getvalue()
+    assert len(prompts) == 2  # after round 1 and 2, never after the last
+    assert attempt.cleared is False
+    assert attempt.attempts >= 3
+
+
+def test_the_sync_twin_ends_on_a_declined_extension() -> None:
+    output = io.StringIO()
+    prompts: list[str] = []
+
+    def cancel(message: str) -> None:
+        prompts.append(message)
+        raise EOFError
+
+    solver = ChallengeWaitSolver(
+        timeout=0.03,
+        poll=0.01,
+        interactive=True,
+        rounds=3,
+        prompt=cancel,
+        output=output,
+        recheck=ScriptedRecheck(turnstile_observation()),
+    )
+
+    attempt = solver.solve(SyncFakePage(scan=dict(TURNSTILE_SCAN)), turnstile_observation())
+
+    assert len(prompts) == 1
+    assert "cancelled" in output.getvalue()
+    assert attempt.cleared is False
+
+
+def test_composite_sync_solve_reports_an_unsupported_kind() -> None:
+    composite = CompositeSolver(FakeSolver(kinds=(ChallengeKind.RECAPTCHA,)))
+
+    attempt = composite.solve(SyncFakePage(scan=dict(TURNSTILE_SCAN)), turnstile_observation())
+
+    assert attempt.ok is False
+    assert attempt.backend == "composite"
+    assert "no solver accepts a turnstile challenge" in (attempt.error or "")

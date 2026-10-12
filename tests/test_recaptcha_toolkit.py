@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from recaptcha_toolkit import (
+from arena_api._vendor.recaptcha_toolkit import (
     BrowserOptions,
     CaptchaError,
     PlaywrightSolverOptions,
@@ -30,14 +30,14 @@ from recaptcha_toolkit import (
     StealthOptions,
     VisionAIOptions,
 )
-from recaptcha_toolkit.errors import (
+from arena_api._vendor.recaptcha_toolkit.errors import (
     require_dependency,
     translate_playwright_recaptcha_error,
     translate_selenium_error,
     translate_vision_ai_error,
 )
-from recaptcha_toolkit.playwright_bot import _run_key_detection, detect_site_key
-from recaptcha_toolkit.stealth import build_browser_launch_kwargs, build_context_kwargs
+from arena_api._vendor.recaptcha_toolkit.playwright_bot import _run_key_detection, detect_site_key
+from arena_api._vendor.recaptcha_toolkit.stealth import build_browser_launch_kwargs, build_context_kwargs
 
 
 # --------------------------------------------------------------------- конфиг
@@ -118,7 +118,7 @@ def test_launch_kwargs_parse_proxy_with_credentials() -> None:
 
 def test_launch_kwargs_drop_chromium_args_for_firefox() -> None:
     """Firefox не понимает Chromium-флаги — они должны отбрасываться."""
-    from recaptcha_toolkit.playwright_bot import _PlaywrightBotBase
+    from arena_api._vendor.recaptcha_toolkit.playwright_bot import _PlaywrightBotBase
 
     bot = _PlaywrightBotBase.__new__(_PlaywrightBotBase)
     bot._browser_opts = BrowserOptions(browser_type="firefox")
@@ -244,7 +244,7 @@ def test_detect_site_key_raises_when_missing() -> None:
 
 def test_playwright_bot_requires_context_manager() -> None:
     """Попытка создать страницу без запуска — явная RuntimeError."""
-    from recaptcha_toolkit import PlaywrightBot
+    from arena_api._vendor.recaptcha_toolkit import PlaywrightBot
 
     bot = PlaywrightBot()
     with pytest.raises(RuntimeError):
@@ -253,7 +253,7 @@ def test_playwright_bot_requires_context_manager() -> None:
 
 def test_selenium_bot_rejects_vision_backend() -> None:
     """YOLO-солвер недоступен для Selenium и падает сразу при конструировании."""
-    from recaptcha_toolkit import SeleniumBot
+    from arena_api._vendor.recaptcha_toolkit import SeleniumBot
 
     with pytest.raises(ValueError, match="VISION_AI"):
         SeleniumBot(driver=None, backend=SolverBackend.VISION_AI)  # type: ignore[arg-type]
@@ -261,7 +261,7 @@ def test_selenium_bot_rejects_vision_backend() -> None:
 
 def test_close_is_idempotent() -> None:
     """Повторный close() не должен бросать."""
-    from recaptcha_toolkit import PlaywrightBot
+    from arena_api._vendor.recaptcha_toolkit import PlaywrightBot
 
     bot = PlaywrightBot()
     bot.close()

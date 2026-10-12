@@ -40,6 +40,7 @@ from .exceptions import (
     ArenaError,
     AuthenticationError,
     ChallengeRequiredError,
+    ClientClosedError,
     ProtocolError,
     QueueTimeoutError,
     RateLimitError,
@@ -437,8 +438,17 @@ class ArenaTransport:
         self._apply_session_cookies(fresh)
         return True
 
+    def _ensure_open(self) -> None:
+        """Reject requests after :meth:`close` with a library-level error."""
+        if self._closed:
+            raise ClientClosedError(
+                "this client has been closed; build a new one "
+                "(leaving a `with` block closes it)"
+            )
+
     def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """Perform one request attempt, mapping transport-level failures."""
+        self._ensure_open()
         try:
             response = self.session.request(method, self.url(path), **kwargs)
         except httpx.RequestError as exc:
@@ -514,6 +524,7 @@ class ArenaTransport:
         yielded, so a 401/403 or a challenge page can still be retried with
         refreshed cookies without the consumer noticing.
         """
+        self._ensure_open()
         attempts = self._max_auth_refreshes + 1
         for attempt in range(attempts):
             context = self.session.stream(method, self.url(path), **kwargs)
@@ -669,8 +680,17 @@ class AsyncArenaTransport:
         self._apply_session_cookies(fresh)
         return True
 
+    def _ensure_open(self) -> None:
+        """Reject requests after :meth:`close` with a library-level error."""
+        if self._closed:
+            raise ClientClosedError(
+                "this client has been closed; build a new one "
+                "(leaving an `async with` block closes it)"
+            )
+
     async def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """Perform one request attempt, mapping transport-level failures."""
+        self._ensure_open()
         try:
             response = await self.session.request(method, self.url(path), **kwargs)
         except httpx.RequestError as exc:
@@ -748,6 +768,7 @@ class AsyncArenaTransport:
         yielded, so a 401/403 or a challenge page can still be retried with
         refreshed cookies without the consumer noticing.
         """
+        self._ensure_open()
         attempts = self._max_auth_refreshes + 1
         for attempt in range(attempts):
             context = self.session.stream(method, self.url(path), **kwargs)

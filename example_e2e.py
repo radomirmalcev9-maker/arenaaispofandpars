@@ -24,6 +24,7 @@ The run identifies itself with the ``X-Synthetic-Monitor`` header and
 
 from __future__ import annotations
 
+from importlib.util import find_spec
 import asyncio
 import os
 import sys
@@ -205,13 +206,11 @@ def main() -> None:
     if "--check" in sys.argv:
         raise SystemExit(check_session(base_url))
 
-    try:
-        import playwright  # noqa: F401
-    except ImportError:
+    if find_spec("playwright") is None:
         raise SystemExit(
             "Playwright is not installed. Run: python -m pip install '.[e2e]' "
             "&& playwright install chromium"
-        ) from None
+        )
 
     try:
         raise SystemExit(asyncio.run(run_journey(base_url)))

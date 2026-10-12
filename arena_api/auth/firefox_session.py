@@ -577,7 +577,7 @@ class FirefoxSessionManager:
     def _rookiepy_module(self) -> Any | None:
         """Import rookiepy lazily so the module stays an optional dependency."""
         try:
-            import rookiepy  # type: ignore[import-untyped]
+            import rookiepy  # optional dependency; mypy config silences the missing stubs
         except ImportError:
             return None
         return rookiepy

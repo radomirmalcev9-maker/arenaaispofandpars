@@ -285,7 +285,7 @@ class PlaywrightBot(_PlaywrightBotBase):
 
     Пример::
 
-        from recaptcha_toolkit import PlaywrightBot, SolverBackend
+        from arena_api._vendor.recaptcha_toolkit import PlaywrightBot, SolverBackend
 
         with PlaywrightBot(backend=SolverBackend.AUDIO) as bot:
             page = bot.new_page()
@@ -531,7 +531,7 @@ class AsyncPlaywrightBot(_PlaywrightBotBase):
     Пример::
 
         import asyncio
-        from recaptcha_toolkit import AsyncPlaywrightBot
+        from arena_api._vendor.recaptcha_toolkit import AsyncPlaywrightBot
 
         async def main():
             async with AsyncPlaywrightBot() as bot:

@@ -48,3 +48,13 @@ class RateLimitError(ArenaError):
 
 class ProtocolError(ArenaError):
     """A response did not match the expected Arena/Gradio protocol."""
+
+
+class ClientClosedError(ArenaError):
+    """A request was attempted through a client that is already closed.
+
+    Leaving a ``with`` block (or calling ``close()``/``aclose()``) shuts the
+    underlying ``httpx`` client down. Reusing it used to surface as a bare
+    ``RuntimeError`` from ``httpx``, which no ``except ArenaError`` handler
+    caught; build a new client instead.
+    """

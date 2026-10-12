@@ -23,8 +23,10 @@ What happens automatically
    challenge, the refresh ladder runs: re-read the browser profile (in
    interactive mode it asks you to refresh the page and press Enter), then a
    real form login if credentials are configured, then -- only if
-   ``solve_captchas`` allows it and the dependencies are installed -- solve a
-   reCAPTCHA in a browser.
+   ``solve_captchas`` allows it -- clear a verification screen in a browser:
+   a reCAPTCHA token when the solver dependencies are installed, otherwise
+   waiting out Turnstile/a managed interstitial or handing hCaptcha/DataDome
+   to a person (``wait_out_challenges``, on by default).
 5. **Retry transparently.** The transport applies the healed cookies and
    replays the original request, streams included.
 
@@ -36,10 +38,16 @@ automate.
 
 Command line::
 
+    python -m arena_api --login              # sign in once by hand, save it
     python -m arena_api --status             # what was found, is it accepted
     python -m arena_api --explain            # every source considered and why
     python -m arena_api --models             # model list of the frontend
     python -m arena_api --prompt "Hi"        # one completion
+
+``--login`` is step 1 for a machine with no browser profile of yours on it: it
+opens a headed Chromium, waits for you to sign in, writes ``state/cookies.json``
+and verifies it -- after which every command above needs no arguments
+(:func:`arena_api.auto.interactive_login` is the same thing from Python).
 
 (``python -m arena_api.auto`` works too; ``python -m arena_api`` is the
 warning-free spelling, see :mod:`arena_api.__main__`.)
@@ -51,6 +59,7 @@ import argparse
 import asyncio
 import os
 import sys
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from importlib.util import find_spec
@@ -59,8 +68,14 @@ from typing import Any, Literal, TextIO
 from urllib.parse import urlparse
 
 from .auth.browser import BrowserEnvironment, BrowserEnvironmentOptions, run_sync
-from .auth.captcha import RecaptchaToolkitSolver
-from .auth.challenge import ChallengeHandler
+from .auth.captcha import (
+    ChallengeWaitSolver,
+    CompositeSolver,
+    RecaptchaToolkitSolver,
+    describe_solver,
+)
+from .auth.challenge import ChallengeHandler, ChallengeKind, ChallengeObservation
+from .auth.login import DEFAULT_STATE_PATH, LoginResult, login_and_save
 from .auth.firefox_session import (
     DEFAULT_COOKIE_DOMAINS,
     FirefoxSessionError,
@@ -84,6 +99,7 @@ __all__ = [
     "AutoSessionManager",
     "DirectVerificationToken",
     "DiscoveredSession",
+    "LoginOutcome",
     "ProbeResult",
     "aprobe",
     "auto_async_client",
@@ -93,6 +109,7 @@ __all__ = [
     "discover_session",
     "explain_login",
     "explain_sources",
+    "interactive_login",
     "login_flow_from_env",
     "main",
     "probe",
@@ -165,6 +182,18 @@ _INTERSTITIAL_MARKERS: tuple[str, ...] = (
     "just a moment",
     "captcha-delivery",
 )
+
+
+#: Pages that embed reCAPTCHA markup as part of their normal job, so finding it
+#: there is not evidence of a challenge. The Direct Chat page is asserted with a
+#: v3 token on every load (see :class:`DirectVerificationToken`).
+_RECAPTCHA_OK_PATHS: tuple[str, ...] = (DIRECT_PAGE_PATH.split("?")[0],)
+
+
+def _expects_recaptcha(path: str) -> bool:
+    """Whether ``path`` is a page that legitimately contains captcha markup."""
+    target = path.split("?")[0].rstrip("/")
+    return any(target == ok.rstrip("/") for ok in _RECAPTCHA_OK_PATHS)
 
 
 def _interstitial_marker(text: str) -> str | None:
@@ -242,7 +271,20 @@ class AutoOptions:
     captcha_backend: str = "audio"
     captcha_solver: Any | None = None
 
-    #: Path probed to verify the session.
+    #: Wait out the challenges that have no token to produce (Turnstile, a
+    #: managed Cloudflare interstitial) and give a person a headed window for the
+    #: rest (hCaptcha, DataDome, anything unrecognised). Needs no third-party
+    #: package, so it is on by default -- set ``False`` for the pure
+    #: detect-and-report behaviour.
+    wait_out_challenges: bool = True
+
+    #: Seconds :class:`~arena_api.auth.captcha.ChallengeWaitSolver` waits per
+    #: round, polling the page, before reporting the challenge as unsolved.
+    challenge_wait_timeout: float = 30.0
+
+    #: Path probed to verify the session. Must be an API/JSON endpoint: an HTML
+    #: page carrying captcha markup is read as a challenge. (The Direct Chat page
+    #: is the documented exception -- it legitimately embeds a v3 assertion.)
     probe_path: str = CONFIG_PATH
     verify: bool = True
 
@@ -262,6 +304,8 @@ class AutoOptions:
             self.artifacts_dir = Path(self.artifacts_dir)
         if self.solve_captchas not in (True, False, "auto"):
             raise ValueError("solve_captchas must be True, False or 'auto'")
+        if self.challenge_wait_timeout <= 0:
+            raise ValueError("challenge_wait_timeout must be positive")
 
     @property
     def site(self) -> str:
@@ -396,7 +440,7 @@ def _from_firefox(options: AutoOptions) -> DiscoveredSession | None:
 
 def _rookiepy_module() -> Any | None:
     try:
-        import rookiepy  # type: ignore[import-untyped]
+        import rookiepy  # optional dependency; mypy config silences the missing stubs
     except ImportError:
         return None
     return rookiepy
@@ -464,30 +508,39 @@ def discover_session(options: AutoOptions | None = None) -> DiscoveredSession | 
     return None
 
 
+def _report_line(label: str, value: str) -> str:
+    """One aligned ``label : value`` line of the discovery report."""
+    return f"{label:<20}: {value}"
+
+
 def explain_sources(options: AutoOptions | None = None) -> list[str]:
     """Describe every source considered, for ``--explain`` and error messages."""
     options = options or AutoOptions()
-    report: list[str] = []
-
-    report.append(
-        "cookies=          : "
-        + ("set" if options.cookies is not None else "not given")
-    )
-    report.append(
-        "ARENA_COOKIE(S_FILE): "
-        + (
+    report: list[str] = [
+        _report_line("cookies=", "set" if options.cookies is not None else "not given"),
+        _report_line(
+            "ARENA_COOKIE(S_FILE)",
             "set"
             if os.environ.get("ARENA_COOKIE") or os.environ.get("ARENA_COOKIES_FILE")
-            else "not set"
-        )
-    )
+            else "not set",
+        ),
+    ]
     path = _default_storage_path(options)
-    report.append(
-        f"stored cookies.json : {path} "
-        + ("(exists)" if path is not None and path.is_file() else "(absent)")
-    )
+    if path is None:
+        report.append(_report_line("stored cookies.json", "not configured"))
+    else:
+        report.append(
+            _report_line(
+                "stored cookies.json",
+                f"{path} " + ("(exists)" if path.is_file() else "(absent)"),
+            )
+        )
     if not options.use_browser_profiles:
-        report.append("browser profiles   : disabled by use_browser_profiles=False")
+        report.append(
+            _report_line(
+                "browser profiles", "disabled by use_browser_profiles=False"
+            )
+        )
         return report
 
     manager = FirefoxSessionManager(
@@ -499,24 +552,30 @@ def explain_sources(options: AutoOptions | None = None) -> list[str]:
     try:
         profile = manager.profile_path()
     except FirefoxSessionError as exc:
-        report.append(f"Firefox profile     : unavailable ({exc})")
+        report.append(_report_line("Firefox profile", f"unavailable ({exc})"))
     else:
         try:
             found = len(manager.load_cookies())
         except FirefoxSessionError as exc:
-            report.append(f"Firefox profile     : {profile} unreadable ({exc})")
+            report.append(_report_line("Firefox profile", f"{profile} unreadable ({exc})"))
         else:
             report.append(
-                f"Firefox profile     : {profile} ({found} cookie names for "
-                f"{', '.join(_domains_for(options))})"
+                _report_line(
+                    "Firefox profile",
+                    f"{profile} ({found} cookie names for "
+                    f"{', '.join(_domains_for(options))})",
+                )
             )
     if _rookiepy_module() is None:
         report.append(
-            "other browsers      : rookiepy not installed "
-            "(pip install '.[firefox]' to add Chrome/Edge/Brave/...)"
+            _report_line(
+                "other browsers",
+                "rookiepy not installed "
+                "(pip install '.[firefox]' to add Chrome/Edge/Brave/...)",
+            )
         )
     else:
-        report.append("other browsers      : rookiepy available")
+        report.append(_report_line("other browsers", "rookiepy available"))
     return report
 
 
@@ -560,16 +619,46 @@ def solver_dependencies_available(backend: str = "audio") -> bool:
 
 
 def resolve_solver(options: AutoOptions) -> Any | None:
-    """Build the captcha solver the options ask for, or ``None``."""
+    """Build the captcha solver the options ask for, or ``None``.
+
+    Three ingredients, in order of precedence:
+
+    * an explicit ``options.captcha_solver`` wins outright;
+    * ``solve_captchas=False`` switches everything off, waiting included;
+    * otherwise a :class:`~arena_api.auth.captcha.RecaptchaToolkitSolver` joins
+      when its backend dependencies are importable (or when solving is forced on
+      with ``solve_captchas=True``), and a
+      :class:`~arena_api.auth.captcha.ChallengeWaitSolver` joins when
+      ``wait_out_challenges`` is set.
+
+    A single ingredient is returned bare; several are wrapped in a
+    :class:`~arena_api.auth.captcha.CompositeSolver` that dispatches by
+    challenge kind. Because waiting needs nothing but Playwright,
+    ``solve_captchas="auto"`` is no longer a silent no-op on a machine without
+    ``playwright-recaptcha``: reCAPTCHA stays unsolvable there, but a Turnstile
+    or an hCaptcha screen is still handled.
+    """
     if options.captcha_solver is not None:
         return options.captcha_solver
     if options.solve_captchas is False:
         return None
-    if options.solve_captchas == "auto" and not solver_dependencies_available(
+
+    solvers: list[Any] = []
+    if options.solve_captchas is True or solver_dependencies_available(
         options.captcha_backend
     ):
+        solvers.append(RecaptchaToolkitSolver(backend=options.captcha_backend))
+    if options.wait_out_challenges:
+        solvers.append(
+            ChallengeWaitSolver(
+                timeout=options.challenge_wait_timeout,
+                interactive=options.interactive,
+                output=options.output,
+            )
+        )
+    if not solvers:
         return None
-    return RecaptchaToolkitSolver(backend=options.captcha_backend)
+    return solvers[0] if len(solvers) == 1 else CompositeSolver(*solvers)
 
 
 def login_flow_from_env(options: AutoOptions) -> LoginFlow | None:
@@ -601,13 +690,12 @@ def login_flow_from_env(options: AutoOptions) -> LoginFlow | None:
     )
 
 
-def explain_login(options: AutoOptions | None = None) -> str:
-    """Why the automatic form login is or is not available."""
-    options = options or AutoOptions()
+def _login_state(options: AutoOptions) -> str:
+    """Why the automatic form login is or is not available (value only)."""
     if options.login_flow is not None:
-        return "login flow: configured explicitly"
+        return "configured explicitly"
     if not options.login_from_env:
-        return "login flow: disabled by login_from_env=False"
+        return "disabled by login_from_env=False"
     credentials = [name for name in (USERNAME_ENV, PASSWORD_ENV) if not os.environ.get(name)]
     form = [
         name
@@ -615,9 +703,161 @@ def explain_login(options: AutoOptions | None = None) -> str:
         if not os.environ.get(name)
     ]
     if not credentials and not form:
-        return "login flow: available from the environment"
+        return "available from the environment"
     missing = ", ".join(credentials + form)
-    return f"login flow: unavailable, missing {missing}"
+    return f"unavailable, missing {missing}"
+
+
+def explain_login(options: AutoOptions | None = None) -> str:
+    """One-line answer to "can this run sign itself in?"."""
+    return f"login flow: {_login_state(options or AutoOptions())}"
+
+
+# --------------------------------------------------------------------------- #
+# Interactive login: the one manual step
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class LoginOutcome:
+    """An interactive sign-in, plus the server's verdict on what it produced.
+
+    :ivar login: the browser-side result (cookies, rounds, state file).
+    :ivar verification: probe of the freshly saved file, or ``None`` when
+        verification was skipped.
+    :ivar path: the state file, when one was written.
+    """
+
+    login: LoginResult
+    verification: ProbeResult | None = None
+    path: Path | None = None
+
+    @property
+    def ok(self) -> bool:
+        """The sign-in produced a usable capture and, when checked, the server
+        accepted it.
+
+        Delegates the first half to :attr:`LoginResult.ok`, so an exhausted or
+        cancelled wait is never reported as success just because the browser
+        happened to hold anonymous cookies.
+        """
+        return self.login.ok and (self.verification is None or self.verification.ok)
+
+    def describe(self) -> str:
+        """Two-line-friendly summary used by the CLI."""
+        parts = [f"login: {self.login.describe()}"]
+        if self.verification is not None:
+            parts.append(f"verification: {self.verification.describe()}")
+        return "; ".join(parts)
+
+
+def interactive_login(
+    options: AutoOptions | None = None,
+    *,
+    path: str | Path | None = None,
+    headless: bool = False,
+    fresh: bool = False,
+    rounds: int = 5,
+    verify: bool | None = None,
+    login_flow: LoginFlow | None = None,
+    **overrides: Any,
+) -> LoginOutcome:
+    """Open a browser, let a human sign in, save and verify the session.
+
+    This is the "you only have to log in" step, as a function::
+
+        from arena_api import interactive_login
+
+        outcome = interactive_login()
+        if outcome.ok:
+            print("session saved to", outcome.path)
+
+    Afterwards :func:`auto_client` needs no arguments at all: it finds the state
+    file this call wrote.
+
+    :param options: bootstrap options; ``base_url``, ``domains``, ``prompt``,
+        ``output``, ``probe_path`` and the captcha settings are taken from it.
+    :param path: where to save. Defaults to ``options.storage_path`` and then to
+        :data:`~arena_api.auth.login.DEFAULT_STATE_PATH` (``./state/cookies.json``).
+    :param headless: hide the window. Almost never what you want here -- you
+        have to see the page to sign in to it.
+    :param fresh: ignore an existing state file instead of reusing it, e.g. to
+        switch accounts.
+    :param rounds: how many Enter presses to offer before giving up.
+    :param verify: probe the saved session afterwards (defaults to
+        ``options.verify``).
+    :param login_flow: fill the sign-in form first (``FormLoginFlow``). Without
+        it, a complete ``ARENA_*`` configuration is used when present.
+    :param overrides: any other :class:`AutoOptions` field.
+    :returns: a :class:`LoginOutcome`; :attr:`LoginOutcome.ok` is ``False`` when
+        nothing was captured or the server rejected it.
+
+    .. note::
+       Blocking by design: the wait happens on ``input()``. There is no async
+       twin, because an interactive sign-in cannot run concurrently with the
+       loop that would have to await it.
+    """
+    options = _merge_options(options, overrides)
+    destination = Path(path or options.storage_path or DEFAULT_STATE_PATH)
+    flow = login_flow or login_flow_from_env(options)
+    solver = resolve_solver(options)
+
+    result = login_and_save(
+        base_url=options.base_url,
+        path=destination,
+        domains=options.cookie_domains(),
+        headless=headless,
+        reuse_existing=not fresh,
+        rounds=rounds,
+        login_flow=flow,
+        captcha_solver=solver,
+        prompt=options.prompt,
+        output=options.output,
+        artifacts_dir=options.artifacts_dir,
+    )
+
+    check = options.verify if verify is None else verify
+    verification: ProbeResult | None = None
+    if check and result.saved:
+        verification = _verify_saved_session(options, destination)
+        if verification is not None and not verification.ok:
+            _emit(
+                options,
+                f"[arena-api] the saved session did not verify ({verification.reason})",
+            )
+    elif check:
+        _emit(
+            options,
+            f"[arena-api] nothing saved to {destination}; skipping verification",
+        )
+    return LoginOutcome(
+        login=result,
+        verification=verification,
+        path=destination if result.saved else None,
+    )
+
+
+def _verify_saved_session(options: AutoOptions, destination: Path) -> ProbeResult | None:
+    """Probe exactly the file just written, with no refresh ladder of its own.
+
+    The ladder's own remedy for a rejected session *is* another sign-in, so it
+    is switched off here (``interactive=False``, ``verify=False``): this probe
+    must report, not act.
+    """
+    probe_options = replace(
+        options,
+        cookies=None,
+        storage_path=str(destination),
+        use_browser_profiles=False,
+        login_from_env=False,
+        interactive=False,
+        verify=False,
+    )
+    try:
+        with auto_client(probe_options) as client:
+            return probe(client, options.probe_path)
+    except ArenaError as exc:
+        return _classify(exc)
 
 
 @dataclass
@@ -634,6 +874,11 @@ class AutoSessionManager(BrowserSessionManager):
     #: Manager of the source the cookies were discovered from.
     fallback: SessionManager | None = None
     _from_fallback: bool = field(default=True, repr=False, compare=False)
+    #: Serialises the ladder: parallel requests that all fail with 403 must not
+    #: each start a browser, solve a captcha, or ask for Enter.
+    _refresh_lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False, compare=False
+    )
 
     def firefox_headers(self, *, navigation: bool = False) -> dict[str, str]:
         """Headers of the browser that owns the current cookies.
@@ -655,7 +900,20 @@ class AutoSessionManager(BrowserSessionManager):
         self._from_fallback = True
 
     def refresh_session(self, reason: BaseException | None = None) -> dict[str, str] | None:
-        """Run the refresh ladder and return fresh cookies, or ``None``."""
+        """Run the refresh ladder and return fresh cookies, or ``None``.
+
+        Thread-safe: when several requests fail at once, the first one refreshes
+        and the others pick up its result instead of repeating the work.
+        """
+        stale = self.load_cookies()
+        with self._refresh_lock:
+            current = self.load_cookies()
+            if current and current != stale:
+                return current
+            return self._refresh(reason)
+
+    def _refresh(self, reason: BaseException | None) -> dict[str, str] | None:
+        """The ladder itself; called with :attr:`_refresh_lock` held."""
         if self.fallback is not None:
             try:
                 cookies = self.fallback.refresh_session(reason)
@@ -740,7 +998,7 @@ def _classify(exc: ArenaError) -> ProbeResult:
 
 def _accepted(path: str, text: str) -> ProbeResult:
     """Classify a response the transport itself did not reject."""
-    marker = _interstitial_marker(text)
+    marker = None if _expects_recaptcha(path) else _interstitial_marker(text)
     if marker is not None:
         return ProbeResult(
             False,
@@ -774,12 +1032,17 @@ async def aprobe(client: Any, path: str = CONFIG_PATH) -> ProbeResult:
 
 
 def _heal_sync(
-    client: ArenaClient,
+    client: Any,
     manager: AutoSessionManager,
     result: ProbeResult,
     options: AutoOptions,
 ) -> ProbeResult:
-    """Run the refresh ladder once when the probe found an auth problem."""
+    """Run the refresh ladder once when the probe found an auth problem.
+
+    ``client`` is any of the four clients: all of them own a ``transport`` with
+    :meth:`~arena_api.transport.ArenaTransport.apply_session_cookies` and a
+    ``close()``.
+    """
     _emit(options, f"[arena-api] session needs a refresh ({result.reason})")
     try:
         cookies = manager.refresh_session(result.error)
@@ -794,7 +1057,7 @@ def _heal_sync(
 
 
 async def _heal_async(
-    client: AsyncArenaClient,
+    client: Any,
     manager: AutoSessionManager,
     result: ProbeResult,
     options: AutoOptions,
@@ -811,6 +1074,32 @@ async def _heal_async(
         return result
     client.transport.apply_session_cookies(cookies)
     return await aprobe(client, options.probe_path)
+
+
+def _verified(
+    client: Any, manager: AutoSessionManager, options: AutoOptions
+) -> Any:
+    """Probe a freshly built client and heal it when the session was rejected."""
+    if not options.verify:
+        return client
+    result = probe(client, options.probe_path)
+    if result.auth_problem:
+        result = _heal_sync(client, manager, result, options)
+    _emit(options, f"[arena-api] verification: {result.describe()}")
+    return client
+
+
+async def _averified(
+    client: Any, manager: AutoSessionManager, options: AutoOptions
+) -> Any:
+    """Async twin of :func:`_verified`."""
+    if not options.verify:
+        return client
+    result = await aprobe(client, options.probe_path)
+    if result.auth_problem:
+        result = await _heal_async(client, manager, result, options)
+    _emit(options, f"[arena-api] verification: {result.describe()}")
+    return client
 
 
 # --------------------------------------------------------------------------- #
@@ -860,18 +1149,19 @@ def auto_client(options: AutoOptions | None = None, **overrides: Any) -> ArenaCl
         http_transport=options.http_transport,
         max_auth_refreshes=options.max_auth_refreshes,
     )
-    if options.verify:
-        result = probe(client, options.probe_path)
-        if result.auth_problem:
-            result = _heal_sync(client, manager, result, options)
-        _emit(options, f"[arena-api] verification: {result.describe()}")
-    return client
+    return _verified(client, manager, options)
 
 
 async def auto_async_client(
     options: AutoOptions | None = None, **overrides: Any
 ) -> AsyncArenaClient:
-    """Async twin of :func:`auto_client`."""
+    """Async twin of :func:`auto_client`.
+
+    Discovery and a needed refresh run in worker threads, but an interactive
+    login wait calls ``prompt`` (``input`` by default) on the calling thread, so
+    inside a running server pass ``interactive=False`` or your own non-blocking
+    ``prompt``.
+    """
     options = _merge_options(options, overrides)
     prepared = _prepare(options)
     if prepared is None:  # pragma: no cover
@@ -887,12 +1177,7 @@ async def auto_async_client(
         http_transport=options.http_transport,
         max_auth_refreshes=options.max_auth_refreshes,
     )
-    if options.verify:
-        result = await aprobe(client, options.probe_path)
-        if result.auth_problem:
-            result = await _heal_async(client, manager, result, options)
-        _emit(options, f"[arena-api] verification: {result.describe()}")
-    return client
+    return await _averified(client, manager, options)
 
 
 def _merge_options(options: AutoOptions | None, overrides: Mapping[str, Any]) -> AutoOptions:
@@ -901,6 +1186,22 @@ def _merge_options(options: AutoOptions | None, overrides: Mapping[str, Any]) ->
     if options is None:
         return AutoOptions(**dict(overrides))
     return replace(options, **dict(overrides))
+
+
+def _token_solver(solver: Any) -> Any:
+    """Unwrap the token-producing member of a composite solver.
+
+    ``resolve_solver`` returns a :class:`~arena_api.auth.captcha.CompositeSolver`
+    by default; the Direct Chat assertion can only come from the reCAPTCHA
+    bridge inside it, and unwrapping keeps the v3 pin below effective.
+    """
+    members = getattr(solver, "solvers", None)
+    if not members:
+        return solver
+    for member in members:
+        if isinstance(member, RecaptchaToolkitSolver):
+            return member
+    return solver
 
 
 class DirectVerificationToken:
@@ -912,6 +1213,11 @@ class DirectVerificationToken:
     normalised browser and intercepts the v3 token with
     :class:`~arena_api.auth.captcha.RecaptchaToolkitSolver`, so it needs the
     captcha dependencies and a deployment you may automate.
+
+    A composite solver is unwrapped to its token-producing member
+    (:func:`_token_solver`), and a solver that cannot produce a token at all --
+    the wait-only default on a machine without ``playwright-recaptcha`` -- is
+    rejected with an actionable error instead of returning an empty assertion.
     """
 
     def __init__(
@@ -928,6 +1234,7 @@ class DirectVerificationToken:
         base = solver or resolve_solver(self.options) or RecaptchaToolkitSolver(
             backend=self.options.captcha_backend
         )
+        base = _token_solver(base)
         # The Direct Chat assertion is always a v3 token. A custom solver object
         # decides its own path, so only the toolkit adapter is pinned.
         self.solver = (
@@ -937,7 +1244,13 @@ class DirectVerificationToken:
         )
 
     async def afetch(self) -> str:
-        """Fetch a token asynchronously."""
+        """Fetch a token asynchronously.
+
+        :raises arena_api.exceptions.AuthenticationError: when the configured
+            solver cannot produce a token at all, or produced none -- an empty
+            assertion must never be sent silently.
+        """
+        self._require_a_token_solver()
         if isinstance(self.solver, RecaptchaToolkitSolver) and not (
             solver_dependencies_available(self.solver.backend)
         ):
@@ -954,7 +1267,36 @@ class DirectVerificationToken:
             page = await environment.new_page()
             await page.goto(self.page_url, wait_until="domcontentloaded")
             attempt = await self.solver.asolve(page)
-            return attempt.raise_for_status()
+            token = attempt.raise_for_status()
+            if not token:
+                raise AuthenticationError(
+                    "the solver cleared the page but produced no assertion "
+                    f"({attempt.describe()}); Direct Chat needs a v3 token"
+                )
+            return token
+
+    def _require_a_token_solver(self) -> None:
+        """Refuse a solver that cannot produce a reCAPTCHA token.
+
+        Capability-based on purpose: a custom solver object is fine as long as
+        it accepts reCAPTCHA observations, while a wait-only solver (what
+        ``resolve_solver`` returns when the toolkit's dependencies are missing)
+        would happily report ``cleared=True`` with no token.
+        """
+        supports = getattr(self.solver, "supports", None)
+        if not callable(supports):
+            return
+        probe = ChallengeObservation(
+            url=self.page_url, kind=ChallengeKind.RECAPTCHA, signals=()
+        )
+        if not supports(probe):
+            raise AuthenticationError(
+                "verification_token='auto' needs a solver that produces a "
+                f"reCAPTCHA token, but {describe_solver(self.solver)} does not "
+                "accept reCAPTCHA. Install the token backends with "
+                "pip install '.[auth-captcha]' (plus playwright install "
+                "chromium), or pass verification_token= your own assertion."
+            )
 
     def __call__(self) -> str:
         """Fetch a token, safe to call from inside a running event loop."""
@@ -981,16 +1323,20 @@ def auto_direct_client(
     manager, _ = prepared
     if isinstance(verification_token, str) and verification_token.strip().lower() == "auto":
         verification_token = DirectVerificationToken(options)
-    return DirectArenaClient(
-        base_url=options.base_url,
-        session_source=manager,
-        headers=options.headers,
-        timeout=options.timeout,
-        http2=options.http2,
-        verify=options.verify_tls,
-        verification_token=verification_token,
-        http_transport=options.http_transport,
-        max_auth_refreshes=options.max_auth_refreshes,
+    return _verified(
+        DirectArenaClient(
+            base_url=options.base_url,
+            session_source=manager,
+            headers=options.headers,
+            timeout=options.timeout,
+            http2=options.http2,
+            verify=options.verify_tls,
+            verification_token=verification_token,
+            http_transport=options.http_transport,
+            max_auth_refreshes=options.max_auth_refreshes,
+        ),
+        manager,
+        options,
     )
 
 
@@ -1008,16 +1354,20 @@ async def auto_async_direct_client(
     manager, _ = prepared
     if isinstance(verification_token, str) and verification_token.strip().lower() == "auto":
         verification_token = DirectVerificationToken(options)
-    return AsyncDirectArenaClient(
-        base_url=options.base_url,
-        session_source=manager,
-        headers=options.headers,
-        timeout=options.timeout,
-        http2=options.http2,
-        verify=options.verify_tls,
-        verification_token=verification_token,
-        http_transport=options.http_transport,
-        max_auth_refreshes=options.max_auth_refreshes,
+    return await _averified(
+        AsyncDirectArenaClient(
+            base_url=options.base_url,
+            session_source=manager,
+            headers=options.headers,
+            timeout=options.timeout,
+            http2=options.http2,
+            verify=options.verify_tls,
+            verification_token=verification_token,
+            http_transport=options.http_transport,
+            max_auth_refreshes=options.max_auth_refreshes,
+        ),
+        manager,
+        options,
     )
 
 
@@ -1037,7 +1387,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="frontend to talk to")
     parser.add_argument("--cookies", default=None, help="cookie header or cookies.json path")
-    parser.add_argument("--storage", default=None, help="cookies.json written by an earlier run")
+    parser.add_argument(
+        "--storage",
+        default=None,
+        help=(
+            "cookies.json to read, and where --login saves it "
+            "(default ./state/cookies.json)"
+        ),
+    )
     parser.add_argument(
         "--no-browser-profiles",
         action="store_true",
@@ -1055,8 +1412,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend", default="audio", help="captcha backend: audio, image or vision_ai"
     )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help=(
+            "do not wait out challenges that have no token "
+            "(Turnstile, hCaptcha, DataDome); detect and report only"
+        ),
+    )
+    parser.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=30.0,
+        help="seconds to wait per challenge round (default 30)",
+    )
     parser.add_argument("--probe-path", default=CONFIG_PATH, help="path used to verify")
     parser.add_argument("--no-verify", action="store_true", help="skip the probe request")
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="open a browser, sign in by hand once, save the session and verify it",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true", help="ignore an existing session file when logging in"
+    )
+    parser.add_argument(
+        "--headless", action="store_true", help="keep the --login window hidden (not recommended)"
+    )
+    parser.add_argument(
+        "--login-rounds",
+        type=int,
+        default=5,
+        help="how many Enter presses --login offers (default 5)",
+    )
     parser.add_argument("--status", action="store_true", help="report the session and stop")
     parser.add_argument(
         "--explain", action="store_true", help="list every source considered and why"
@@ -1078,6 +1466,8 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         interactive=not args.non_interactive,
         solve_captchas=solve,
         captcha_backend=args.backend,
+        wait_out_challenges=not args.no_wait,
+        challenge_wait_timeout=args.wait_timeout,
         probe_path=args.probe_path,
         verify=not args.no_verify,
     )
@@ -1095,20 +1485,75 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.explain:
         for line in explain_sources(options):
             print(line)
-        print(explain_login(options))
+        print(_report_line("login flow", _login_state(options)))
         available = solver_dependencies_available(options.captcha_backend)
-        print(
-            f"captcha solving   : {options.solve_captchas} "
-            f"(backend {options.captcha_backend}, dependencies "
-            f"{'available' if available else 'missing'})"
+        detail = (
+            f"{options.solve_captchas} (backend {options.captcha_backend}, "
+            f"dependencies {'available' if available else 'missing'})"
         )
+        solver = resolve_solver(options)
+        if solver is not None:
+            detail += f" -> {describe_solver(solver)}"
+        else:
+            detail += " -> off"
+        print(_report_line("captcha solving", detail))
         return 0
 
     try:
+        if args.login:
+            destination = Path(args.storage or options.storage_path or DEFAULT_STATE_PATH)
+            code = _login(args, options, destination)
+            # ``--login --models`` keeps going with the session it just saved.
+            if code != 0 or not (args.models or args.prompt):
+                return code
+            options = replace(
+                options,
+                cookies=None,
+                storage_path=str(destination),
+                use_browser_profiles=False,
+            )
+            return _run(args, options)
         return _run(args, options)
     except ArenaError as exc:
         print(f"[arena-api] {exc}", file=sys.stderr)
         return 1
+
+
+def _login(
+    args: argparse.Namespace, options: AutoOptions, destination: Path
+) -> int:
+    """``--login``: sign in by hand once, then report what happened."""
+    try:
+        outcome = interactive_login(
+            options,
+            path=destination,
+            headless=args.headless,
+            fresh=args.fresh,
+            rounds=args.login_rounds,
+        )
+    except ArenaError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - translate into one actionable line
+        # The usual cause is a missing browser binary: Playwright answers with
+        # its own multi-line error, which reads as a crash rather than as the
+        # one-command fix it is.
+        detail = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        raise AuthenticationError(
+            f"the login browser could not be started: {detail} Install it with "
+            "`python -m playwright install chromium`."
+        ) from exc
+    login = outcome.login
+    if not login.cookies:
+        print(_report_line("login", "no cookies captured"))
+        return 1
+    print(_report_line("login", login.describe()))
+    if not login.saved:
+        print(_report_line("hint", "no sign-in detected, so nothing was written"))
+        return 1
+    if outcome.verification is None:
+        return 0
+    print(_report_line("verification", outcome.verification.describe()))
+    return 0 if outcome.verification.ok else 2
 
 
 def _run(args: argparse.Namespace, options: AutoOptions) -> int:
