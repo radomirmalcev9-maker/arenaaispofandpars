@@ -1,8 +1,11 @@
 """Run with: python example_firefox.py
 
-Requires a local Firefox profile that is signed in to arena.ai. The
-recommended cookie backend is rookiepy (python -m pip install '.[firefox]');
-without it the built-in lock-safe cookies.sqlite reader is used.
+Requires a local Firefox profile that is signed in to arena.ai. Every profile of
+every profiles root is ranked (snap and Flatpak installs included) and the one
+that actually stores cookies for arena.ai wins. The recommended cookie backend is
+rookiepy (python -m pip install '.[firefox]'); without it the built-in lock-safe
+cookies.sqlite reader is used, and rookiepy is skipped when it would read a
+different profile than the selected one.
 
 ```python -m pip install '.[impersonate]'``` additionally sends the requests
 with Firefox's own TLS/HTTP2 fingerprint, which is what a cookie-aware edge
@@ -28,11 +31,17 @@ def main() -> None:
         raise SystemExit(f"Firefox profile not found: {exc}") from exc
 
     print("Firefox profile:", profile)
+    # With several profiles the configured default is often not the one holding
+    # the session; this says which profile was read and why.
+    print("Why this profile:", manager.selection_reason())
     cookies = manager.load_cookies()
     if not cookies:
         raise SystemExit(
             "No arena.ai cookies in this Firefox profile. "
-            "Open https://arena.ai in Firefox, sign in, and rerun."
+            "Open https://arena.ai in Firefox, sign in, and rerun.\n"
+            "Still empty? `python -m arena_api --diagnose` prints a redacted "
+            "report -- hosts, names, expiry, value fingerprints, never a value "
+            "-- which is safe to read and to send."
         )
     print("Session cookies:", ", ".join(sorted(cookies)))
     print("User-Agent:", manager.user_agent())

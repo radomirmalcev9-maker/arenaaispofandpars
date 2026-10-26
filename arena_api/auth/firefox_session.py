@@ -47,11 +47,14 @@ from typing import Any, Protocol, TextIO, runtime_checkable
 
 __all__ = [
     "DEFAULT_COOKIE_DOMAINS",
+    "FIREFOX_PROFILE_ENV",
+    "FIREFOX_ROOT_ENV",
     "FirefoxSessionError",
     "FirefoxSessionManager",
     "SessionManager",
     "cookies_from_rookiepy",
     "default_profiles_root",
+    "firefox_profiles_roots",
     "read_firefox_cookie_records",
     "read_firefox_cookies",
 ]
@@ -59,6 +62,23 @@ __all__ = [
 
 #: Domains queried when the caller does not specify any.
 DEFAULT_COOKIE_DOMAINS: tuple[str, ...] = ("arena.ai", "lmarena.ai")
+
+#: Point the reader at a root (or a ``profiles.ini``) it would not guess -- a
+#: portable install, a second root, a profile on another disk.
+FIREFOX_ROOT_ENV = "ARENA_FIREFOX_ROOT"
+#: Name or absolute path of the profile to use, skipping discovery entirely.
+FIREFOX_PROFILE_ENV = "ARENA_FIREFOX_PROFILE"
+
+#: Roots tried after the platform default. Distribution packaging puts the real
+#: profile inside a sandbox, where ``~/.mozilla/firefox`` does not exist at all;
+#: on such a machine every discovery attempt used to end in "not found".
+_SANDBOX_PROFILE_ROOTS: dict[str, tuple[str, ...]] = {
+    "linux": (
+        "~/snap/firefox/common/.mozilla/firefox",
+        "~/.var/app/org.mozilla.firefox/.mozilla/firefox",
+        "~/snap/firefox/current/.mozilla/firefox",
+    ),
+}
 
 # Profile directory suffixes tried, in order, when profiles.ini gives no hint.
 DEFAULT_PROFILE_HINTS: tuple[str, ...] = ("default-release", "default")
@@ -91,7 +111,6 @@ _COOKIE_RECORD_QUERY = """
 SELECT host, name, value, path, expiry, isSecure, isHttpOnly
 FROM moz_cookies
 WHERE (host = :exact OR host = :dotted OR host LIKE :subdomain)
-  AND (expiry IS NULL OR expiry <= 0 OR expiry > :now)
 ORDER BY LENGTH(host) DESC, name COLLATE NOCASE
 """
 
@@ -131,6 +150,44 @@ def default_profiles_root() -> Path:
     return home / ".mozilla" / "firefox"
 
 
+def _platform_profile_roots() -> tuple[str, ...]:
+    """Sandboxed roots for this platform (snap/Flatpak packaging)."""
+    if sys.platform.startswith("linux"):
+        return _SANDBOX_PROFILE_ROOTS.get("linux", ())
+    return ()
+
+
+def firefox_profiles_roots() -> tuple[Path, ...]:
+    """Every Firefox profiles root worth searching, most likely first.
+
+    The platform default comes first, then the sandboxed locations a snap or a
+    Flatpak install uses (``~/snap/firefox/common/.mozilla/firefox`` and
+    ``~/.var/app/org.mozilla.firefox/.mozilla/firefox`` on Linux), because on
+    those distributions the conventional ``~/.mozilla/firefox`` does not exist.
+
+    ``ARENA_FIREFOX_ROOT`` -- a profiles directory, or the ``profiles.ini``
+    inside one -- is prepended, which covers a portable install or a copy of a
+    profile restored somewhere else.
+
+    Roots that do not exist are included: callers report them, and a report
+    that names the paths it searched is what a stuck user needs.
+    """
+    roots: list[Path] = []
+    override = os.environ.get(FIREFOX_ROOT_ENV, "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        roots.append(
+            candidate.parent if candidate.name == "profiles.ini" else candidate
+        )
+    roots.append(default_profiles_root())
+    roots.extend(Path(item).expanduser() for item in _platform_profile_roots())
+    unique: list[Path] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return tuple(unique)
+
+
 def _normalize_domains(domains: Sequence[str]) -> tuple[str, ...]:
     normalized: list[str] = []
     for item in domains:
@@ -140,6 +197,11 @@ def _normalize_domains(domains: Sequence[str]) -> tuple[str, ...]:
     if not normalized:
         raise ValueError("at least one cookie domain is required")
     return tuple(normalized)
+
+
+def _as_profiles_root(path: Path) -> Path:
+    """Accept either a profiles directory or the ``profiles.ini`` inside one."""
+    return path.parent if path.name == "profiles.ini" else path
 
 
 def _read_profiles_ini(root: Path) -> configparser.RawConfigParser:
@@ -176,30 +238,47 @@ def _looks_locked(error: BaseException) -> bool:
     return any(marker in text for marker in _LOCK_MARKERS)
 
 
-def _cookie_expired(expires: Any) -> bool:
-    """Interpret rookiepy-style expiry values; 0/None means a session cookie."""
-    if expires is None:
-        return False
-    if isinstance(expires, bool):
-        return False
+def _expiry_seconds(expires: Any) -> float | None:
+    """Normalize a cookie expiry to epoch **seconds**; ``None`` = session cookie.
+
+    Firefox stores ``moz_cookies.expiry`` in seconds, but older profile
+    formats (and some exports) carry microseconds, and ``rookiepy`` hands back
+    seconds as a float. Mixing the units up silently makes an expiring cookie
+    look immortal or an immortal one look long expired, so every value goes
+    through here exactly once.
+    """
+    if expires is None or isinstance(expires, bool):
+        return None
     if isinstance(expires, (int, float)):
-        return expires > 0 and expires < time.time()
-    if isinstance(expires, str):
+        number = float(expires)
+    elif isinstance(expires, str):
         text = expires.strip()
         if not text:
-            return False
+            return None
         try:
-            stamp = float(text)
+            number = float(text)
         except ValueError:
             try:
                 parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
             except ValueError:
-                return False
+                return None
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp() < time.time()
-        return stamp > 0 and stamp < time.time()
-    return False
+            return parsed.timestamp()
+    else:
+        return None
+    if number <= 0:
+        return None
+    # Microseconds since epoch (~1.7e15 today) rather than seconds (~1.7e9).
+    if number > 1e12:
+        number /= 1_000_000
+    return number
+
+
+def _cookie_expired(expires: Any) -> bool:
+    """Whether an expiry value is in the past; ``0``/``None`` means "session"."""
+    moment = _expiry_seconds(expires)
+    return moment is not None and moment < time.time()
 
 
 def _normalize_rookiepy_records(records: Any) -> list[dict[str, Any]]:
@@ -216,14 +295,14 @@ def _normalize_rookiepy_records(records: Any) -> list[dict[str, Any]]:
             continue
         if _cookie_expired(record.get("expires")):
             continue
-        expires = record.get("expires")
+        moment = _expiry_seconds(record.get("expires"))
         normalized.append(
             {
                 "name": name,
                 "value": value,
                 "domain": str(record.get("domain") or ""),
                 "path": str(record.get("path") or "/"),
-                "expires": expires if isinstance(expires, (int, float)) else 0,
+                "expires": int(moment) if moment is not None else 0,
                 "secure": bool(record.get("secure")),
                 "http_only": bool(record.get("http_only")),
             }
@@ -259,7 +338,6 @@ def _query_cookie_snapshot(
                     "exact": domain,
                     "dotted": f".{domain}",
                     "subdomain": f"%.{domain}",
-                    "now": now,
                 },
             ).fetchall()
             for row in rows:
@@ -267,13 +345,16 @@ def _query_cookie_snapshot(
                 value = row["value"]
                 if not name or value is None:
                     continue
+                moment = _expiry_seconds(row["expiry"])
+                if moment is not None and moment < now:
+                    continue
                 records.append(
                     {
                         "name": name,
                         "value": value,
                         "domain": row["host"],
                         "path": row["path"],
-                        "expires": row["expiry"],
+                        "expires": int(moment) if moment is not None else 0,
                         "secure": bool(row["isSecure"]),
                         "http_only": bool(row["isHttpOnly"]),
                     }
@@ -359,12 +440,18 @@ class FirefoxSessionManager:
         Cookie domains to extract. Defaults to ``("arena.ai", "lmarena.ai")``.
     profiles_root:
         Override the Firefox profiles directory (portable installs, tests).
+        ``None`` searches every root of
+        :func:`firefox_profiles_roots` — the platform default *and* the
+        snap/Flatpak locations — and honours ``ARENA_FIREFOX_ROOT``.
     profile_name:
-        Explicit profile directory name or absolute path. When omitted, the
-        default profile is discovered from ``profiles.ini`` — the
-        ``[Install*]`` section's ``Default`` entry, then the profile flagged
-        ``Default=1``, then ``*.default-release``/``*.default`` directory
-        names, and finally the profile with the newest ``cookies.sqlite``.
+        Explicit profile directory name or absolute path. When omitted, every
+        profile of every root is ranked by ``profiles.ini`` (the ``[Install*]``
+        section's ``Default`` entry, then the profile flagged ``Default=1``,
+        then ``*.default-release``/``*.default`` names, then the newest
+        ``cookies.sqlite``) and the first one that actually stores cookies for
+        the requested domains wins — with several profiles, the configured
+        default is often not the one holding the session. Honours
+        ``ARENA_FIREFOX_PROFILE``.
     cookie_database:
         Explicit ``cookies.sqlite`` path, bypassing profile resolution for
         the cookie store itself.
@@ -408,9 +495,22 @@ class FirefoxSessionManager:
         else:
             self.domains = _normalize_domains(domains)
         self.profiles_root = (
-            Path(profiles_root).expanduser() if profiles_root is not None else None
+            _as_profiles_root(Path(profiles_root).expanduser())
+            if profiles_root is not None
+            else None
         )
-        self.profile_name = profile_name
+        # Environment overrides let a portable install, a second root or a
+        # non-default profile be used through ``arena-api --status`` -- without
+        # editing code -- when nothing on the command line says otherwise.
+        if self.profiles_root is None:
+            override_root = os.environ.get(FIREFOX_ROOT_ENV, "").strip()
+            if override_root:
+                self.profiles_root = _as_profiles_root(
+                    Path(override_root).expanduser()
+                )
+        self.profile_name = profile_name or (
+            os.environ.get(FIREFOX_PROFILE_ENV, "").strip() or None
+        )
         self.cookie_database = (
             Path(cookie_database).expanduser()
             if cookie_database is not None
@@ -434,6 +534,8 @@ class FirefoxSessionManager:
         self.max_cookie_attempts = max_cookie_attempts
         self.lock_retry_delay = lock_retry_delay
         self._profile_path: Path | None = None
+        # profile -> number of matching cookies, filled by profile discovery.
+        self._profile_counts: dict[Path, int] = {}
 
     # ------------------------------------------------------------------ #
     # Profile and database discovery
@@ -445,23 +547,28 @@ class FirefoxSessionManager:
             self._profile_path = self._resolve_profile()
         return self._profile_path
 
-    def _resolve_profile(self) -> Path:
-        root = (
-            Path(self.profiles_root).expanduser()
-            if self.profiles_root is not None
-            else default_profiles_root()
-        )
+    def profiles_roots(self) -> tuple[Path, ...]:
+        """Roots this manager searches, most likely first."""
+        if self.profiles_root is not None:
+            return (Path(self.profiles_root).expanduser(),)
+        return firefox_profiles_roots()
+
+    def _root_candidates(self, root: Path) -> list[Path]:
+        """Profile directories under one root, most likely first.
+
+        ``profiles.ini`` records the installation's default profile and a
+        profile flagged ``Default=1``; anything else is guessed by the usual
+        ``*.default-release`` name and then by which cookie database was
+        written most recently. All of them are returned rather than the first
+        hit -- see :meth:`profile_candidates` for why.
+        """
         if not root.is_dir():
-            raise FirefoxSessionError(
-                f"Firefox profiles directory not found: {root}"
-            )
-        if self.profile_name:
-            candidate = Path(self.profile_name).expanduser()
-            if not candidate.is_absolute():
-                candidate = root / candidate
-            if not candidate.is_dir():
-                raise FirefoxSessionError(f"Firefox profile not found: {candidate}")
-            return candidate
+            return []
+        ordered: list[Path] = []
+
+        def remember(path: Path) -> None:
+            if path.is_dir() and path not in ordered:
+                ordered.append(path)
 
         ini = _read_profiles_ini(root)
         # Firefox 67+ records each installation's default profile here.
@@ -470,37 +577,139 @@ class FirefoxSessionManager:
                 continue
             value = ini.get(section, "Default", fallback=None)
             if value:
-                candidate = _path_from_ini_value(root, value)
-                if candidate.is_dir():
-                    return candidate
+                remember(_path_from_ini_value(root, value))
         for section in ini.sections():
             if not section.startswith("Profile"):
                 continue
             if ini.getboolean(section, "Default", fallback=False):
                 value = ini.get(section, "Path", fallback=None)
                 if value:
-                    candidate = _path_from_ini_value(root, value)
-                    if candidate.is_dir():
-                        return candidate
+                    remember(_path_from_ini_value(root, value))
         candidates = _candidate_profile_dirs(root)
         for hint in DEFAULT_PROFILE_HINTS:
             for candidate in candidates:
                 if candidate.name.endswith(f".{hint}"):
-                    return candidate
+                    remember(candidate)
         with_database = [
             candidate
             for candidate in candidates
             if (candidate / "cookies.sqlite").is_file()
         ]
-        if with_database:
-            return max(
-                with_database,
-                key=lambda item: (item / "cookies.sqlite").stat().st_mtime,
+        for candidate in sorted(
+            with_database,
+            key=lambda item: (item / "cookies.sqlite").stat().st_mtime,
+            reverse=True,
+        ):
+            remember(candidate)
+        for candidate in candidates:
+            # A container directory (``Profiles``, ``Crash Reports``) is not a
+            # profile; a real one always carries at least one of these.
+            if any(
+                (candidate / marker).exists()
+                for marker in ("prefs.js", "times.json", "cookies.sqlite")
+            ):
+                remember(candidate)
+        return ordered
+
+    def profile_candidates(self) -> list[Path]:
+        """Every profile worth reading, most likely first.
+
+        A machine can hold several profiles, and the one ``profiles.ini``
+        calls the default is frequently *not* the one holding the signed-in
+        session (a separate profile made with ``about:profiles``, a work
+        profile, a leftover from an older install). Discovery therefore keeps
+        the whole list and picks by content in :meth:`_resolve_profile`.
+        """
+        if self.profile_name:
+            name = Path(self.profile_name).expanduser()
+            if name.is_absolute():
+                if name.is_dir():
+                    return [name]
+                raise FirefoxSessionError(f"Firefox profile not found: {name}")
+            found: list[Path] = []
+            for root in self.profiles_roots():
+                # ``<root>/<name>`` (unusual), ``<root>/Profiles/<name>`` (the
+                # layout Firefox creates) and any directory of this root whose
+                # name matches -- a profile made with about:profiles is named
+                # by the user and only the directory name is predictable.
+                for candidate in (
+                    root / name,
+                    root / "Profiles" / name,
+                    *(
+                        item
+                        for item in self._root_candidates(root)
+                        if item.name == name
+                    ),
+                ):
+                    if candidate.is_dir() and candidate not in found:
+                        found.append(candidate)
+            if not found:
+                raise FirefoxSessionError(f"Firefox profile not found: {name}")
+            return found
+        roots = self.profiles_roots()
+        existing = [root for root in roots if root.is_dir()]
+        if not existing:
+            listed = ", ".join(str(root) for root in roots)
+            raise FirefoxSessionError(
+                f"Firefox profiles directory not found: {listed}"
             )
-        raise FirefoxSessionError(
-            f"No Firefox profile found under {root}. Install Firefox, open "
-            "arena.ai in it, and sign in."
-        )
+        ordered: list[Path] = []
+        for root in existing:
+            for candidate in self._root_candidates(root):
+                if candidate not in ordered:
+                    ordered.append(candidate)
+        if not ordered:
+            listed = ", ".join(str(root) for root in existing)
+            raise FirefoxSessionError(
+                f"No Firefox profile found under {listed}. Install Firefox, "
+                "open arena.ai in it, and sign in."
+            )
+        return ordered
+
+    def profile_cookie_count(self, profile: Path) -> int:
+        """Matching cookies stored by one profile (0 when unreadable/absent).
+
+        Permission to fail quietly is deliberate: this runs during discovery,
+        where a locked or half-written database of *one* profile must not stop
+        the reader from trying the others.
+        """
+        cached = self._profile_counts.get(profile)
+        if cached is not None:
+            return cached
+        database = profile / "cookies.sqlite"
+        count = 0
+        if database.is_file():
+            try:
+                count = len(read_firefox_cookie_records(database, self.domains))
+            except (sqlite3.DatabaseError, OSError, ValueError):
+                count = 0
+        self._profile_counts[profile] = count
+        return count
+
+    def selection_reason(self) -> str:
+        """One line explaining which profile was chosen and why."""
+        profile = self.profile_path()
+        count = self.profile_cookie_count(profile)
+        domains = ", ".join(self.domains)
+        if count:
+            return (
+                f"{profile} ({count} cookie names for {domains} -- the "
+                "profile that actually holds the session)"
+            )
+        return f"{profile} (no cookies for {domains})"
+
+    def _resolve_profile(self) -> Path:
+        candidates = self.profile_candidates()
+        for candidate in candidates:
+            if self.profile_cookie_count(candidate):
+                if candidate != candidates[0]:
+                    self._emit(
+                        "[arena-api] using Firefox profile "
+                        f"{candidate} (it holds the cookies; "
+                        f"{candidates[0].name} does not)"
+                    )
+                return candidate
+        return candidates[0]
 
     def cookie_database_path(self) -> Path:
         """Return the cookie database of the selected profile."""
@@ -557,6 +766,27 @@ class FirefoxSessionManager:
             grouped.setdefault(host, {})[record["name"]] = record["value"]
         return grouped
 
+    def _rookiepy_is_reading_the_selected_profile(self) -> bool:
+        """Whether ``rookiepy`` would open the very profile that was selected.
+
+        ``rookiepy.firefox()`` always opens the installation's *default*
+        profile. When discovery picked a different one -- a work profile, a
+        second ``about:profiles`` entry, a leftover install -- asking rookiepy
+        returns that other profile's cookies, which is worse than not asking:
+        the values look real and are simply the wrong session. In that case the
+        snapshot reader is used instead, because it reads the profile that was
+        chosen.
+        """
+        if self.cookie_database is not None:
+            return False
+        try:
+            candidates = self.profile_candidates()
+            selected = self.profile_path()
+        except (FirefoxSessionError, OSError):
+            # Nothing to compare against: let rookiepy have its usual turn.
+            return True
+        return bool(candidates) and selected == candidates[0]
+
     def _session_records(
         self, domains: Sequence[str] | None = None
     ) -> list[dict[str, Any]]:
@@ -564,14 +794,21 @@ class FirefoxSessionManager:
             _normalize_domains(domains) if domains is not None else self.domains
         )
         warnings: list[str] = []
-        records = self._rookiepy_records(targets, warnings)
+        if self._rookiepy_is_reading_the_selected_profile():
+            records = self._rookiepy_records(targets, warnings)
+        else:
+            records = None
         if records is None:
-            records = self._sqlite_records(targets, warnings)
-        if records is None:
-            raise FirefoxSessionError(
-                "; ".join(warnings)
-                or "the Firefox cookie store could not be read"
-            )
+            # Reported apart from the notes above: what a caller needs to read
+            # is why the store could not be read, not that an optional
+            # accelerator was absent or skipped.
+            failures: list[str] = []
+            records = self._sqlite_records(targets, failures)
+            if records is None:
+                raise FirefoxSessionError(
+                    "; ".join(failures + warnings)
+                    or "the Firefox cookie store could not be read"
+                )
         return records
 
     def _rookiepy_module(self) -> Any | None:

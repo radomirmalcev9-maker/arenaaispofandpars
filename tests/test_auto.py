@@ -73,6 +73,8 @@ FUTURE = int(time.time()) + 86_400
 ENV_VARS = (
     "ARENA_COOKIE",
     "ARENA_COOKIES_FILE",
+    "ARENA_FIREFOX_ROOT",
+    "ARENA_FIREFOX_PROFILE",
     "ARENA_LOGIN_URL",
     "ARENA_USERNAME",
     "ARENA_PASSWORD",
@@ -2150,3 +2152,138 @@ def test_cli_login_translates_a_browser_failure_into_one_line(tmp_path, monkeypa
     assert "playwright install chromium" in captured.err
     assert len(captured.err.strip().splitlines()) == 1, "the hint must stay one line"
     assert captured.out == ""
+
+
+# --------------------------------------------------------------------------- #
+# Profiles, --diagnose and the redacted report
+# --------------------------------------------------------------------------- #
+
+
+def make_extra_firefox_profile(profiles: Path, name: str, rows) -> Path:
+    """Add one more profile (and its cookie database) to a Firefox tree."""
+    profile = profiles / name
+    profile.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(profile / "cookies.sqlite")
+    connection.executescript(
+        """
+        CREATE TABLE moz_cookies (
+            id INTEGER PRIMARY KEY,
+            originAttributes TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL,
+            value TEXT NOT NULL,
+            host TEXT NOT NULL,
+            path TEXT NOT NULL DEFAULT '/',
+            expiry INTEGER NOT NULL,
+            lastAccessed INTEGER NOT NULL,
+            creationTime INTEGER NOT NULL,
+            isSecure INTEGER NOT NULL,
+            isHttpOnly INTEGER NOT NULL,
+            inBrowserElement INTEGER NOT NULL DEFAULT 0,
+            sameSite INTEGER NOT NULL DEFAULT 0,
+            rawSameSite INTEGER NOT NULL DEFAULT 0,
+            schemeMap INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    connection.executemany(
+        "INSERT INTO moz_cookies"
+        " (name, value, host, path, expiry, lastAccessed, creationTime,"
+        " isSecure, isHttpOnly)"
+        " VALUES (?, ?, ?, '/', ?, 0, 0, 1, 1)",
+        rows,
+    )
+    connection.commit()
+    connection.close()
+    (profile / "prefs.js").write_text("", encoding="utf-8")
+    return profile
+
+
+def test_the_reader_uses_the_profile_that_holds_the_session(tmp_path) -> None:
+    """Discovery must not stop at the profile ``profiles.ini`` calls default."""
+    root = tmp_path / "firefox"
+    (root / "Profiles").mkdir(parents=True)
+    make_extra_firefox_profile(root / "Profiles", "aaaa.default-release", [])
+    make_extra_firefox_profile(
+        root / "Profiles", "bbbb.work", [("session", "from-work", ".arena.ai", FUTURE)]
+    )
+    (root / "profiles.ini").write_text(
+        "[Install1234]\nDefault=Profiles/aaaa.default-release\n", encoding="utf-8"
+    )
+    options = isolated_options(tmp_path, use_browser_profiles=True, profiles_root=root)
+    found = discover_session(options)
+    assert found is not None
+    assert found.source == "firefox"
+    assert found.cookies == {"session": "from-work"}
+    assert "bbbb.work" in found.description
+
+
+def test_explain_lists_every_profile_and_the_selected_one(tmp_path) -> None:
+    root = tmp_path / "firefox"
+    (root / "Profiles").mkdir(parents=True)
+    make_extra_firefox_profile(root / "Profiles", "aaaa.default-release", [])
+    make_extra_firefox_profile(
+        root / "Profiles", "bbbb.work", [("session", "v", ".arena.ai", FUTURE)]
+    )
+    (root / "profiles.ini").write_text(
+        "[Install1234]\nDefault=Profiles/aaaa.default-release\n", encoding="utf-8"
+    )
+    lines = explain_sources(
+        isolated_options(tmp_path, use_browser_profiles=True, profiles_root=root)
+    )
+    joined = "\n".join(lines)
+    assert "Firefox profile     : " in joined and "aaaa.default-release" in joined
+    assert "Firefox profile 2   : " in joined and "bbbb.work" in joined
+    selected = next(line for line in lines if line.startswith("Firefox selected"))
+    assert "bbbb.work" in selected and "holds the session" in selected
+
+
+def test_status_names_the_cookies_without_their_values(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    root = make_firefox_profile(tmp_path, value="do-not-print-me")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_FIREFOX_ROOT", str(root))
+    assert main(["--status", "--no-verify"]) == 0
+    printed = capsys.readouterr().out
+    assert "cookie names      : session" in printed
+    assert "do-not-print-me" not in printed
+
+
+def test_diagnose_prints_a_redacted_report(tmp_path, capsys, monkeypatch) -> None:
+    root = make_firefox_profile(tmp_path, value="ultra-secret-value")
+    monkeypatch.setenv("ARENA_FIREFOX_ROOT", str(root))
+    assert main(["--diagnose"]) == 0
+    printed = capsys.readouterr().out
+    assert "ultra-secret-value" not in printed
+    assert "cookie domains" in printed
+    assert "session" in printed
+    assert "roots searched" in printed
+    assert str(root) in printed
+
+
+def test_diagnose_speaks_json(tmp_path, capsys, monkeypatch) -> None:
+    root = make_firefox_profile(tmp_path, value="ultra-secret-value")
+    monkeypatch.setenv("ARENA_FIREFOX_ROOT", str(root))
+    assert main(["--diagnose", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cookies"]["names"] == ["session"]
+    assert "ultra-secret-value" not in json.dumps(payload)
+
+
+def test_profile_flags_reach_the_options(tmp_path) -> None:
+    args = build_arg_parser().parse_args(
+        ["--profile", "bbbb.work", "--profile-root", str(tmp_path)]
+    )
+    options = _options_from_args(args)
+    assert options.profile_name == "bbbb.work"
+    assert options.profiles_root == str(tmp_path)
+
+
+def test_no_firefox_cookies_mentions_the_diagnose_command(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_FIREFOX_ROOT", str(tmp_path / "empty-root"))
+    assert main(["--explain"]) == 0
+    printed = capsys.readouterr().out
+    assert "--diagnose" in printed
