@@ -77,6 +77,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .auth.autosolve import auto_solve_challenge_on_page
 from .auth.browser import BrowserEnvironment, BrowserEnvironmentOptions, run_sync
 from .auth.captcha import (
     ChallengeWaitSolver,
@@ -2359,6 +2360,44 @@ async def _reclick_send_button_if_unsent(page: Any) -> bool:
     return True
 
 
+async def _replay_eval_with_v2_token(
+    page: Any,
+    eval_url: str,
+    post_data: str,
+    v2_token: str,
+) -> bool:
+    eval_fn = getattr(page, "evaluate", None)
+    if not (callable(eval_fn) and eval_url and post_data and v2_token):
+        return False
+    try:
+        parsed = json.loads(post_data)
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    parsed["recaptchaV2Token"] = v2_token
+    url_literal = json.dumps(eval_url)
+    body_literal = json.dumps(json.dumps(parsed, separators=(",", ":")))
+    script = f"""
+    /* arena_replay_v2 */ () => {{
+      window.fetch({url_literal}, {{
+        method: "POST",
+        credentials: "include",
+        headers: {{
+          "Content-Type": "application/json",
+          "Accept": "text/event-stream, text/plain, */*"
+        }},
+        body: {body_literal}
+      }}).catch(() => {{}});
+      return true;
+    }}
+    """
+    try:
+        return bool(await eval_fn(script))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _submit_prompt_via_composer(
     page: Any,
     prompt: str,
@@ -2511,6 +2550,7 @@ class DirectVerificationToken:
         self.session_cookies = dict(session_cookies) if session_cookies else None
         self.session_manager = session_manager
         self.cookie_source = cookie_source
+        self._explicit_solver = solver is not None
         self._refreshed_cookies: dict[str, str] | None = None
         base = solver or resolve_solver(self.options) or RecaptchaToolkitSolver(
             backend=self.options.captcha_backend
@@ -2536,6 +2576,20 @@ class DirectVerificationToken:
                 f"(backend '{self.solver.backend}' reports them missing)."
             )
 
+    def _check_stream_browser_ready(self) -> None:
+        if BrowserEnvironment is not _DEFAULT_BROWSER_ENVIRONMENT:
+            return
+        if solver_dependencies_available(
+            getattr(self.solver, "backend", "audio")
+        ):
+            return
+        if not _has_spec("playwright"):
+            raise AuthenticationError(
+                "Direct Chat browser verification requires Playwright: "
+                "pip install playwright && python -m playwright install chromium "
+                "(or use --channel chrome / --channel msedge)."
+            )
+
     def _current_cookies(self) -> dict[str, str]:
         merged: dict[str, str] = {}
         if self.session_cookies:
@@ -2553,9 +2607,9 @@ class DirectVerificationToken:
         return merged
 
     async def _mint_token_on_page(self, page: Any) -> str:
-        if isinstance(self.solver, RecaptchaToolkitSolver) and callable(
-            getattr(page, "evaluate", None)
-        ):
+        if isinstance(
+            self.solver, (RecaptchaToolkitSolver, ChallengeWaitSolver)
+        ) and callable(getattr(page, "evaluate", None)):
             js = _build_execute_recaptcha_v3_js(
                 _default_recaptcha_site_key(self.page_url)
             )
@@ -2771,17 +2825,24 @@ class DirectVerificationToken:
             has_network_events = callable(on_fn)
             in_flight_eval_requests = 0
             eval_request_seen = False
+            last_eval_url = ""
+            last_eval_post_data = ""
 
             if has_network_events:
                 assert callable(on_fn)
 
                 def _on_request(req: Any) -> None:
                     nonlocal in_flight_eval_requests, eval_request_seen
+                    nonlocal last_eval_url, last_eval_post_data
                     method = str(getattr(req, "method", "POST") or "POST").upper()
                     url = str(getattr(req, "url", "") or "")
                     if method == "POST" and _is_eval_stream_url(url):
                         eval_request_seen = True
                         in_flight_eval_requests += 1
+                        last_eval_url = url
+                        raw_pd = getattr(req, "post_data", None)
+                        if isinstance(raw_pd, str) and raw_pd:
+                            last_eval_post_data = raw_pd
 
                 def _on_request_failed(req: Any) -> None:
                     nonlocal in_flight_eval_requests
@@ -2952,11 +3013,13 @@ class DirectVerificationToken:
             pending_verification_err: tuple[int, str, dict[str, str]] | None = None
             grace_until = 0.0
             clicked_checkbox_kinds: set[str] = set()
-            solver_attempted_bframe = False
+            auto_solve_attempts = 0
+            solved_v2_token: str | None = None
             notified_user = False
             challenge_active = False
             challenge_cleared_at: float | None = None
             retried_send_after_clear = False
+            replayed_v2_payload = False
 
             while True:
                 now = time.monotonic()
@@ -3001,7 +3064,7 @@ class DirectVerificationToken:
                         raise _RetryInHeadedBrowser(f"HTTP {status}")
                     if (
                         used_composer
-                        and not headless
+                        and (not headless or self.options.solve_captchas is not False)
                         and status in (403, 429, 503)
                         and (
                             _is_verification_rejection(err_body)
@@ -3015,15 +3078,23 @@ class DirectVerificationToken:
                             status, err_body, resp_headers
                         )
 
-                if used_composer and not headless:
+                if used_composer and (
+                    not headless or self.options.solve_captchas is not False
+                ):
                     obs = await _detect_post_submit_challenge(page)
                     obs_kind = obs.get("kind")
                     if isinstance(obs_kind, str) and obs_kind:
                         challenge_active = True
                         challenge_cleared_at = None
-                        interactive_budget = max(timeout, 300.0)
-                        deadline = max(deadline, time.monotonic() + interactive_budget)
-                        grace_until = deadline
+                        if not headless:
+                            interactive_budget = max(timeout, 300.0)
+                            deadline = max(
+                                deadline, time.monotonic() + interactive_budget
+                            )
+                            grace_until = deadline
+                        else:
+                            deadline = max(deadline, time.monotonic() + 60.0)
+                            grace_until = max(grace_until, time.monotonic() + 60.0)
 
                         if (
                             obs_kind in ("recaptcha_anchor", "turnstile", "hcaptcha")
@@ -3038,30 +3109,56 @@ class DirectVerificationToken:
 
                         if (
                             obs_kind == "recaptcha_bframe"
-                            and not solver_attempted_bframe
-                            and _can_auto_solve_bframe(self.solver)
+                            and (
+                                self.options.solve_captchas is not False
+                                or self._explicit_solver
+                            )
+                            and auto_solve_attempts < 2
                         ):
-                            solver_attempted_bframe = True
-                            try:
-                                v2_solver = replace(
-                                    self.solver, version="v2", reload_for_v3=False
+                            auto_solve_attempts += 1
+                            solver_opts = getattr(self.solver, "solver", None)
+                            cap_key = (
+                                getattr(solver_opts, "capsolver_api_key", None)
+                                if solver_opts is not None
+                                else None
+                            )
+                            outcome = await auto_solve_challenge_on_page(
+                                page,
+                                obs,
+                                detect_challenge_fn=_detect_post_submit_challenge,
+                                proxy=resolved_proxy,
+                                capsolver_api_key=cap_key,
+                                toolkit_solver=self.solver,
+                                status_stream=sys.stderr,
+                            )
+                            if outcome.token:
+                                solved_v2_token = outcome.token
+                            if outcome.solved:
+                                challenge_active = False
+                                challenge_cleared_at = time.monotonic()
+                                grace_until = max(
+                                    grace_until, challenge_cleared_at + 15.0
                                 )
-                                await v2_solver.asolve(page)
-                            except Exception:  # noqa: BLE001
-                                pass
+                                continue
                             obs = await _detect_post_submit_challenge(page)
                             obs_kind = obs.get("kind")
 
-                        if isinstance(obs_kind, str) and obs_kind and not notified_user:
-                            notified_user = True
-                            await _safe_bring_to_front(page)
-                            print(
-                                "[arena-api] после отправки появилась капча — "
-                                "решите её в открытом окне браузера "
-                                "(ожидание до 5 мин)...",
-                                file=sys.stderr,
-                                flush=True,
-                            )
+                        if isinstance(obs_kind, str) and obs_kind:
+                            if headless:
+                                if pending_verification_err is not None:
+                                    self._raise_browser_http_error(
+                                        *pending_verification_err
+                                    )
+                            elif not notified_user:
+                                notified_user = True
+                                await _safe_bring_to_front(page)
+                                print(
+                                    "[arena-api] после отправки появилась капча — "
+                                    "решите её в открытом окне браузера "
+                                    "(ожидание до 5 мин)...",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
                     else:
                         if challenge_active:
                             challenge_active = False
@@ -3073,13 +3170,30 @@ class DirectVerificationToken:
                             challenge_cleared_at is not None
                             and not retried_send_after_clear
                             and in_flight_eval_requests == 0
-                            and (time.monotonic() - challenge_cleared_at) >= 2.5
+                            and (time.monotonic() - challenge_cleared_at) >= 2.0
                         ):
                             if await _reclick_send_button_if_unsent(page):
                                 retried_send_after_clear = True
                                 grace_until = max(
                                     grace_until, time.monotonic() + 15.0
                                 )
+                            elif (
+                                not replayed_v2_payload
+                                and solved_v2_token
+                                and last_eval_post_data
+                            ):
+                                replayed = await _replay_eval_with_v2_token(
+                                    page,
+                                    last_eval_url or endpoint_path,
+                                    last_eval_post_data,
+                                    solved_v2_token,
+                                )
+                                if replayed:
+                                    replayed_v2_payload = True
+                                    retried_send_after_clear = True
+                                    grace_until = max(
+                                        grace_until, time.monotonic() + 15.0
+                                    )
                         if (
                             pending_verification_err is not None
                             and not challenge_active
@@ -3209,7 +3323,7 @@ class DirectVerificationToken:
         follow_up: bool = False,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
         """Mint a fresh v3 assertion and stream ``endpoint_path`` inside the same browser tab."""
-        self._check_solver_ready()
+        self._check_stream_browser_ready()
         allow_headed = bool(self.options.interactive)
         is_live_browser = BrowserEnvironment is _DEFAULT_BROWSER_ENVIRONMENT
         profile_dir = (

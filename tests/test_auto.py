@@ -3715,4 +3715,223 @@ def test_live_browser_interactive_skips_headless_preattempt_and_falls_back_if_no
     ]
 
 
+def test_post_submit_bframe_autosolves_without_playwright_recaptcha_or_ffmpeg_and_replays_v2_token(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Direct Chat auto-solves bframe challenges with only Playwright installed (no ffmpeg / playwright-recaptcha)."""
+    from arena_api.auth.autosolve import AutoSolveOutcome
+
+    monkeypatch.setattr(auto_module.shutil, "which", lambda _cmd: None)
+    monkeypatch.setattr(
+        auto_module,
+        "_has_spec",
+        lambda name: name == "playwright",
+    )
+
+    replayed_payloads: list[dict[str, object]] = []
+    autosolve_calls: list[dict[str, object]] = []
+
+    class FakeRequest:
+        def __init__(self, url: str, post_data: str = "") -> None:
+            self.url = url
+            self.method = "POST"
+            self.post_data = post_data
+
+    class FakeResponse:
+        def __init__(self, url: str, status: int, body: str, content_type: str) -> None:
+            self.url = url
+            self.status = status
+            self._body = body
+            self.headers = {"content-type": content_type}
+            self.request = FakeRequest(url)
+
+        async def text(self) -> str:
+            return self._body
+
+    class FakeLocator:
+        def __init__(self, selector: str, page: "AutoSolveBframePage") -> None:
+            self.selector = selector
+            self._page = page
+
+        @property
+        def first(self) -> "FakeLocator":
+            return self
+
+        async def click(self) -> None:
+            if "data-arena-send" in self.selector:
+                self._page._on_initial_send()
+
+        async def fill(self, value: str) -> None:
+            return None
+
+    class FakeKeyboard:
+        async def type(self, text: str, delay: int = 0) -> None:
+            return None
+
+    class FakeMouse:
+        async def move(self, x: float, y: float, steps: int = 1) -> None:
+            return None
+
+    class FakeContext:
+        async def cookies(self, urls=None):
+            return []
+
+        async def add_cookies(self, cookies) -> None:
+            return None
+
+    class AutoSolveBframePage:
+        def __init__(self) -> None:
+            self.context = FakeContext()
+            self.keyboard = FakeKeyboard()
+            self.mouse = FakeMouse()
+            self._listeners: dict[str, list[object]] = {}
+            self._bframe_open = False
+
+        def on(self, event: str, cb: object) -> None:
+            self._listeners.setdefault(event, []).append(cb)
+
+        def remove_listener(self, event: str, cb: object) -> None:
+            return None
+
+        def _emit(self, event: str, payload: object) -> None:
+            for cb in list(self._listeners.get(event, ())):
+                assert callable(cb)
+                cb(payload)
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector, self)
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def content(self) -> str:
+            return "<html><body><form><textarea></textarea><button type='submit'>Send</button></form></body></html>"
+
+        def _on_initial_send(self) -> None:
+            url = "https://arena.ai/nextjs-api/stream/create-evaluation"
+            initial_body = json.dumps(
+                {
+                    "id": "eval-1",
+                    "mode": "direct",
+                    "userMessage": {"content": "Реши сам"},
+                    "recaptchaV3Token": "spent-v3",
+                }
+            )
+            self._emit("request", FakeRequest(url, post_data=initial_body))
+            self._emit(
+                "response",
+                FakeResponse(
+                    url,
+                    403,
+                    '{"error":"recaptcha validation failed"}',
+                    "application/json",
+                ),
+            )
+            self._bframe_open = True
+
+        async def evaluate(self, script: str) -> object:
+            if "arena_cleanup_marks" in script:
+                return None
+            if "composer_nonempty" in script:
+                # Composer was cleared when React submitted, so v2 token replay must fire.
+                return False
+            if "arena_replay_v2" in script:
+                # Extract serialized JSON body passed into window.fetch(...)
+                marker = "body: "
+                idx = script.index(marker) + len(marker)
+                line = script[idx:].splitlines()[0].strip()
+                inner_json = json.loads(line)
+                replayed_payloads.append(json.loads(inner_json))
+                url = "https://arena.ai/nextjs-api/stream/create-evaluation"
+                self._emit("request", FakeRequest(url, post_data=inner_json))
+                self._emit(
+                    "response",
+                    FakeResponse(
+                        url,
+                        200,
+                        'a0:"Решено автоматически без ffmpeg!"\nad:{"finishReason":"stop"}\n',
+                        "text/plain; charset=utf-8",
+                    ),
+                )
+                return True
+            if "data-arena-composer" in script and "data-arena-send" not in script:
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {"found": True, "confidence": "explicit", "x": 650, "y": 700}
+            if "recaptcha_anchor" in script:
+                if self._bframe_open:
+                    return {
+                        "kind": "recaptcha_bframe",
+                        "x": 500,
+                        "y": 400,
+                        "width": 400,
+                        "height": 580,
+                    }
+                return {"kind": None}
+            raise AssertionError(f"unexpected evaluate script: {script[:80]}")
+
+    async def fake_auto_solve(page, obs, **kwargs) -> AutoSolveOutcome:
+        autosolve_calls.append({"obs": dict(obs), "proxy": kwargs.get("proxy")})
+        page._bframe_open = False
+        return AutoSolveOutcome(
+            solved=True,
+            method="audio",
+            token="03AFcWeA_FRESH_V2_TOKEN",
+            rounds=1,
+        )
+
+    class FakeEnv:
+        def __init__(self, options) -> None:
+            self.options = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def new_page(self):
+            return AutoSolveBframePage()
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnv)
+    monkeypatch.setattr(auto_module, "auto_solve_challenge_on_page", fake_auto_solve)
+
+    # solve_captchas="auto" mirrors default real CLI options; without playwright-recaptcha
+    # installed, tok.solver resolves to ChallengeWaitSolver, yet Direct Chat still auto-solves!
+    tok = DirectVerificationToken(
+        isolated_options(
+            tmp_path,
+            base_url="https://arena.ai",
+            proxy="127.0.0.1:10809",
+            solve_captchas="auto",
+            interactive=False,
+        ),
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+    )
+    assert isinstance(tok.solver, ChallengeWaitSolver)
+
+    client = auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        cookies={"arena-auth-prod-v1.0": "jwt"},
+        verification_token=tok,
+        timeout=10.0,
+    )
+    try:
+        answer = client.complete("Реши сам")
+    finally:
+        client.close()
+
+    stderr = capsys.readouterr().err
+    assert answer == "Решено автоматически без ffmpeg!"
+    assert "решите её в открытом окне браузера" not in stderr
+    assert len(autosolve_calls) == 1
+    assert autosolve_calls[0]["proxy"] == "http://127.0.0.1:10809"
+    assert len(replayed_payloads) == 1
+    assert replayed_payloads[0]["recaptchaV2Token"] == "03AFcWeA_FRESH_V2_TOKEN"
+
+
+
 
