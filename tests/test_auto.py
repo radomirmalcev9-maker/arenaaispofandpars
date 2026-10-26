@@ -2293,3 +2293,151 @@ def test_no_firefox_cookies_mentions_the_diagnose_command(
     assert main(["--explain"]) == 0
     printed = capsys.readouterr().out
     assert "--diagnose" in printed
+
+
+def test_has_session_cookie_distinguishes_auth_from_ui_and_edge_cookies() -> None:
+    from arena_api.auto import has_session_cookie
+
+    assert has_session_cookie({"arena-auth-prod-v1.0": "tok"}) is True
+    assert has_session_cookie({"session": "abc"}) is True
+    assert has_session_cookie({"connect.sid": "abc"}) is True
+    assert has_session_cookie({"PHPSESSID": "abc"}) is True
+    assert (
+        has_session_cookie(
+            {
+                "__cf_bm": "1",
+                "_dd_s": "2",
+                "_ga": "3",
+                "_ga_DB32ZN1WHB": "4",
+                "_vcrr_ec68a2456e920849": "5",
+                "arena_build_bucket": "6",
+                "arena_visit_id": "7",
+                "cf_clearance": "8",
+                "cookie-preferences": "9",
+                "provisional_user_id": "10",
+                "sidebar_state": "true",
+                "user_country_code": "SE",
+            }
+        )
+        is False
+    )
+
+
+def test_signed_in_firefox_wins_over_guest_default_storage(
+    tmp_path, monkeypatch
+) -> None:
+    """An incomplete ``--login`` guest file in ``./state/cookies.json`` must not
+    shadow a signed-in Firefox profile."""
+    monkeypatch.chdir(tmp_path)
+    write_storage(
+        tmp_path,
+        {
+            "__cf_bm": "bm",
+            "_dd_s": "dd",
+            "_ga": "ga",
+            "arena_visit_id": "vid",
+            "cf_clearance": "stale-cf",
+            "provisional_user_id": "guest-uuid",
+            "sidebar_state": "true",
+        },
+    )
+    profiles = make_firefox_profile(tmp_path, value="signed-in-firefox")
+    options = AutoOptions(
+        use_browser_profiles=True,
+        profiles_root=profiles,
+        solve_captchas=False,
+        output=io.StringIO(),
+    )
+
+    found = discover_session(options)
+    assert found is not None
+    assert found.source == "firefox"
+    assert found.cookies == {"session": "signed-in-firefox"}
+
+    explained = "\n".join(explain_sources(options))
+    assert "guest/anonymous -- skipped for signed-in profile" in explained
+
+
+def test_explicit_storage_path_still_wins_without_session_cookie(tmp_path) -> None:
+    path = write_storage(tmp_path, {"provisional_user_id": "explicit-guest"})
+    profiles = make_firefox_profile(tmp_path, value="signed-in-firefox")
+    options = AutoOptions(
+        storage_path=path,
+        use_browser_profiles=True,
+        profiles_root=profiles,
+        solve_captchas=False,
+        output=io.StringIO(),
+    )
+    found = discover_session(options)
+    assert found is not None
+    assert found.source == "storage"
+    assert found.cookies == {"provisional_user_id": "explicit-guest"}
+
+
+def test_interactive_wait_solver_opens_a_headed_browser_window(tmp_path) -> None:
+    discovered = DiscoveredSession(
+        source="storage",
+        cookies={"session": "abc"},
+        headers={},
+        description="storage",
+    )
+    headed = build_session_manager(
+        AutoOptions(
+            interactive=True,
+            solve_captchas="auto",
+            channel="chrome",
+            artifacts_dir=tmp_path / "artifacts",
+            output=io.StringIO(),
+        ),
+        discovered,
+    )
+    assert headed.environment_options is not None
+    assert headed.environment_options.headless is False
+    assert headed.environment_options.channel == "chrome"
+
+    headless = build_session_manager(
+        AutoOptions(
+            interactive=False,
+            solve_captchas="auto",
+            artifacts_dir=tmp_path / "artifacts",
+            output=io.StringIO(),
+        ),
+        discovered,
+    )
+    assert headless.environment_options is not None
+    assert headless.environment_options.headless is True
+
+
+def test_cli_status_probes_once_without_launching_refresh_ladder(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """``--status`` must report a Cloudflare challenge and exit 2 immediately
+    instead of launching Playwright to wait out the challenge."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_COOKIE", "session=abc")
+    challenge_html = (
+        b"<html><head><title>Just a moment...</title></head>"
+        b"<body>__cf_chl_rt_tk=123</body></html>"
+    )
+    recorder = Recorder((403, challenge_html, "text/html"))
+    monkeypatch.setattr(auto_module, "impersonation_available", lambda: False)
+
+    real_options_from_args = auto_module._options_from_args
+
+    def with_mock_transport(args):
+        opts = real_options_from_args(args)
+        return replace(opts, http_transport=recorder.transport)
+
+    monkeypatch.setattr(auto_module, "_options_from_args", with_mock_transport)
+
+    def fail_if_refreshed(*args, **kwargs):  # pragma: no cover
+        raise AssertionError("--status must not run AutoSessionManager.refresh_session")
+
+    monkeypatch.setattr(AutoSessionManager, "refresh_session", fail_if_refreshed)
+
+    assert main(["--status", "--no-browser-profiles"]) == 2
+    out = capsys.readouterr().out
+    assert len(recorder.requests) == 1
+    assert "not ok: browser verification challenge" in out
+    assert "impersonate" in out
+

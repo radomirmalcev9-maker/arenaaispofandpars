@@ -343,3 +343,30 @@ def test_far_future_expiry_formats_without_platform_gmtime_limits() -> None:
     assert fingerprint.as_dict()["expires"] == "9999-12-31T23:59:59Z"
     assert "expiry=9999-12-31" in fingerprint.describe()
 
+
+def test_sidebar_state_is_not_marked_as_auth_and_impersonation_is_reported(
+    root: Path,
+) -> None:
+    make_profile(
+        root / "Profiles" / "aaa.default-release",
+        [
+            ("arena-auth-prod-v1.0", SECRET, "arena.ai", FUTURE),
+            ("connect.sid", SECRET, "arena.ai", FUTURE),
+            ("sidebar_state", "true", "arena.ai", FUTURE),
+            ("provisional_user_id", "guest-id", "arena.ai", FUTURE),
+        ],
+    )
+    report = collect_firefox_report(profiles_root=root)
+    by_name = {
+        item["name"]: item["looks_like_auth"]
+        for item in report["profiles"][0]["cookies"]
+    }
+    assert by_name["arena-auth-prod-v1.0"] is True
+    assert by_name["connect.sid"] is True
+    assert by_name["sidebar_state"] is False
+    assert by_name["provisional_user_id"] is False
+    assert "impersonation" in report
+    rendered = "\n".join(format_firefox_report(report))
+    assert "impersonation" in rendered
+
+

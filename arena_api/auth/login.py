@@ -461,12 +461,49 @@ def _domain_matches(domain: str, targets: Sequence[str]) -> bool:
     return False
 
 
+#: Cookies set asynchronously on an unauthenticated landing page (guest IDs,
+#: edge clearance, analytics, UI preferences). Ignoring them in the default
+#: ``before != after`` heuristic prevents an incomplete ``--login`` run from
+#: saving a guest session that later shadows a signed-in browser profile.
+_ANONYMOUS_NOISE_EXACT: frozenset[str] = frozenset(
+    {
+        "__cf_bm",
+        "_cfuvid",
+        "_dd_s",
+        "_ga",
+        "_gat",
+        "_gid",
+        "arena_build_bucket",
+        "arena_visit_id",
+        "cf_clearance",
+        "cookie-preferences",
+        "provisional_user_id",
+        "sidebar_state",
+        "user_country_code",
+    }
+)
+_ANONYMOUS_NOISE_PREFIXES: tuple[str, ...] = (
+    "_ga_",
+    "_gat_",
+    "_vcrr_",
+    "ph_phc_",
+)
+
+
+def _is_anonymous_noise_cookie(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in _ANONYMOUS_NOISE_EXACT or lowered.startswith(
+        _ANONYMOUS_NOISE_PREFIXES
+    )
+
+
 def _fingerprints(cookies: Sequence[Mapping[str, Any]], targets: Sequence[str]) -> set[tuple[str, str]]:
     """``(name, value)`` pairs for the watched domains, for change detection."""
     return {
         (str(cookie.get("name", "")), str(cookie.get("value", "")))
         for cookie in cookies
         if _domain_matches(str(cookie.get("domain", "")), targets)
+        and not _is_anonymous_noise_cookie(str(cookie.get("name", "")))
     }
 
 

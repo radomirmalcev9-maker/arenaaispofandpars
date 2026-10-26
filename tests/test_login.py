@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -854,3 +855,47 @@ def test_a_saved_result_names_the_file() -> None:
     # POSIX literal.
     assert f"saved ({Path('state/cookies.json')})" in result.describe()
     assert "1 cookie(s) for arena.ai" in result.describe()
+
+
+def test_guest_and_analytics_cookies_do_not_count_as_completed_login(
+    tmp_path: Path,
+) -> None:
+    """Async guest/telemetry cookies set on landing must not poison state/cookies.json."""
+    destination = tmp_path / "state" / "cookies.json"
+    guest_only = [
+        cookie("__cf_bm", "bm", domain=".arena.ai"),
+        cookie("_dd_s", "dd"),
+        cookie("_ga", "ga"),
+        cookie("_ga_DB32ZN1WHB", "ga2"),
+        cookie("_vcrr_ec68a2456e920849", "vc"),
+        cookie("arena_build_bucket", "b"),
+        cookie("arena_visit_id", "v"),
+        cookie("cf_clearance", "cf", domain=".arena.ai"),
+        cookie("cookie-preferences", "cp"),
+        cookie("ph_phc_abc_posthog", "ph"),
+        cookie("provisional_user_id", "guest-uuid"),
+        cookie("sidebar_state", "true"),
+        cookie("user_country_code", "SE"),
+    ]
+    signed_in = list(guest_only) + [cookie("arena-auth-prod-v1.0", "jwt-part-0")]
+    environment = FakeEnvironment([[], guest_only, signed_in])
+    output = StringIO()
+
+    result = asyncio.run(
+        alogin_and_save(
+            base_url="https://arena.ai",
+            path=destination,
+            rounds=2,
+            prompt=lambda _: "",
+            output=output,
+            environment=environment,  # type: ignore[arg-type]
+        )
+    )
+
+    assert result.accepted is True
+    assert result.saved is True
+    assert result.attempts == 2
+    assert "no session cookie" in output.getvalue()
+    saved_names = {item["name"] for item in json.loads(destination.read_text())["cookies"]}
+    assert "arena-auth-prod-v1.0" in saved_names
+

@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import io
 import json
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import sys
@@ -77,10 +79,10 @@ def _utc_from_epoch(seconds: int | float) -> datetime:
 
 #: Cookie names that usually carry the session itself, used only to point a
 #: reader at the interesting rows -- never to decide whether a session is valid.
-_AUTH_HINTS: tuple[str, ...] = (
+#: Short stems like ``sid`` and ``sess`` are matched on token boundaries so UI
+#: cookies such as ``sidebar_state`` are not mislabelled as credentials.
+_AUTH_SUBSTRING_HINTS: tuple[str, ...] = (
     "session",
-    "sess",
-    "sid",
     "token",
     "auth",
     "jwt",
@@ -90,6 +92,8 @@ _AUTH_HINTS: tuple[str, ...] = (
     "__secure",
     "__host",
 )
+_AUTH_TOKEN_HINTS: frozenset[str] = frozenset({"sid", "sess"})
+_AUTH_SUFFIX_HINTS: tuple[str, ...] = ("sessid", "sessionid")
 
 _SAME_SITE: dict[int, str] = {0: "none", 1: "lax", 2: "strict"}
 
@@ -199,7 +203,12 @@ def _value_shape(value: str) -> str:
 
 def _looks_like_auth(name: str) -> bool:
     lowered = name.lower()
-    return any(hint in lowered for hint in _AUTH_HINTS)
+    if any(hint in lowered for hint in _AUTH_SUBSTRING_HINTS):
+        return True
+    if lowered.endswith(_AUTH_SUFFIX_HINTS):
+        return True
+    tokens = {part for part in re.split(r"[^a-z0-9]+", lowered) if part}
+    return bool(tokens & _AUTH_TOKEN_HINTS)
 
 
 # --------------------------------------------------------------------------- #
@@ -441,6 +450,15 @@ def _rookiepy_state() -> str:
     return "installed"
 
 
+def _impersonation_state() -> str:
+    """Whether browser TLS fingerprint impersonation is available."""
+    has_curl = importlib.util.find_spec("curl_cffi") is not None
+    has_transport = importlib.util.find_spec("httpx_curl_cffi") is not None
+    if has_curl and has_transport:
+        return "installed (curl_cffi + httpx_curl_cffi)"
+    return 'not installed (pip install -e ".[impersonate]")'
+
+
 def collect_firefox_report(
     *,
     domains: Sequence[str] | None = None,
@@ -482,6 +500,7 @@ def collect_firefox_report(
             name: "set" for name in _REPORTED_ENV if os.environ.get(name, "").strip()
         },
         "rookiepy": _rookiepy_state(),
+        "impersonation": _impersonation_state(),
         "roots": [
             {
                 "path": str(root),
@@ -691,6 +710,8 @@ def format_firefox_report(report: Mapping[str, Any]) -> list[str]:
     )
     line("cookie domains", ", ".join(report.get("domains") or []))
     line("rookiepy", report.get("rookiepy", "unknown"))
+    if "impersonation" in report:
+        line("impersonation", report.get("impersonation"))
     environment = report.get("environment") or {}
     line(
         "env overrides",
