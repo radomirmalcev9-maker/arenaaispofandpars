@@ -2586,4 +2586,225 @@ def test_cli_explain_redacts_proxy_credentials(
     assert "alice" not in out
 
 
+def test_direct_verification_token_forwards_proxy_channel_cookies_and_fast_js(
+    tmp_path, monkeypatch
+) -> None:
+    seen_env_options: list[object] = []
+    added_cookies: list[list[dict[str, str]]] = []
+    solver_calls: list[object] = []
 
+    class FakeContext:
+        async def add_cookies(self, cookies):
+            added_cookies.append(list(cookies))
+
+    class JsPage:
+        def __init__(self) -> None:
+            self.context = FakeContext()
+            self.visited: list[str] = []
+
+        async def goto(self, url: str, **kwargs) -> None:
+            self.visited.append(url)
+
+        async def evaluate(self, script: str):
+            assert "chat_submit" in script
+            return "fast-v3-assertion"
+
+    class CapturingEnv:
+        def __init__(self, options) -> None:
+            seen_env_options.append(options)
+            self.page = JsPage()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def new_page(self):
+            return self.page
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", CapturingEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+    solver = RecaptchaToolkitSolver()
+    monkeypatch.setattr(
+        solver,
+        "asolve",
+        lambda page: solver_calls.append(page),
+    )
+
+    factory = DirectVerificationToken(
+        isolated_options(
+            tmp_path,
+            base_url="https://arena.ai",
+            proxy="http://127.0.0.1:10809",
+            channel="msedge",
+        ),
+        solver=solver,
+        session_cookies={"cf_clearance": "cf1", "arena-auth-prod-v1.0": "jwt"},
+    )
+    assert factory() == "fast-v3-assertion"
+    assert solver_calls == []
+    assert len(seen_env_options) == 1
+    env_opt = seen_env_options[0]
+    assert env_opt.proxy == "http://127.0.0.1:10809"
+    assert env_opt.channel == "msedge"
+    assert added_cookies == [
+        [
+            {"name": "cf_clearance", "value": "cf1", "url": "https://arena.ai"},
+            {"name": "arena-auth-prod-v1.0", "value": "jwt", "url": "https://arena.ai"},
+        ]
+    ]
+
+
+def test_direct_verification_token_missing_browser_binary_gives_actionable_error(
+    tmp_path, monkeypatch
+) -> None:
+    class MissingBrowserEnv:
+        def __init__(self, options) -> None:
+            pass
+
+        async def __aenter__(self):
+            raise RuntimeError(
+                "BrowserType.launch: Executable doesn't exist at C:\\ms-playwright\\chromium.exe"
+            )
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", MissingBrowserEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+    factory = DirectVerificationToken(
+        isolated_options(tmp_path),
+        solver=RecaptchaToolkitSolver(),
+    )
+    with pytest.raises(AuthenticationError, match="--channel msedge"):
+        factory()
+
+
+def test_cli_prompt_falls_back_to_direct_chat_and_selects_ranked_text_model(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_COOKIE", "arena-auth-prod-v1.0=tok")
+    monkeypatch.setenv("ARENA_VERIFICATION_TOKEN", "env-v3-tok")
+
+    img_id = "11111111-1111-1111-1111-111111111111"
+    flash_id = "22222222-2222-2222-2222-222222222222"
+    direct_markup = (
+        '<html><script id="__NEXT_DATA__" type="application/json">'
+        + json.dumps(
+            {
+                "props": {
+                    "pageProps": {
+                        "models": [
+                            {"id": img_id, "publicName": "flux-1-schnell"},
+                            {"id": flash_id, "publicName": "gemini-2.5-flash"},
+                        ]
+                    }
+                }
+            }
+        )
+        + "</script></html>"
+    ).encode("utf-8")
+    sent_bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/config":
+            return httpx.Response(404, text="not found")
+        if request.url.path == "/text/direct":
+            return httpx.Response(
+                200, content=direct_markup, headers={"content-type": "text/html"}
+            )
+        if request.url.path == "/nextjs-api/stream/create-evaluation":
+            sent_bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b'a0:"\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82!"\nad:{"finishReason":"stop"}\n',
+            )
+        raise AssertionError(request.url)
+
+    real_from_args = auto_module._options_from_args
+    monkeypatch.setattr(
+        auto_module,
+        "_options_from_args",
+        lambda args: replace(
+            real_from_args(args), http_transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    assert main(["--prompt", "Hi!", "--no-browser-profiles"]) == 0
+    captured = capsys.readouterr()
+    assert "model             : gemini-2.5-flash" in captured.out
+    assert "answer            : Привет!" in captured.out
+    assert captured.err.count("[arena-api] session:") == 1
+    assert len(sent_bodies) == 1
+    assert sent_bodies[0]["modelAId"] == flash_id
+    assert sent_bodies[0]["recaptchaV3Token"] == "env-v3-tok"
+
+
+def test_cli_prompt_honors_explicit_model_and_verification_token_flags(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_COOKIE", "arena-auth-prod-v1.0=tok")
+    custom_id = "33333333-3333-3333-3333-333333333333"
+    direct_markup = (
+        '<html><script id="__NEXT_DATA__" type="application/json">'
+        + json.dumps(
+            {
+                "props": {
+                    "pageProps": {
+                        "models": [{"id": custom_id, "publicName": "claude-sonnet-4-6"}]
+                    }
+                }
+            }
+        )
+        + "</script></html>"
+    ).encode("utf-8")
+    sent_bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/config":
+            return httpx.Response(404, text="not found")
+        if request.url.path == "/text/direct":
+            return httpx.Response(
+                200, content=direct_markup, headers={"content-type": "text/html"}
+            )
+        if request.url.path == "/nextjs-api/stream/create-evaluation":
+            sent_bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b'a0:"4"\nad:{"finishReason":"stop"}\n',
+            )
+        raise AssertionError(request.url)
+
+    real_from_args = auto_module._options_from_args
+    monkeypatch.setattr(
+        auto_module,
+        "_options_from_args",
+        lambda args: replace(
+            real_from_args(args), http_transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    assert (
+        main(
+            [
+                "--no-browser-profiles",
+                "--model",
+                "claude-sonnet-4-6",
+                "--verification-token",
+                "cli-v3-tok",
+                "--prompt",
+                "2+2?",
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "model             : claude-sonnet-4-6" in captured.out
+    assert "answer            : 4" in captured.out
+    assert sent_bodies[0]["modelAId"] == custom_id
+    assert sent_bodies[0]["recaptchaV3Token"] == "cli-v3-tok"

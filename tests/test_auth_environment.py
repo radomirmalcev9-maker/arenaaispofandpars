@@ -241,3 +241,25 @@ def test_stamp_is_utc_and_sortable() -> None:
     second = BrowserEnvironment.stamp()
     assert first.endswith("Z")
     assert first <= second
+
+
+def test_launch_kwargs_configures_playwright_proxy() -> None:
+    assert "proxy" not in BrowserEnvironmentOptions().launch_kwargs()
+
+    http_kwargs = BrowserEnvironmentOptions(
+        proxy="http://127.0.0.1:10809"
+    ).launch_kwargs()
+    assert http_kwargs["proxy"] == {"server": "http://127.0.0.1:10809"}
+
+    socks_kwargs = BrowserEnvironmentOptions(
+        proxy="socks5h://alice:s%40cret@127.0.0.1:10808"
+    ).launch_kwargs()
+    assert socks_kwargs["proxy"] == {
+        "server": "socks5://127.0.0.1:10808",
+        "username": "alice",
+        "password": "s@cret",
+    }
+
+    with pytest.raises(ValueError, match="Unsupported browser proxy"):
+        BrowserEnvironmentOptions(proxy="ftp://127.0.0.1:21").launch_kwargs()
+

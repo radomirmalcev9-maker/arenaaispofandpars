@@ -173,15 +173,15 @@ def _walk_models(value: Any, models: dict[str, ModelInfo]) -> None:
         )
         if model_id is not None and display is not None:
             model_id = str(model_id)
-            models.setdefault(
-                model_id,
-                ModelInfo(
-                    id=model_id,
-                    display_name=str(display),
-                    available=bool(value.get("available", value.get("active", True))),
-                    metadata=dict(value),
-                ),
+            candidate = ModelInfo(
+                id=model_id,
+                display_name=str(display),
+                available=bool(value.get("available", value.get("active", True))),
+                metadata=dict(value),
             )
+            existing = models.get(model_id)
+            if existing is None or len(candidate.metadata) > len(existing.metadata):
+                models[model_id] = candidate
         for child in value.values():
             _walk_models(child, models)
     elif isinstance(value, (list, tuple)):
@@ -308,20 +308,32 @@ def _is_done_frame(kind: str, value: Any) -> bool:
 def _update_direct_text(
     kind: str, value: Any, previous: str
 ) -> tuple[str, StreamChunk | None, bool]:
-    if kind in {"3", "error"} or (isinstance(value, Mapping) and value.get("error")):
+    if kind in {"3", "a3", "b3", "error"} or (
+        isinstance(value, Mapping) and value.get("error")
+    ):
         detail = value.get("error", value) if isinstance(value, Mapping) else value
         raise ProtocolError(f"Arena Direct Chat stream reported an error: {detail}")
+    if kind in {"0", "a0", "b0"} and value == "hasArenaError":
+        raise ProtocolError("Arena Direct Chat stream reported an error: hasArenaError")
 
     text_value: Any = value
+    is_delta_field = kind in {"0", "a0", "text_delta", "text-delta"}
     if isinstance(value, Mapping):
-        text_value = next(
-            (
-                value.get(key)
-                for key in ("delta", "text", "content")
-                if isinstance(value.get(key), str)
-            ),
-            None,
-        )
+        if isinstance(value.get("delta"), str):
+            text_value = value["delta"]
+            is_delta_field = True
+        elif isinstance(value.get("textDelta"), str):
+            text_value = value["textDelta"]
+            is_delta_field = True
+        else:
+            text_value = next(
+                (
+                    value.get(key)
+                    for key in ("text", "content")
+                    if isinstance(value.get(key), str)
+                ),
+                None,
+            )
         if text_value is None and _is_text_frame(kind):
             text_value = value.get("value")
     if text_value is None and kind == "message" and isinstance(value, str):
@@ -330,16 +342,30 @@ def _update_direct_text(
     current = previous
     chunk: StreamChunk | None = None
     if _is_text_frame(kind) and isinstance(text_value, str):
-        current = (
-            text_value if text_value.startswith(previous) else previous + text_value
-        )
-        delta = current[len(previous) :]
+        if is_delta_field:
+            current = previous + text_value
+            delta = text_value
+        else:
+            current = (
+                text_value
+                if (previous and text_value.startswith(previous))
+                else previous + text_value
+            )
+            delta = current[len(previous) :]
         if delta:
             chunk = StreamChunk(
                 text=current, delta=delta, event="text", raw={kind: value}
             )
     finished = _is_done_frame(kind, value)
     if finished:
+        if (
+            isinstance(value, Mapping)
+            and value.get("finishReason") == "error"
+            and not current
+        ):
+            raise ProtocolError(
+                "Arena Direct Chat stream finished with finishReason='error'."
+            )
         chunk = StreamChunk(
             text=current, delta="", event="completed", finished=True, raw={kind: value}
         )
@@ -374,26 +400,85 @@ def _check_direct_prefix(wire: bytes, response: httpx.Response) -> None:
         raise ProtocolError("Direct Chat expected a stream but received HTML.")
 
 
+_SSE_PREFIXES: tuple[str, ...] = ("data:", "event:", "id:", "retry:", ":")
+_MAX_REASONABLE_CHAT_RANK = 100_000
+
+
+def _looks_like_standard_sse(prefix_bytes: bytes) -> bool:
+    stripped = prefix_bytes.decode("utf-8", "replace").lstrip()
+    return stripped.startswith(_SSE_PREFIXES)
+
+
+def _has_capability(caps: Any, key: str) -> bool:
+    if isinstance(caps, Mapping):
+        return bool(caps.get(key))
+    if isinstance(caps, (list, tuple, set)):
+        return key in caps
+    return False
+
+
+def model_chat_score(item: ModelInfo) -> int:
+    """Rank how suitable ``item`` is for text Direct Chat (lower is better).
+
+    ``initialModels`` on ``arena.ai`` mixes ranked Direct Chat models with
+    hidden, image/video-only, or webdev-only twin UUIDs whose ``chat`` rank is
+    a huge sentinel and which 404 on ``create-evaluation`` in ``chat`` mode.
+    """
+    meta = item.metadata or {}
+    score = 0
+    if meta.get("userSelectable") is False:
+        score += 1_000_000
+    caps = meta.get("capabilities")
+    if isinstance(caps, Mapping):
+        in_caps = caps.get("inputCapabilities")
+        if in_caps is not None and not _has_capability(in_caps, "text"):
+            score += 100_000
+        out_caps = caps.get("outputCapabilities")
+        if out_caps is not None and not _has_capability(out_caps, "text"):
+            score += 50_000
+    rank_by_mod = meta.get("rankByModality")
+    chat_rank = (
+        rank_by_mod.get("chat") if isinstance(rank_by_mod, Mapping) else None
+    )
+    if isinstance(chat_rank, (int, float)) and not isinstance(chat_rank, bool):
+        r = int(chat_rank)
+        score += r if r < _MAX_REASONABLE_CHAT_RANK else 100_000 + min(r, 1_000_000)
+    elif isinstance(meta.get("rank"), (int, float)) and not isinstance(
+        meta.get("rank"), bool
+    ):
+        score += 10_000 + int(meta["rank"])
+    elif caps is not None or rank_by_mod is not None:
+        score += 20_000
+    return score
+
+
 def _iter_response_records(response: httpx.Response) -> Iterator[tuple[str, Any]]:
     content_type = response.headers.get("content-type", "").lower()
-    if "text/event-stream" in content_type:
+    chunks = response.iter_bytes()
+    head = bytearray()
+    for wire in chunks:
+        if not wire:
+            continue
+        head.extend(wire)
+        if b":" in head or b"\n" in head or len(head) >= 64:
+            break
+    if not head:
+        return
+    head_bytes = bytes(head)
+    _check_direct_prefix(head_bytes, response)
+    if "text/event-stream" in content_type and _looks_like_standard_sse(head_bytes):
         sse_parser = SSEParser()
-        first_chunk = True
-        for wire in response.iter_bytes():
-            if first_chunk:
-                _check_direct_prefix(wire, response)
-                first_chunk = False
+        for event_name, data in sse_parser.feed(head_bytes):
+            yield from _records_from_sse_event(event_name, data)
+        for wire in chunks:
             for event_name, data in sse_parser.feed(wire):
                 yield from _records_from_sse_event(event_name, data)
         for event_name, data in sse_parser.close():
             yield from _records_from_sse_event(event_name, data)
         return
     ai_parser = AIDataStreamParser()
-    first_chunk = True
-    for wire in response.iter_bytes():
-        if first_chunk:
-            _check_direct_prefix(wire, response)
-            first_chunk = False
+    yield from ai_parser.feed(head_bytes)
+    for wire in chunks:
         yield from ai_parser.feed(wire)
     yield from ai_parser.close()
 
@@ -402,13 +487,24 @@ async def _aiter_response_records(
     response: httpx.Response,
 ) -> AsyncIterator[tuple[str, Any]]:
     content_type = response.headers.get("content-type", "").lower()
-    if "text/event-stream" in content_type:
+    chunks = response.aiter_bytes()
+    head = bytearray()
+    async for wire in chunks:
+        if not wire:
+            continue
+        head.extend(wire)
+        if b":" in head or b"\n" in head or len(head) >= 64:
+            break
+    if not head:
+        return
+    head_bytes = bytes(head)
+    _check_direct_prefix(head_bytes, response)
+    if "text/event-stream" in content_type and _looks_like_standard_sse(head_bytes):
         sse_parser = SSEParser()
-        first_chunk = True
-        async for wire in response.aiter_bytes():
-            if first_chunk:
-                _check_direct_prefix(wire, response)
-                first_chunk = False
+        for event_name, data in sse_parser.feed(head_bytes):
+            for item in _records_from_sse_event(event_name, data):
+                yield item
+        async for wire in chunks:
             for event_name, data in sse_parser.feed(wire):
                 for item in _records_from_sse_event(event_name, data):
                     yield item
@@ -417,11 +513,9 @@ async def _aiter_response_records(
                 yield item
         return
     ai_parser = AIDataStreamParser()
-    first_chunk = True
-    async for wire in response.aiter_bytes():
-        if first_chunk:
-            _check_direct_prefix(wire, response)
-            first_chunk = False
+    for item in ai_parser.feed(head_bytes):
+        yield item
+    async for wire in chunks:
         for item in ai_parser.feed(wire):
             yield item
     for item in ai_parser.close():
@@ -480,18 +574,37 @@ class _DirectMixin:
             raise ModelUnavailableError(
                 "Pass a model id or display name returned by get_models()."
             )
-        folded = model.casefold()
         for item in known:
-            if (
-                model == item.id
-                or model == item.display_name
-                or folded == (item.display_name or "").casefold()
-            ):
+            if model == item.id:
                 if not item.available:
                     raise ModelUnavailableError(
                         f"Model {model!r} is currently unavailable."
                     )
                 return item.id
+        folded = model.casefold()
+        matches: list[ModelInfo] = []
+        for item in known:
+            meta = item.metadata or {}
+            candidates = (
+                item.display_name,
+                meta.get("publicName"),
+                meta.get("public_name"),
+                meta.get("displayName"),
+                meta.get("display_name"),
+                meta.get("name"),
+            )
+            if any(
+                isinstance(name, str) and (model == name or folded == name.casefold())
+                for name in candidates
+            ):
+                matches.append(item)
+        if matches:
+            available = [item for item in matches if item.available]
+            if not available:
+                raise ModelUnavailableError(
+                    f"Model {model!r} is currently unavailable."
+                )
+            return min(available, key=model_chat_score).id
         raise ModelUnavailableError(
             f"Model {model!r} was not found in the current Direct Chat model list."
         )
@@ -603,8 +716,8 @@ class DirectArenaClient(_DirectMixin):
             "POST",
             self.direct_stream_path,
             headers={
-                "content-type": "text/plain;charset=UTF-8",
-                "accept": "text/plain, text/event-stream, */*",
+                "content-type": "application/json",
+                "accept": "text/event-stream, text/plain, */*",
             },
             content=json.dumps(body, separators=(",", ":")),
             timeout=httpx.Timeout(generation.queue_timeout),
@@ -844,8 +957,8 @@ class AsyncDirectArenaClient(_DirectMixin):
             "POST",
             self.direct_stream_path,
             headers={
-                "content-type": "text/plain;charset=UTF-8",
-                "accept": "text/plain, text/event-stream, */*",
+                "content-type": "application/json",
+                "accept": "text/event-stream, text/plain, */*",
             },
             content=json.dumps(body, separators=(",", ":")),
             timeout=httpx.Timeout(generation.queue_timeout),

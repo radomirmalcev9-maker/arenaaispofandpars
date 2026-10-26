@@ -96,7 +96,12 @@ from .auth.firefox_session import (
 from .auth.session import BrowserSessionManager, FormLoginFlow, LoginFlow
 from .client import ArenaClient, AsyncArenaClient
 from .constants import CONFIG_PATH, DEFAULT_BASE_URL, DEFAULT_TIMEOUT
-from .direct import DIRECT_PAGE_PATH, AsyncDirectArenaClient, DirectArenaClient
+from .direct import (
+    DIRECT_PAGE_PATH,
+    AsyncDirectArenaClient,
+    DirectArenaClient,
+    model_chat_score,
+)
 from .exceptions import (
     ArenaError,
     AuthenticationError,
@@ -1235,6 +1240,20 @@ def build_session_manager(
     capture_dir = (
         Path(options.artifacts_dir) / "challenges" if options.artifacts_dir else None
     )
+    fallback_proxy = None
+    if discovered.manager is not None:
+        getter = getattr(discovered.manager, "proxy_url", None)
+        if callable(getter):
+            parsed_url = urlparse(options.base_url)
+            try:
+                fallback_proxy = getter(
+                    scheme=parsed_url.scheme or "https", host=parsed_url.hostname
+                )
+            except Exception:  # noqa: BLE001
+                fallback_proxy = None
+    resolved_proxy = resolve_proxy_url(
+        options.base_url, options.proxy, fallback_proxy=fallback_proxy
+    )
     manager = AutoSessionManager(
         base_url=options.base_url,
         domains=options.cookie_domains(),
@@ -1249,6 +1268,7 @@ def build_session_manager(
         environment_options=BrowserEnvironmentOptions(
             headless=not _solver_needs_headed_window(solver),
             channel=options.channel,
+            proxy=resolved_proxy,
             artifacts_dir=options.artifacts_dir,
         ),
         login_flow=login_flow_from_env(options),
@@ -1507,6 +1527,68 @@ def _token_solver(solver: Any) -> Any:
     return solver
 
 
+_EXECUTE_RECAPTCHA_V3_JS = """
+async () => {
+    const deadline = Date.now() + 4000;
+    let g = null;
+    while (Date.now() < deadline) {
+        g = (window.grecaptcha && window.grecaptcha.enterprise) || window.grecaptcha;
+        if (g && typeof g.execute === "function") break;
+        await new Promise((r) => setTimeout(r, 150));
+    }
+    if (!g || typeof g.execute !== "function") return null;
+    let siteKey = null;
+    for (const el of document.querySelectorAll("script[src*='recaptcha']")) {
+        try {
+            const u = new URL(el.src, location.href);
+            const k = u.searchParams.get("render");
+            if (k && k !== "explicit") { siteKey = k; break; }
+        } catch (_) {}
+    }
+    if (!siteKey) {
+        for (const el of document.querySelectorAll("iframe[src*='recaptcha']")) {
+            try {
+                const u = new URL(el.src, location.href);
+                const k = u.searchParams.get("k");
+                if (k) { siteKey = k; break; }
+            } catch (_) {}
+        }
+    }
+    if (!siteKey) {
+        const el = document.querySelector("[data-sitekey]");
+        if (el) siteKey = el.getAttribute("data-sitekey");
+    }
+    if (!siteKey && window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
+        const seen = new Set();
+        const stack = [window.___grecaptcha_cfg.clients];
+        while (stack.length && !siteKey) {
+            const cur = stack.pop();
+            if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
+            seen.add(cur);
+            for (const v of Object.values(cur)) {
+                if (typeof v === "string" && /^6L[A-Za-z0-9_-]{38}$/.test(v)) {
+                    siteKey = v;
+                    break;
+                }
+                if (v && typeof v === "object") stack.push(v);
+            }
+        }
+    }
+    if (!siteKey) return null;
+    return await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), 15000);
+        const run = () => {
+            Promise.resolve(g.execute(siteKey, { action: "chat_submit" }))
+                .then((tok) => { clearTimeout(timer); resolve(tok || null); })
+                .catch(() => { clearTimeout(timer); resolve(null); });
+        };
+        if (typeof g.ready === "function") g.ready(run);
+        else run();
+    });
+}
+"""
+
+
 class DirectVerificationToken:
     """Callable producing a fresh reCAPTCHA v3 assertion for Direct Chat.
 
@@ -1529,11 +1611,13 @@ class DirectVerificationToken:
         *,
         page_url: str | None = None,
         solver: Any | None = None,
+        session_cookies: Mapping[str, str] | None = None,
     ) -> None:
         self.options = options or AutoOptions()
         self.page_url = page_url or (
             self.options.base_url.rstrip("/") + DIRECT_PAGE_PATH
         )
+        self.session_cookies = dict(session_cookies) if session_cookies else None
         base = solver or resolve_solver(self.options) or RecaptchaToolkitSolver(
             backend=self.options.captcha_backend
         )
@@ -1563,20 +1647,71 @@ class DirectVerificationToken:
                 "'.[auth-captcha]' and playwright install chromium "
                 f"(backend '{self.solver.backend}' reports them missing)."
             )
-        options = BrowserEnvironmentOptions.with_captcha_solving(
-            self.solver, headless=True, artifacts_dir=self.options.artifacts_dir
+        resolved_proxy = resolve_proxy_url(
+            self.options.base_url,
+            self.options.proxy,
+            fallback_proxy=_firefox_fallback_proxy(self.options),
         )
-        async with BrowserEnvironment(options) as environment:
-            page = await environment.new_page()
-            await page.goto(self.page_url, wait_until="domcontentloaded")
-            attempt = await self.solver.asolve(page)
-            token = attempt.raise_for_status()
-            if not token:
+        env_kwargs: dict[str, Any] = {
+            "headless": True,
+            "artifacts_dir": self.options.artifacts_dir,
+        }
+        if self.options.channel:
+            env_kwargs["channel"] = self.options.channel
+        if resolved_proxy:
+            env_kwargs["proxy"] = resolved_proxy
+        options = BrowserEnvironmentOptions.with_captcha_solving(
+            self.solver, **env_kwargs
+        )
+        try:
+            async with BrowserEnvironment(options) as environment:
+                page = await environment.new_page()
+                context = getattr(page, "context", None)
+                if (
+                    self.session_cookies
+                    and context is not None
+                    and callable(getattr(context, "add_cookies", None))
+                ):
+                    await context.add_cookies(
+                        [
+                            {
+                                "name": str(name),
+                                "value": str(value),
+                                "url": self.options.base_url,
+                            }
+                            for name, value in self.session_cookies.items()
+                        ]
+                    )
+                await page.goto(self.page_url, wait_until="domcontentloaded")
+                if isinstance(self.solver, RecaptchaToolkitSolver) and callable(
+                    getattr(page, "evaluate", None)
+                ):
+                    try:
+                        direct_tok = await page.evaluate(_EXECUTE_RECAPTCHA_V3_JS)
+                    except Exception:  # noqa: BLE001
+                        direct_tok = None
+                    if isinstance(direct_tok, str) and direct_tok.strip():
+                        return direct_tok.strip()
+                attempt = await self.solver.asolve(page)
+                token = attempt.raise_for_status()
+                if not token:
+                    raise AuthenticationError(
+                        "the solver cleared the page but produced no assertion "
+                        f"({attempt.describe()}); Direct Chat needs a v3 token"
+                    )
+                return token
+        except ArenaError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            if "Executable doesn't exist" in str(exc):
                 raise AuthenticationError(
-                    "the solver cleared the page but produced no assertion "
-                    f"({attempt.describe()}); Direct Chat needs a v3 token"
-                )
-            return token
+                    f"Direct Chat verification browser could not be started: {detail} "
+                    "Install Chromium (`python -m playwright install chromium`) or "
+                    "use your installed browser with `--channel msedge` / "
+                    "`--channel chrome`."
+                ) from exc
+            raise
 
     def _require_a_token_solver(self) -> None:
         """Refuse a solver that cannot produce a reCAPTCHA token.
@@ -1625,7 +1760,9 @@ def auto_direct_client(
         raise AuthenticationError("no session found")
     manager, _ = prepared
     if isinstance(verification_token, str) and verification_token.strip().lower() == "auto":
-        verification_token = DirectVerificationToken(options)
+        verification_token = DirectVerificationToken(
+            options, session_cookies=manager.load_cookies()
+        )
     return _verified(
         DirectArenaClient(
             base_url=options.base_url,
@@ -1657,7 +1794,9 @@ async def auto_async_direct_client(
         raise AuthenticationError("no session found")
     manager, _ = prepared
     if isinstance(verification_token, str) and verification_token.strip().lower() == "auto":
-        verification_token = DirectVerificationToken(options)
+        verification_token = DirectVerificationToken(
+            options, session_cookies=manager.load_cookies()
+        )
     return await _averified(
         AsyncDirectArenaClient(
             base_url=options.base_url,
@@ -1825,6 +1964,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--explain", action="store_true", help="list every source considered and why"
     )
     parser.add_argument("--models", action="store_true", help="print the model list")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="model id or display name for --prompt (default: auto-select)",
+    )
+    parser.add_argument(
+        "--verification-token",
+        default=None,
+        metavar="TOKEN",
+        help=(
+            "Direct Chat reCAPTCHA v3 assertion, or 'auto' (default when Direct "
+            "Chat is used; also ARENA_VERIFICATION_TOKEN)"
+        ),
+    )
     parser.add_argument("--prompt", default=None, help="send one prompt and print the answer")
     return parser
 
@@ -1967,6 +2120,107 @@ def _login(
     return 0 if outcome.verification.ok else 2
 
 
+_NON_TEXT_MODEL_HINTS: tuple[str, ...] = (
+    "image",
+    "video",
+    "flux",
+    "imagen",
+    "midjourney",
+    "ideogram",
+    "recraft",
+    "seedream",
+    "suno",
+    "veo",
+    "sora",
+    "kling",
+    "hailuo",
+    "runway",
+    "pika",
+    "luma",
+    "kontext",
+)
+_PREFERRED_DEFAULT_MODELS: tuple[str, ...] = (
+    "gemini-2.5-flash",
+    "gemini-3-flash",
+    "claude-haiku-4-5-20251001",
+    "gpt-4.1-mini",
+    "gpt-4o-mini",
+)
+
+
+def _default_direct_chat_model(models: Sequence[Any]) -> str:
+    """Pick a fast text chat model when ``--model`` was omitted on Direct Chat."""
+    available = [item for item in models if getattr(item, "available", True)]
+    pool = available or list(models)
+    if not pool:
+        raise ArenaError("No Direct Chat models were found on the frontend.")
+    text_pool = [
+        item
+        for item in pool
+        if not any(
+            hint
+            in f"{getattr(item, 'display_name', '')} {getattr(item, 'id', '')}".lower()
+            for hint in _NON_TEXT_MODEL_HINTS
+        )
+    ] or pool
+    ranked = sorted(text_pool, key=model_chat_score)
+    by_name: dict[str, Any] = {}
+    for item in ranked:
+        key = str(getattr(item, "display_name", "")).casefold()
+        by_name.setdefault(key, item)
+    for preferred in _PREFERRED_DEFAULT_MODELS:
+        match = by_name.get(preferred.casefold())
+        if match is not None and model_chat_score(match) < 50_000:
+            return str(getattr(match, "display_name", None) or match.id)
+    chosen = ranked[0]
+    return str(getattr(chosen, "display_name", None) or chosen.id)
+
+
+def _direct_client_for_cli(
+    client: Any,
+    options: AutoOptions,
+    *,
+    verification_token: Any = None,
+) -> Any:
+    """Build a :class:`DirectArenaClient` reusing ``client.session_manager``."""
+    shared_manager = getattr(client, "session_manager", None)
+    if shared_manager is not None:
+        tok = verification_token
+        if isinstance(tok, str) and tok.strip().lower() == "auto":
+            tok = DirectVerificationToken(
+                options, session_cookies=shared_manager.load_cookies()
+            )
+        return DirectArenaClient(
+            base_url=options.base_url,
+            session_source=shared_manager,
+            headers=options.headers,
+            timeout=options.timeout,
+            http2=options.http2,
+            verify=options.verify_tls,
+            proxy=options.proxy,
+            verification_token=tok,
+            http_transport=options.http_transport,
+            max_auth_refreshes=options.max_auth_refreshes,
+        )
+    return auto_direct_client(
+        replace(options, verify=False, output=io.StringIO()),
+        verification_token=verification_token,
+    )
+
+
+def _stream_to_stdout(stream: Any) -> None:
+    stream_iter = iter(stream)
+    first = next(stream_iter, None)
+    print("answer            : ", end="", flush=True)
+    if first is not None:
+        sys.stdout.write(first.delta)
+        sys.stdout.flush()
+    for chunk in stream_iter:
+        sys.stdout.write(chunk.delta)
+        sys.stdout.flush()
+    print()
+
+
 def _run(args: argparse.Namespace, options: AutoOptions) -> int:
     """The part of :func:`main` that needs a session."""
     if args.status and not (args.models or args.prompt):
@@ -2033,6 +2287,7 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
         return 0 if result.ok else (2 if result.auth_problem else 1)
 
     with auto_client(options) as client:
+        models: Sequence[Any] | None = None
         if args.models:
             try:
                 models = client.get_models()
@@ -2041,34 +2296,45 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
                     exc.__cause__, httpx.RequestError
                 ):
                     raise
-                shared_manager = getattr(client, "session_manager", None)
-                if shared_manager is not None:
-                    with DirectArenaClient(
-                        base_url=options.base_url,
-                        session_source=shared_manager,
-                        headers=options.headers,
-                        timeout=options.timeout,
-                        http2=options.http2,
-                        verify=options.verify_tls,
-                        proxy=options.proxy,
-                        http_transport=options.http_transport,
-                        max_auth_refreshes=options.max_auth_refreshes,
-                    ) as direct:
-                        models = direct.get_models()
-                else:
-                    with auto_direct_client(
-                        replace(options, verify=False, output=io.StringIO())
-                    ) as direct:
-                        models = direct.get_models()
+                with _direct_client_for_cli(client, options) as direct:
+                    models = direct.get_models()
             print(f"models            : {len(models)}")
             for model in models[:25]:
                 print(f"  {model.id} — {model.display_name}")
         if args.prompt:
-            print("answer            : ", end="", flush=True)
-            for chunk in client.stream(args.prompt):
-                sys.stdout.write(chunk.delta)
-                sys.stdout.flush()
-            print()
+            explicit_vtoken = args.verification_token
+            stream_kwargs: dict[str, Any] = {}
+            if args.model is not None:
+                stream_kwargs["model"] = args.model
+            used_gradio = False
+            if explicit_vtoken is None:
+                try:
+                    _stream_to_stdout(client.stream(args.prompt, **stream_kwargs))
+                    used_gradio = True
+                except ArenaError as exc:
+                    if isinstance(exc, AuthenticationError) or isinstance(
+                        exc.__cause__, httpx.RequestError
+                    ):
+                        raise
+            if not used_gradio:
+                resolved_vtoken = (
+                    explicit_vtoken
+                    or os.environ.get("ARENA_VERIFICATION_TOKEN")
+                    or "auto"
+                )
+                with _direct_client_for_cli(
+                    client, options, verification_token=resolved_vtoken
+                ) as direct:
+                    target_model = args.model
+                    if target_model is None:
+                        direct_models = (
+                            models if models is not None else direct.get_models()
+                        )
+                        target_model = _default_direct_chat_model(direct_models)
+                    print(f"model             : {target_model}")
+                    _stream_to_stdout(
+                        direct.stream(args.prompt, model=target_model)
+                    )
         if not (args.models or args.prompt):
             print("session           : ready")
     return 0
