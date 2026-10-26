@@ -394,10 +394,17 @@ def _records_from_sse_event(event_name: str, data: str) -> list[tuple[str, Any]]
     return [(event_name or "message", value)]
 
 
-def _check_direct_prefix(wire: bytes, response: httpx.Response) -> None:
+#: v2 programmatic client-interaction telemetry blob accepted by arena.ai's
+#: Direct Chat stream endpoints when no DOM event tracker ran.
+PROGRAMMATIC_CX = "Ahbd4XIDxKpTIU7vpGSu"
+
+
+def _check_direct_prefix(
+    wire: bytes, headers: Mapping[str, Any] | None = None
+) -> None:
     prefix = wire[:4096].decode("utf-8", "replace")
     if prefix.lstrip().lower().startswith(("<!doctype html", "<html")):
-        _raise_if_challenge_page(prefix, response.headers)
+        _raise_if_challenge_page(prefix, headers)
         raise ProtocolError("Direct Chat expected a stream but received HTML.")
 
 
@@ -453,11 +460,16 @@ def model_chat_score(item: ModelInfo) -> int:
     return score
 
 
-def _iter_response_records(response: httpx.Response) -> Iterator[tuple[str, Any]]:
-    content_type = response.headers.get("content-type", "").lower()
-    chunks = response.iter_bytes()
+def _iter_wire_records(
+    chunks: Iterator[bytes],
+    *,
+    content_type: str = "",
+    headers: Mapping[str, Any] | None = None,
+) -> Iterator[tuple[str, Any]]:
+    lowered_ct = content_type.lower()
+    chunk_iter = iter(chunks)
     head = bytearray()
-    for wire in chunks:
+    for wire in chunk_iter:
         if not wire:
             continue
         head.extend(wire)
@@ -466,12 +478,12 @@ def _iter_response_records(response: httpx.Response) -> Iterator[tuple[str, Any]
     if not head:
         return
     head_bytes = bytes(head)
-    _check_direct_prefix(head_bytes, response)
-    if "text/event-stream" in content_type and _looks_like_standard_sse(head_bytes):
+    _check_direct_prefix(head_bytes, headers)
+    if "text/event-stream" in lowered_ct and _looks_like_standard_sse(head_bytes):
         sse_parser = SSEParser()
         for event_name, data in sse_parser.feed(head_bytes):
             yield from _records_from_sse_event(event_name, data)
-        for wire in chunks:
+        for wire in chunk_iter:
             for event_name, data in sse_parser.feed(wire):
                 yield from _records_from_sse_event(event_name, data)
         for event_name, data in sse_parser.close():
@@ -479,16 +491,26 @@ def _iter_response_records(response: httpx.Response) -> Iterator[tuple[str, Any]
         return
     ai_parser = AIDataStreamParser()
     yield from ai_parser.feed(head_bytes)
-    for wire in chunks:
+    for wire in chunk_iter:
         yield from ai_parser.feed(wire)
     yield from ai_parser.close()
 
 
-async def _aiter_response_records(
-    response: httpx.Response,
+def _iter_response_records(response: httpx.Response) -> Iterator[tuple[str, Any]]:
+    yield from _iter_wire_records(
+        response.iter_bytes(),
+        content_type=response.headers.get("content-type", ""),
+        headers=response.headers,
+    )
+
+
+async def _aiter_wire_records(
+    chunks: AsyncIterator[bytes],
+    *,
+    content_type: str = "",
+    headers: Mapping[str, Any] | None = None,
 ) -> AsyncIterator[tuple[str, Any]]:
-    content_type = response.headers.get("content-type", "").lower()
-    chunks = response.aiter_bytes()
+    lowered_ct = content_type.lower()
     head = bytearray()
     async for wire in chunks:
         if not wire:
@@ -499,8 +521,8 @@ async def _aiter_response_records(
     if not head:
         return
     head_bytes = bytes(head)
-    _check_direct_prefix(head_bytes, response)
-    if "text/event-stream" in content_type and _looks_like_standard_sse(head_bytes):
+    _check_direct_prefix(head_bytes, headers)
+    if "text/event-stream" in lowered_ct and _looks_like_standard_sse(head_bytes):
         sse_parser = SSEParser()
         for event_name, data in sse_parser.feed(head_bytes):
             for item in _records_from_sse_event(event_name, data):
@@ -521,6 +543,37 @@ async def _aiter_response_records(
             yield item
     for item in ai_parser.close():
         yield item
+
+
+async def _aiter_response_records(
+    response: httpx.Response,
+) -> AsyncIterator[tuple[str, Any]]:
+    async for item in _aiter_wire_records(
+        response.aiter_bytes(),
+        content_type=response.headers.get("content-type", ""),
+        headers=response.headers,
+    ):
+        yield item
+
+
+def _uses_browser_stream(
+    verification_token: Any,
+    supplied: str | None,
+    *,
+    custom_http_transport: bool,
+) -> bool:
+    if supplied is not None or custom_http_transport or verification_token is None:
+        return False
+    if not (
+        callable(getattr(verification_token, "stream_evaluation", None))
+        and callable(getattr(verification_token, "astream_evaluation", None))
+    ):
+        return False
+    afetch = getattr(verification_token, "afetch", None)
+    raw_fn = getattr(afetch, "__func__", afetch)
+    if afetch is not None and not getattr(raw_fn, "_is_default_direct_afetch", False):
+        return False
+    return True
 
 
 class _DirectMixin:
@@ -563,6 +616,7 @@ class _DirectMixin:
             },
             "modality": "chat",
             "recaptchaV3Token": token,
+            "cx": PROGRAMMATIC_CX,
         }
         parameters = config.model_parameters()
         if parameters:
@@ -706,6 +760,9 @@ class DirectArenaClient(_DirectMixin):
         self.close()
 
     def close(self) -> None:
+        token_close = getattr(self.verification_token, "close", None)
+        if callable(token_close):
+            token_close()
         self.transport.close()
 
     def get_models(self, *, refresh: bool = False) -> list[ModelInfo]:
@@ -731,19 +788,62 @@ class DirectArenaClient(_DirectMixin):
     ) -> Iterator[StreamChunk]:
         generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
         model_id = self._resolve_model(model, self.get_models())
-        token = self._token(verification_token)
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
-        body = self._request_body(prompt, model_id, token, chat_id, generation)
+        endpoint_path = self._stream_endpoint_path(chat_id, follow_up=follow_up)
         finished = False
         text = ""
         deadline = time.monotonic() + generation.queue_timeout
+        if _uses_browser_stream(
+            self.verification_token,
+            verification_token,
+            custom_http_transport=self.transport._custom_http_transport,
+        ):
+            browser_runner: Any = self.verification_token
+            with browser_runner.stream_evaluation(
+                endpoint_path,
+                lambda tok: self._request_body(
+                    prompt, model_id, tok, chat_id, generation
+                ),
+                timeout=generation.queue_timeout,
+            ) as (content_type, wire_chunks):
+                for kind, value in _iter_wire_records(
+                    wire_chunks, content_type=content_type
+                ):
+                    if time.monotonic() >= deadline:
+                        raise QueueTimeoutError(
+                            "Direct Chat stream exceeded its configured timeout."
+                        )
+                    text, chunk, done = _update_direct_text(kind, value, text)
+                    if chunk is not None:
+                        yield chunk
+                    if done:
+                        finished = True
+                        return
+            if not finished:
+                raise ProtocolError(
+                    "Arena Direct Chat stream ended without a completion record."
+                )
+            return
+
+        initial_token: str | None = self._token(verification_token)
+
+        def build_content() -> str:
+            nonlocal initial_token
+            if initial_token is not None:
+                tok = initial_token
+                initial_token = None
+            else:
+                tok = self._token(verification_token)
+            body = self._request_body(prompt, model_id, tok, chat_id, generation)
+            return json.dumps(body, separators=(",", ":"))
+
         with self.transport.stream_request(
             "POST",
-            self._stream_endpoint_path(chat_id, follow_up=follow_up),
+            endpoint_path,
             headers=self._stream_headers(self.transport.base_url),
-            content=json.dumps(body, separators=(",", ":")),
+            content_factory=build_content,
             timeout=httpx.Timeout(generation.queue_timeout),
         ) as response:
             for kind, value in _iter_response_records(response):
@@ -947,6 +1047,13 @@ class AsyncDirectArenaClient(_DirectMixin):
         await self.aclose()
 
     async def aclose(self) -> None:
+        token_aclose = getattr(self.verification_token, "aclose", None)
+        if callable(token_aclose):
+            await token_aclose()
+        else:
+            token_close = getattr(self.verification_token, "close", None)
+            if callable(token_close):
+                token_close()
         await self.transport.close()
 
     async def get_models(self, *, refresh: bool = False) -> list[ModelInfo]:
@@ -972,18 +1079,58 @@ class AsyncDirectArenaClient(_DirectMixin):
     ) -> AsyncIterator[StreamChunk]:
         generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
         model_id = self._resolve_model(model, await self.get_models())
-        token = self._token(verification_token)
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
-        body = self._request_body(prompt, model_id, token, chat_id, generation)
+        endpoint_path = self._stream_endpoint_path(chat_id, follow_up=follow_up)
         text = ""
         deadline = time.monotonic() + generation.queue_timeout
+        if _uses_browser_stream(
+            self.verification_token,
+            verification_token,
+            custom_http_transport=self.transport._custom_http_transport,
+        ):
+            browser_runner: Any = self.verification_token
+            async with browser_runner.astream_evaluation(
+                endpoint_path,
+                lambda tok: self._request_body(
+                    prompt, model_id, tok, chat_id, generation
+                ),
+                timeout=generation.queue_timeout,
+            ) as (content_type, wire_chunks):
+                async for kind, value in _aiter_wire_records(
+                    wire_chunks, content_type=content_type
+                ):
+                    if time.monotonic() >= deadline:
+                        raise QueueTimeoutError(
+                            "Direct Chat stream exceeded its configured timeout."
+                        )
+                    text, chunk, done = _update_direct_text(kind, value, text)
+                    if chunk is not None:
+                        yield chunk
+                    if done:
+                        return
+            raise ProtocolError(
+                "Arena Direct Chat stream ended without a completion record."
+            )
+
+        initial_token: str | None = self._token(verification_token)
+
+        def build_content() -> str:
+            nonlocal initial_token
+            if initial_token is not None:
+                tok = initial_token
+                initial_token = None
+            else:
+                tok = self._token(verification_token)
+            body = self._request_body(prompt, model_id, tok, chat_id, generation)
+            return json.dumps(body, separators=(",", ":"))
+
         async with self.transport.stream_request(
             "POST",
-            self._stream_endpoint_path(chat_id, follow_up=follow_up),
+            endpoint_path,
             headers=self._stream_headers(self.transport.base_url),
-            content=json.dumps(body, separators=(",", ":")),
+            content_factory=build_content,
             timeout=httpx.Timeout(generation.queue_timeout),
         ) as response:
             async for kind, value in _aiter_response_records(response):

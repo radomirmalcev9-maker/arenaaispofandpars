@@ -62,13 +62,13 @@ HIDE_WEBDRIVER_SCRIPT = """
 (function () {
   const proto = Object.getPrototypeOf(navigator);
   try {
-    delete proto.webdriver;
+    delete navigator.webdriver;
   } catch (error) {
     /* A hardened build can refuse the delete; fall through to defineProperty. */
   }
   if ('webdriver' in proto) {
     Object.defineProperty(proto, 'webdriver', {
-      get: () => undefined,
+      get: () => false,
       configurable: true
     });
   }

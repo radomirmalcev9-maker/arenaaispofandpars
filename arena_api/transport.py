@@ -21,6 +21,7 @@ import asyncio
 import codecs
 import hashlib
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -541,6 +542,53 @@ def _retry_after(headers: Mapping[str, Any] | None) -> float | None:
             return None
 
 
+_VERIFICATION_REJECTION_MARKERS: tuple[str, ...] = (
+    "recaptcha",
+    "turnstile",
+    "captcha",
+    "botid",
+    "verification token",
+    "human verification",
+)
+
+
+def _extract_error_detail(body: str) -> str:
+    """Extract a concise, single-line diagnostic summary from a non-HTML error body."""
+    stripped = (body or "").strip()
+    if not stripped or stripped.startswith("<"):
+        return ""
+    text = stripped
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, Mapping):
+            for key in ("error", "message", "detail", "reason"):
+                val = parsed.get(key)
+                if isinstance(val, str) and val.strip():
+                    text = val.strip()
+                    break
+                if isinstance(val, Mapping):
+                    nested = val.get("message") or val.get("detail") or val.get("code")
+                    if isinstance(nested, str) and nested.strip():
+                        text = nested.strip()
+                        break
+    collapsed = " ".join(text.split())
+    if len(collapsed) > 240:
+        return collapsed[:237] + "..."
+    return collapsed
+
+
+def _is_verification_rejection(body: str) -> bool:
+    """Return True when a 401/403 body indicates bot/reCAPTCHA token rejection rather than stale cookies."""
+    stripped = (body or "").strip()
+    if not stripped or stripped.startswith("<"):
+        return False
+    lowered = stripped.lower()
+    return any(marker in lowered for marker in _VERIFICATION_REJECTION_MARKERS)
+
+
 def _raise_for_status(
     status: int,
     body: str = "",
@@ -561,13 +609,21 @@ def _raise_for_status(
             f"The service requested an interactive browser verification (HTTP {status}). "
             "Refresh or verify the session in a normal browser and retry."
         )
+    detail = _extract_error_detail(body)
+    suffix = f": {detail}" if detail else ""
     if status in (401, 403):
-        raise AuthenticationError(f"The supplied session was rejected (HTTP {status}).")
+        if _is_verification_rejection(body):
+            raise ProtocolError(
+                f"Arena rejected the request verification token (HTTP {status}){suffix}."
+            )
+        raise AuthenticationError(
+            f"The supplied session was rejected (HTTP {status}){suffix}."
+        )
     if status == 429:
         raise RateLimitError(
             "Arena rate limit reached.", retry_after=_retry_after(headers)
         )
-    raise ArenaError(f"Arena returned HTTP {status}.")
+    raise ArenaError(f"Arena returned HTTP {status}{suffix}.")
 
 
 def _raise_if_challenge_page(
@@ -827,6 +883,7 @@ class ArenaTransport:
         self._session_cookies: dict[str, str] = dict(session_cookies or {})
         self._session_refresher = session_refresher
         self._max_auth_refreshes = max_auth_refreshes
+        self._custom_http_transport: bool = http_transport is not None
         self.impersonate = (
             validate_impersonate(impersonate) if impersonate is not None else None
         )
@@ -984,9 +1041,14 @@ class ArenaTransport:
         refreshed cookies without the consumer noticing.
         """
         self._ensure_open()
+        request_kwargs = dict(kwargs)
+        content_factory = request_kwargs.pop("content_factory", None)
         attempts = self._max_auth_refreshes + 1
         for attempt in range(attempts):
-            context = self.session.stream(method, self.url(path), **kwargs)
+            attempt_kwargs = dict(request_kwargs)
+            if callable(content_factory):
+                attempt_kwargs["content"] = content_factory()
+            context = self.session.stream(method, self.url(path), **attempt_kwargs)
             response = context.__enter__()
             try:
                 _check_sync_response(response, streaming=True)
@@ -1112,6 +1174,7 @@ class AsyncArenaTransport:
         self._session_cookies: dict[str, str] = dict(session_cookies or {})
         self._session_refresher = session_refresher
         self._max_auth_refreshes = max_auth_refreshes
+        self._custom_http_transport: bool = http_transport is not None
         self.impersonate = (
             validate_impersonate(impersonate) if impersonate is not None else None
         )
@@ -1272,9 +1335,17 @@ class AsyncArenaTransport:
         refreshed cookies without the consumer noticing.
         """
         self._ensure_open()
+        request_kwargs = dict(kwargs)
+        content_factory = request_kwargs.pop("content_factory", None)
         attempts = self._max_auth_refreshes + 1
         for attempt in range(attempts):
-            context = self.session.stream(method, self.url(path), **kwargs)
+            attempt_kwargs = dict(request_kwargs)
+            if callable(content_factory):
+                produced = content_factory()
+                if inspect.isawaitable(produced):
+                    produced = await produced
+                attempt_kwargs["content"] = produced
+            context = self.session.stream(method, self.url(path), **attempt_kwargs)
             response = await context.__aenter__()
             try:
                 await _check_async_response(response)

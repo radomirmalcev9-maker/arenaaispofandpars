@@ -2824,3 +2824,242 @@ def test_cli_prompt_honors_explicit_model_and_verification_token_flags(
     assert "answer            : 4" in captured.out
     assert sent_bodies[0]["modelAId"] == custom_id
     assert sent_bodies[0]["recaptchaV3Token"] == "cli-v3-tok"
+
+
+def test_firefox_browser_cookie_filter_and_supabase_jwt_expiry() -> None:
+    import base64
+    import time
+
+    filtered = auto_module._seedable_browser_cookies(
+        {
+            "cf_clearance": "ff-bound",
+            "__cf_bm": "ff-bm",
+            "_cfuvid": "ff-uvid",
+            "arena-auth-prod-v1.0": "part0",
+            "arena-auth-prod-v1.1": "part1",
+        },
+        cookie_source="firefox",
+    )
+    assert filtered == {
+        "arena-auth-prod-v1.0": "part0",
+        "arena-auth-prod-v1.1": "part1",
+    }
+
+    def make_chunked(expires_at: float) -> dict[str, str]:
+        raw_json = json.dumps(
+            {"access_token": "jwt", "refresh_token": "rt", "expires_at": expires_at}
+        ).encode("utf-8")
+        full = "base64-" + base64.urlsafe_b64encode(raw_json).decode("ascii").rstrip("=")
+        mid = len(full) // 2
+        return {
+            "arena-auth-prod-v1.0": full[:mid],
+            "arena-auth-prod-v1.1": full[mid:],
+        }
+
+    assert auto_module._arena_auth_jwt_expired(make_chunked(time.time() - 300)) is True
+    assert auto_module._arena_auth_jwt_expired(make_chunked(time.time() + 3600)) is False
+
+
+def test_direct_verification_token_streams_in_browser_and_retries_headed_on_403(
+    tmp_path, monkeypatch
+) -> None:
+    seen_headless: list[bool] = []
+    added_cookie_sets: list[list[dict[str, str]]] = []
+    evaluated_scripts: list[str] = []
+
+    class FakeContext:
+        async def add_cookies(self, cookies) -> None:
+            added_cookie_sets.append(list(cookies))
+
+        async def cookies(self, urls=None):
+            return [
+                {"name": "arena-auth-prod-v1.0", "value": "rotated-jwt"},
+                {"name": "cf_clearance", "value": "chromium-cf"},
+            ]
+
+    class FakePage:
+        def __init__(self, *, headless: bool) -> None:
+            self._headless = headless
+            self.context = FakeContext()
+            self._exposed: dict[str, object] = {}
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def content(self) -> str:
+            return "<html><body>Direct Chat</body></html>"
+
+        async def expose_function(self, name: str, fn: object) -> None:
+            self._exposed[name] = fn
+
+        async def evaluate(self, script: str) -> object:
+            evaluated_scripts.append(script)
+            if "chat_submit" in script:
+                return "headed-v3-tok" if not self._headless else "headless-v3-tok"
+            if "window.fetch" in script:
+                if self._headless:
+                    return {
+                        "ok": False,
+                        "status": 403,
+                        "body": '{"error":"Forbidden"}',
+                        "contentType": "application/json",
+                        "cfMitigated": "",
+                    }
+                assert '"headed-v3-tok"' in script or '\\"headed-v3-tok\\"' in script
+                meta_fn = self._exposed["__arenaDirectMeta"]
+                chunk_fn = self._exposed["__arenaDirectChunk"]
+                assert callable(meta_fn) and callable(chunk_fn)
+                meta_fn("text/event-stream")
+                chunk_fn('a0:"TCP — надёжный, "\n')
+                chunk_fn(
+                    'a0:"UDP — быстрый."\nad:{"finishReason":"stop"}\n'
+                )
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "contentType": "text/event-stream",
+                }
+            return None
+
+    class FakeEnv:
+        def __init__(self, options) -> None:
+            self.options = options
+            self.challenge_handler = type(
+                "H", (), {"solve_on_detection": True}
+            )()
+
+        async def __aenter__(self):
+            seen_headless.append(self.options.headless)
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def new_page(self):
+            return FakePage(headless=self.options.headless)
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+
+    refresh_calls = 0
+
+    class TrackingManager:
+        def load_cookies(self, domains=None) -> dict[str, str]:
+            return {
+                "cf_clearance": "firefox-cf",
+                "arena-auth-prod-v1.0": "initial-jwt",
+            }
+
+        def firefox_headers(self, *, navigation: bool = False) -> dict[str, str]:
+            return {}
+
+        def refresh_session(self, reason=None):
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return self.load_cookies()
+
+    manager = TrackingManager()
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=RecaptchaToolkitSolver(),
+        session_cookies=manager.load_cookies(),
+        session_manager=manager,
+        cookie_source="firefox",
+    )
+
+    from arena_api.models import ModelInfo
+
+    client = auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        session_source=manager,
+        verification_token=tok,
+    )
+    try:
+        model_uuid = "22222222-2222-2222-2222-222222222222"
+        client._models = [
+            ModelInfo(id=model_uuid, display_name="gemini-2.5-flash")
+        ]
+        answer = client.complete("TCP vs UDP", model="gemini-2.5-flash")
+    finally:
+        client.close()
+
+    assert answer == "TCP — надёжный, UDP — быстрый."
+    assert seen_headless == [True, False]
+    assert refresh_calls == 0
+    assert added_cookie_sets[0] == [
+        {"name": "arena-auth-prod-v1.0", "value": "initial-jwt", "url": "https://arena.ai"}
+    ]
+
+
+def test_direct_verification_token_401_user_not_found_raises_without_headed_retry(
+    tmp_path, monkeypatch
+) -> None:
+    seen_headless: list[bool] = []
+
+    class FakeContext:
+        async def add_cookies(self, cookies) -> None:
+            return None
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.context = FakeContext()
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def content(self) -> str:
+            return "<html></html>"
+
+        async def expose_function(self, name: str, fn: object) -> None:
+            return None
+
+        async def evaluate(self, script: str) -> object:
+            if "chat_submit" in script:
+                return "v3-tok"
+            return {
+                "ok": False,
+                "status": 401,
+                "body": '{"message":"User not found"}',
+                "contentType": "application/json",
+                "cfMitigated": "",
+            }
+
+    class FakeEnv:
+        def __init__(self, options) -> None:
+            self.options = options
+
+        async def __aenter__(self):
+            seen_headless.append(self.options.headless)
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def new_page(self):
+            return FakePage()
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=RecaptchaToolkitSolver(),
+    )
+
+    async def run() -> None:
+        async with tok.astream_evaluation(
+            "/nextjs-api/stream/create-evaluation",
+            lambda t: {"recaptchaV3Token": t},
+        ):
+            pass  # pragma: no cover
+
+    with pytest.raises(AuthenticationError, match="User not found"):
+        asyncio.run(run())
+    assert seen_headless == [True]
+
