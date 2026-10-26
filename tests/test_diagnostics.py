@@ -160,7 +160,11 @@ def test_cookies_without_a_session_like_name_are_flagged(root: Path) -> None:
         [("theme", "dark", ".arena.ai", FUTURE)],
     )
     report = collect_firefox_report(profiles_root=root)
-    assert any("looks like a session token" in warning for warning in report["warnings"])
+    assert any(
+        "none of their names looks like a login cookie" in warning
+        for warning in report["warnings"]
+    )
+    assert report["profiles"][0]["verdict"].startswith("no login cookie")
 
 
 def test_a_missing_root_is_named_everywhere(tmp_path: Path, monkeypatch) -> None:
@@ -240,3 +244,13 @@ def test_a_cookie_fingerprint_describes_instead_of_revealing() -> None:
     assert "sha256=deadbeef" in described
     assert described.startswith("*")
     assert fingerprint.as_dict()["expires"].endswith("Z")
+
+
+def test_each_profile_is_detailed_once(root: Path) -> None:
+    make_profile(
+        root / "Profiles" / "aaa.default-release",
+        [("session", SECRET, ".arena.ai", FUTURE)],
+    )
+    report = collect_firefox_report(profiles_root=root)
+    profiles = [entry["profile"] for entry in report["profiles"]]
+    assert len(profiles) == len(set(profiles)) == 1

@@ -83,6 +83,7 @@ from .auth.diagnostics import (
 )
 from .auth.firefox_session import (
     DEFAULT_COOKIE_DOMAINS,
+    looks_like_auth_cookie,
     FIREFOX_PROFILE_ENV,
     FIREFOX_ROOT_ENV,
     FirefoxSessionError,
@@ -534,27 +535,54 @@ def _flat_records(records: Any) -> dict[str, str]:
         return {}
 
 
+def _has_login_cookie(discovered: DiscoveredSession) -> bool:
+    """Whether a session holds a cookie that looks like a login.
+
+    A file saved before signing in still holds ``cf_clearance``, ``_ga`` and
+    ``provisional_user_id`` -- thirteen perfectly real cookies that carry no
+    account. Treating that as a found session is how "the library cannot read
+    my cookies" happens while the browser is signed in: the stale file wins the
+    ladder and the profile is never consulted.
+    """
+    return any(looks_like_auth_cookie(name) for name in discovered.cookies)
+
+
 def discover_session(options: AutoOptions | None = None) -> DiscoveredSession | None:
     """Return the first usable session, or ``None`` when there is none.
 
     Order: explicit ``cookies=``, ``ARENA_COOKIE``/``ARENA_COOKIES_FILE``, a
     stored ``cookies.json``, the Firefox profile, then other browsers through
     ``rookiepy``.
+
+    The stored file is the one source that can quietly go stale -- it is a copy
+    of a browser session, saved once. So it loses to a browser profile when it
+    holds no login cookie and the profile does: the profile is the live truth,
+    and a visitor-only export from before the sign-in must not shadow it.
     """
     options = options or AutoOptions()
-    candidates: list[Callable[[AutoOptions], DiscoveredSession | None]] = [
-        _from_explicit_cookies,
-        _from_environment,
-        _from_storage,
-    ]
-    if options.use_browser_profiles:
-        candidates.append(_from_firefox)
-        candidates.append(_from_other_browsers)
-    for candidate in candidates:
+    for candidate in (_from_explicit_cookies, _from_environment):
         found = candidate(options)
         if found is not None:
             return found
-    return None
+    stored = _from_storage(options)
+    browser: DiscoveredSession | None = None
+    if options.use_browser_profiles:
+        browser = _from_firefox(options)
+        if browser is None:
+            browser = _from_other_browsers(options)
+    if browser is not None and not _has_login_cookie(browser):
+        browser = None
+    if browser is None:
+        return stored
+    if stored is not None and _has_login_cookie(stored):
+        return stored
+    if stored is not None:
+        _emit(
+            options,
+            f"[arena-api] ignoring {stored.description}: no login cookie in it, "
+            f"while {browser.source} has one",
+        )
+    return browser
 
 
 def _report_line(label: str, value: str) -> str:
@@ -578,12 +606,10 @@ def explain_sources(options: AutoOptions | None = None) -> list[str]:
     if path is None:
         report.append(_report_line("stored cookies.json", "not configured"))
     else:
-        report.append(
-            _report_line(
-                "stored cookies.json",
-                f"{path} " + ("(exists)" if path.is_file() else "(absent)"),
-            )
-        )
+        detail = "(exists)" if path.is_file() else "(absent)"
+        if path.is_file():
+            detail = f"(exists, {_storage_state(options, path)})"
+        report.append(_report_line("stored cookies.json", f"{path} {detail}"))
     if not options.use_browser_profiles:
         report.append(
             _report_line(
@@ -604,6 +630,29 @@ def explain_sources(options: AutoOptions | None = None) -> list[str]:
     else:
         report.append(_report_line("other browsers", "rookiepy available"))
     return report
+
+
+def _storage_state(options: AutoOptions, path: Path) -> str:
+    """Describe a stored cookie file: how many cookies, and is one a login?"""
+    try:
+        stored = _from_storage(AutoOptions(
+            base_url=options.base_url,
+            storage_path=path,
+            domains=options.domains,
+            use_browser_profiles=False,
+            solve_captchas=False,
+            output=options.output,
+        ))
+    except AuthenticationError:
+        return "unreadable"
+    if stored is None or not stored.cookies:
+        return "no cookies"
+    if _has_login_cookie(stored):
+        return f"{len(stored.cookies)} names, login cookie present"
+    return (
+        f"{len(stored.cookies)} names, no login cookie -- "
+        "a browser profile with one is preferred"
+    )
 
 
 def _explain_firefox(options: AutoOptions) -> list[str]:
@@ -1822,6 +1871,14 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
             "cookie names      : "
             + (", ".join(sorted(discovered.cookies)) or "none")
         )
+        if not _has_login_cookie(discovered):
+            # The distinction a stuck user needs: the reader worked, the
+            # browser is simply not signed in on the site.
+            print(
+                "login cookie      : none -- these are visitor cookies; "
+                "sign in to the site in the browser, then run --status again "
+                "(--diagnose explains each profile)"
+            )
         if not options.verify:
             return 0
         with auto_client(options) as client:
