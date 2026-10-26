@@ -121,6 +121,7 @@ from .exceptions import (
     AuthenticationError,
     ChallengeRequiredError,
     ProtocolError,
+    QueueTimeoutError,
     RateLimitError,
 )
 from .transport import (
@@ -1692,6 +1693,58 @@ def _cookie_source_for_manager(manager: Any) -> str | None:
     return None
 
 
+def _build_whatwg_win1252_inv() -> dict[int, int]:
+    inv: dict[int, int] = {}
+    for b in range(256):
+        if 0x80 <= b <= 0x9F:
+            try:
+                cp = ord(bytes((b,)).decode("cp1252"))
+            except UnicodeDecodeError:
+                cp = b
+        else:
+            cp = b
+        inv[cp] = b
+    return inv
+
+
+_WHATWG_WIN1252_INV: dict[int, int] = _build_whatwg_win1252_inv()
+
+
+def _recover_cdp_utf8_bytes(text: str, content_type: str = "") -> bytes:
+    """Recover raw UTF-8 wire bytes from Chromium CDP ``text/plain`` bodies.
+
+    When an HTTP response omits ``; charset=utf-8`` on ``text/plain`` (as
+    ``arena.ai``'s ``create-evaluation`` stream does), Blink's
+    ``TextResourceDecoder`` decodes the raw UTF-8 wire bytes via the WHATWG
+    ``windows-1252`` bijection before Playwright's driver re-encodes that
+    string as UTF-8. Inverting the 256-codepoint bijection restores the exact
+    original UTF-8 bytes whenever they form valid UTF-8.
+    """
+    if not text or text.isascii():
+        return text.encode("utf-8")
+    lowered_ct = content_type.lower()
+    if "utf-8" in lowered_ct or "utf8" in lowered_ct:
+        return text.encode("utf-8")
+    inv = _WHATWG_WIN1252_INV
+    try:
+        raw = bytes(inv[ord(ch)] for ch in text)
+    except KeyError:
+        return text.encode("utf-8")
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return text.encode("utf-8")
+    return raw
+
+
+def _recover_cdp_utf8_text(text: str, content_type: str = "") -> str:
+    if not text or text.isascii():
+        return text
+    return _recover_cdp_utf8_bytes(text, content_type).decode(
+        "utf-8", errors="replace"
+    )
+
+
 def _seedable_browser_cookies(
     cookies: Mapping[str, str], *, cookie_source: str | None
 ) -> dict[str, str]:
@@ -2861,12 +2914,15 @@ class DirectVerificationToken:
                             hdrs = {
                                 str(k).lower(): str(v) for k, v in raw_hdrs.items()
                             }
+                        ct_val = hdrs.get("content-type", "")
                         if status >= 400:
                             err_body = ""
                             text_fn = getattr(resp, "text", None)
                             if callable(text_fn):
                                 try:
-                                    err_body = str(await text_fn() or "")
+                                    err_body = _recover_cdp_utf8_text(
+                                        str(await text_fn() or ""), ct_val
+                                    )
                                 except Exception:  # noqa: BLE001
                                     err_body = ""
                             async_q.put_nowait(
@@ -2875,19 +2931,21 @@ class DirectVerificationToken:
                                     {
                                         "status": status,
                                         "body": err_body,
-                                        "contentType": hdrs.get("content-type", ""),
+                                        "contentType": ct_val,
                                         "cfMitigated": hdrs.get("cf-mitigated", ""),
                                     },
                                 )
                             )
                             return
-                        async_q.put_nowait(("meta", hdrs.get("content-type", "")))
+                        async_q.put_nowait(("meta", ct_val))
                         body_text = ""
                         text_fn = getattr(resp, "text", None)
                         if callable(text_fn):
                             body_text = str(await text_fn() or "")
                         if body_text:
-                            async_q.put_nowait(("chunk", body_text.encode("utf-8")))
+                            async_q.put_nowait(
+                                ("chunk", _recover_cdp_utf8_bytes(body_text, ct_val))
+                            )
                         async_q.put_nowait(("eof", None))
                     except asyncio.CancelledError:
                         raise
@@ -3084,17 +3142,21 @@ class DirectVerificationToken:
                     obs = await _detect_post_submit_challenge(page)
                     obs_kind = obs.get("kind")
                     if isinstance(obs_kind, str) and obs_kind:
+                        if not challenge_active:
+                            if not headless:
+                                interactive_budget = max(timeout, 300.0)
+                                deadline = max(
+                                    deadline,
+                                    time.monotonic() + interactive_budget,
+                                )
+                                grace_until = deadline
+                            else:
+                                deadline = max(deadline, time.monotonic() + 60.0)
+                                grace_until = max(
+                                    grace_until, time.monotonic() + 60.0
+                                )
                         challenge_active = True
                         challenge_cleared_at = None
-                        if not headless:
-                            interactive_budget = max(timeout, 300.0)
-                            deadline = max(
-                                deadline, time.monotonic() + interactive_budget
-                            )
-                            grace_until = deadline
-                        else:
-                            deadline = max(deadline, time.monotonic() + 60.0)
-                            grace_until = max(grace_until, time.monotonic() + 60.0)
 
                         if (
                             obs_kind in ("recaptcha_anchor", "turnstile", "hcaptcha")
@@ -3415,9 +3477,9 @@ class DirectVerificationToken:
         sync_q: queue.Queue[tuple[str, Any]] = queue.Queue()
         stop_event = threading.Event()
         sync_wait = (
-            max(timeout, 300.0) + 30.0
+            max(timeout, 300.0) + 60.0
             if self.options.interactive
-            else timeout + 15.0
+            else max(timeout, 60.0) + 30.0
         )
 
         async def _driver() -> None:
@@ -3447,7 +3509,12 @@ class DirectVerificationToken:
         )
         worker.start()
         try:
-            first_kind, first_payload = sync_q.get(timeout=sync_wait)
+            try:
+                first_kind, first_payload = sync_q.get(timeout=sync_wait)
+            except queue.Empty as exc:
+                raise QueueTimeoutError(
+                    "Direct Chat browser verification timed out before response headers arrived."
+                ) from exc
             if first_kind == "err":
                 raise first_payload
             content_type = str(first_payload or "") if first_kind == "meta" else ""
@@ -3456,7 +3523,12 @@ class DirectVerificationToken:
                 if first_kind == "chunk" and first_payload:
                     yield first_payload
                 while True:
-                    kind, payload = sync_q.get(timeout=timeout + 15.0)
+                    try:
+                        kind, payload = sync_q.get(timeout=timeout + 30.0)
+                    except queue.Empty as exc:
+                        raise QueueTimeoutError(
+                            "Direct Chat browser stream timed out while reading chunks."
+                        ) from exc
                     if kind == "chunk":
                         if payload:
                             yield payload
@@ -3779,12 +3851,26 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
     )
 
 
+def _ensure_utf8_stdio() -> None:
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            enc = str(getattr(stream, "encoding", "") or "").lower()
+            if "utf" not in enc:
+                try:
+                    stream.reconfigure(encoding="utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point of ``python -m arena_api`` (and ``python -m arena_api.auto``).
 
     Exit codes: ``0`` everything worked, ``1`` no usable session (or another
     library error), ``2`` a session was found but the server rejected it.
     """
+    _ensure_utf8_stdio()
     args = build_arg_parser().parse_args(argv)
     try:
         options = _options_from_args(args)
@@ -3927,16 +4013,24 @@ def _direct_client_for_cli(
     )
 
 
+def _safe_stdout_write(text: str) -> None:
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        enc = str(getattr(sys.stdout, "encoding", "") or "utf-8") or "utf-8"
+        safe = text.encode(enc, errors="replace").decode(enc, errors="replace")
+        sys.stdout.write(safe)
+    sys.stdout.flush()
+
+
 def _stream_to_stdout(stream: Any) -> None:
     stream_iter = iter(stream)
     first = next(stream_iter, None)
     print("answer            : ", end="", flush=True)
     if first is not None:
-        sys.stdout.write(first.delta)
-        sys.stdout.flush()
+        _safe_stdout_write(first.delta)
     for chunk in stream_iter:
-        sys.stdout.write(chunk.delta)
-        sys.stdout.flush()
+        _safe_stdout_write(chunk.delta)
     print()
 
 
