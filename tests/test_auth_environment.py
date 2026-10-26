@@ -263,3 +263,11 @@ def test_launch_kwargs_configures_playwright_proxy() -> None:
     with pytest.raises(ValueError, match="Unsupported browser proxy"):
         BrowserEnvironmentOptions(proxy="ftp://127.0.0.1:21").launch_kwargs()
 
+
+def test_hide_webdriver_script_sets_boolean_false_on_prototype() -> None:
+    """Real Chromium/Edge exposes ``navigator.webdriver === false`` rather than ``undefined``."""
+    assert "delete navigator.webdriver" in HIDE_WEBDRIVER_SCRIPT
+    assert "delete proto.webdriver" not in HIDE_WEBDRIVER_SCRIPT
+    assert "get: () => false" in HIDE_WEBDRIVER_SCRIPT
+
+

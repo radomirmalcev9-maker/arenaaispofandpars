@@ -377,3 +377,112 @@ def test_direct_multi_turn_uses_post_to_evaluation_and_sends_origin_referer() ->
     )
 
 
+def test_direct_client_attaches_cx_and_remints_token_on_auth_refresh() -> None:
+    from arena_api.direct import PROGRAMMATIC_CX
+
+    class StubManager:
+        def __init__(self) -> None:
+            self.refresh_calls = 0
+
+        def load_cookies(self, domains=None) -> dict[str, str]:
+            return {"arena-auth-prod-v1.0": "initial"}
+
+        def firefox_headers(self, *, navigation: bool = False) -> dict[str, str]:
+            return {}
+
+        def refresh_session(self, reason: BaseException | None = None) -> dict[str, str]:
+            self.refresh_calls += 1
+            return {"arena-auth-prod-v1.0": f"refreshed-{self.refresh_calls}"}
+
+    sent_payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/text/direct":
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/html"},
+                content=PAGE.encode(),
+            )
+        payload = json.loads(request.content)
+        sent_payloads.append(payload)
+        if len(sent_payloads) == 1:
+            return httpx.Response(
+                401,
+                request=request,
+                headers={"content-type": "application/json"},
+                content=b'{"message":"User not found"}',
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=b'a0:"Recovered"\nad:{"finishReason":"stop"}\n',
+        )
+
+    minted = iter(["v3-first", "v3-second"])
+    manager = StubManager()
+    with DirectArenaClient(
+        base_url="https://arena.test",
+        session_source=manager,
+        verification_token=lambda: next(minted),
+        http_transport=httpx.MockTransport(handler),
+    ) as client:
+        assert client.complete("Ping", model="Model A") == "Recovered"
+
+    assert manager.refresh_calls == 1
+    assert [p["recaptchaV3Token"] for p in sent_payloads] == [
+        "v3-first",
+        "v3-second",
+    ]
+    assert sent_payloads[0]["cx"] == PROGRAMMATIC_CX
+    assert sent_payloads[0]["userMessageId"] != sent_payloads[1]["userMessageId"]
+
+
+def test_direct_client_does_not_loop_session_refresh_on_recaptcha_403() -> None:
+    class StubManager:
+        def __init__(self) -> None:
+            self.refresh_calls = 0
+
+        def load_cookies(self, domains=None) -> dict[str, str]:
+            return {"arena-auth-prod-v1.0": "valid"}
+
+        def firefox_headers(self, *, navigation: bool = False) -> dict[str, str]:
+            return {}
+
+        def refresh_session(self, reason: BaseException | None = None) -> dict[str, str]:
+            self.refresh_calls += 1
+            return {"arena-auth-prod-v1.0": "still-valid"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/text/direct":
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/html"},
+                content=PAGE.encode(),
+            )
+        return httpx.Response(
+            403,
+            request=request,
+            headers={"content-type": "application/json"},
+            content=b'{"error":"reCAPTCHA verification failed"}',
+        )
+
+    manager = StubManager()
+    with DirectArenaClient(
+        base_url="https://arena.test",
+        session_source=manager,
+        verification_token="tok",
+        http_transport=httpx.MockTransport(handler),
+    ) as client:
+        try:
+            client.complete("Ping", model="Model A")
+        except ProtocolError as exc:
+            assert "reCAPTCHA verification failed" in str(exc)
+        else:
+            raise AssertionError("expected ProtocolError")
+    assert manager.refresh_calls == 0
+
+
+

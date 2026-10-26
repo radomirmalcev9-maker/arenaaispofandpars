@@ -236,3 +236,88 @@ def test_nextjs_404_and_passive_jsd_beacon_are_not_misread_as_challenges() -> No
     with ArenaTransport("https://arena.test", http_transport=httpx.MockTransport(ok_page)) as tr:
         assert "404" in tr.get_text("/text/direct")
 
+
+def test_raise_for_status_preserves_json_detail_and_separates_verification_rejections() -> None:
+    with pytest.raises(AuthenticationError, match="User not found"):
+        _raise_for_status(401, '{"message": "User not found"}')
+
+    with pytest.raises(ProtocolError, match="recaptcha validation failed") as exc_info:
+        _raise_for_status(403, '{"error": "recaptcha validation failed"}')
+    assert not isinstance(exc_info.value, AuthenticationError)
+
+    with pytest.raises(ArenaError, match="modelAId is invalid"):
+        _raise_for_status(400, '{"error": {"message": "modelAId is invalid"}}')
+
+
+def test_stream_request_skips_session_refresh_on_recaptcha_403_and_regenerates_body_on_401() -> None:
+    refreshes = 0
+
+    def refresher(_exc: BaseException) -> dict[str, str]:
+        nonlocal refreshes
+        refreshes += 1
+        return {"session": f"fresh-{refreshes}"}
+
+    def recaptcha_403_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            request=request,
+            headers={"content-type": "application/json"},
+            content=b'{"error":"recaptcha token score too low"}',
+        )
+
+    with ArenaTransport(
+        "https://arena.test",
+        session_cookies={"session": "initial"},
+        session_refresher=refresher,
+        http_transport=httpx.MockTransport(recaptcha_403_handler),
+    ) as tr:
+        with pytest.raises(ProtocolError, match="recaptcha token score too low"):
+            with tr.stream_request("POST", "/nextjs-api/stream/create-evaluation"):
+                pass  # pragma: no cover
+    assert refreshes == 0
+
+    seen_bodies: list[str] = []
+
+    def auth_401_then_200(request: httpx.Request) -> httpx.Response:
+        seen_bodies.append(request.content.decode("utf-8"))
+        if len(seen_bodies) == 1:
+            return httpx.Response(
+                401,
+                request=request,
+                headers={"content-type": "application/json"},
+                content=b'{"message":"User not found"}',
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=b'a0:"ok"\n',
+        )
+
+    counter = 0
+
+    def make_body() -> str:
+        nonlocal counter
+        counter += 1
+        return json.dumps({"recaptchaV3Token": f"tok-{counter}"})
+
+    with ArenaTransport(
+        "https://arena.test",
+        session_cookies={"session": "stale"},
+        session_refresher=refresher,
+        http_transport=httpx.MockTransport(auth_401_then_200),
+    ) as tr:
+        with tr.stream_request(
+            "POST",
+            "/nextjs-api/stream/create-evaluation",
+            content_factory=make_body,
+        ) as resp:
+            assert resp.read() == b'a0:"ok"\n'
+
+    assert refreshes == 1
+    assert [json.loads(b)["recaptchaV3Token"] for b in seen_bodies] == [
+        "tok-1",
+        "tok-2",
+    ]
+
+

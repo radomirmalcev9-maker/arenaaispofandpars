@@ -57,13 +57,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import io
 import json
 import os
+import queue
 import re
 import sys
 import threading
-from collections.abc import Callable, Mapping, Sequence
+import time
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field, replace
 from importlib.util import find_spec
 from pathlib import Path
@@ -114,6 +118,7 @@ from .exceptions import (
     ArenaError,
     AuthenticationError,
     ChallengeRequiredError,
+    ProtocolError,
     RateLimitError,
 )
 from .transport import (
@@ -121,12 +126,18 @@ from .transport import (
     IMPERSONATE_EXTRA,
     CookieInput,
     ProxyInput,
+    _extract_error_detail,
+    _is_verification_rejection,
+    _looks_like_challenge,
+    _raise_for_status,
     impersonation_available,
     normalize_cookies,
     normalize_proxy,
     redact_proxy_url,
     resolve_proxy_url,
 )
+
+_DEFAULT_BROWSER_ENVIRONMENT = BrowserEnvironment
 
 __all__ = [
     "AutoOptions",
@@ -1658,6 +1669,214 @@ async () => {{
 """
 
 
+_BROWSER_BOUND_CF_COOKIES: frozenset[str] = frozenset(
+    {"cf_clearance", "__cf_bm", "_cfuvid"}
+)
+_AUTH_REJECT_MARKERS: tuple[str, ...] = (
+    "user not found",
+    "unauthorized",
+    "unauthenticated",
+    "not signed in",
+    "login required",
+    "invalid jwt",
+)
+
+
+def _cookie_source_for_manager(manager: Any) -> str | None:
+    if isinstance(manager, FirefoxSessionManager):
+        return "firefox"
+    if isinstance(getattr(manager, "fallback", None), FirefoxSessionManager):
+        return "firefox"
+    return None
+
+
+def _seedable_browser_cookies(
+    cookies: Mapping[str, str], *, cookie_source: str | None
+) -> dict[str, str]:
+    if cookie_source == "firefox":
+        return {
+            str(k): str(v)
+            for k, v in cookies.items()
+            if str(k) not in _BROWSER_BOUND_CF_COOKIES
+        }
+    return {str(k): str(v) for k, v in cookies.items()}
+
+
+def _reconstruct_supabase_cookie(cookies: Mapping[str, str]) -> str:
+    whole = cookies.get("arena-auth-prod-v1")
+    if isinstance(whole, str) and whole.strip():
+        return whole.strip()
+    parts: list[str] = []
+    index = 0
+    while True:
+        piece = cookies.get(f"arena-auth-prod-v1.{index}")
+        if not isinstance(piece, str) or not piece:
+            break
+        parts.append(piece)
+        index += 1
+    return "".join(parts)
+
+
+def _arena_auth_jwt_expired(
+    cookies: Mapping[str, str], *, leeway: float = 60.0
+) -> bool:
+    raw = _reconstruct_supabase_cookie(cookies)
+    if not raw.startswith("base64-"):
+        return False
+    encoded = raw[len("base64-") :]
+    if not encoded:
+        return False
+    padded = encoded + "=" * ((4 - (len(encoded) % 4)) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        payload = json.loads(decoded.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    expires_at = payload.get("expires_at")
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+        return False
+    return float(expires_at) <= (time.time() + leeway)
+
+
+def _build_wait_supabase_refresh_js(stale_raw: str) -> str:
+    stale_literal = json.dumps(stale_raw)
+    return f"""
+async () => {{
+    const stale = {stale_literal};
+    const readJoined = () => {{
+        const map = new Map();
+        for (const entry of (document.cookie || "").split(";")) {{
+            const eq = entry.indexOf("=");
+            if (eq < 0) continue;
+            map.set(entry.slice(0, eq).trim(), entry.slice(eq + 1).trim());
+        }}
+        const whole = map.get("arena-auth-prod-v1");
+        if (whole) return whole;
+        let out = "";
+        for (let i = 0; map.has("arena-auth-prod-v1." + i); i += 1) {{
+            out += map.get("arena-auth-prod-v1." + i) || "";
+        }}
+        return out;
+    }};
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {{
+        const current = readJoined();
+        if (current && current !== stale) return true;
+        await new Promise((r) => setTimeout(r, 200));
+    }}
+    return false;
+}}
+"""
+
+
+def _windows_installed_channels() -> list[str]:
+    if sys.platform != "win32":
+        return []
+    roots = [
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+        os.environ.get("LOCALAPPDATA"),
+    ]
+    probes = (
+        ("chrome", Path("Google") / "Chrome" / "Application" / "chrome.exe"),
+        ("msedge", Path("Microsoft") / "Edge" / "Application" / "msedge.exe"),
+    )
+    found: list[str] = []
+    for channel, rel in probes:
+        for root in roots:
+            if root and (Path(root) / rel).is_file():
+                found.append(channel)
+                break
+    return found
+
+
+def _candidate_browser_channels(explicit_channel: str | None) -> list[str | None]:
+    if explicit_channel:
+        return [explicit_channel]
+    if BrowserEnvironment is not _DEFAULT_BROWSER_ENVIRONMENT:
+        return [None]
+    candidates: list[str | None] = []
+    for ch in [*_windows_installed_channels(), "chromium", None]:
+        if ch not in candidates:
+            candidates.append(ch)
+    return candidates
+
+
+def _is_missing_browser_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return (
+        "Executable doesn't exist" in msg
+        or "is not found at" in msg
+        or "Chromium distribution" in msg
+    )
+
+
+def _build_browser_fetch_stream_js(
+    endpoint_path: str, serialized_body: str
+) -> str:
+    url_literal = json.dumps(endpoint_path)
+    body_literal = json.dumps(serialized_body)
+    return f"""
+async () => {{
+    const resp = await window.fetch({url_literal}, {{
+        method: "POST",
+        credentials: "include",
+        headers: {{
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream, text/plain, */*"
+        }},
+        body: {body_literal}
+    }});
+    const contentType = (resp.headers && resp.headers.get("content-type")) || "";
+    const cfMitigated = (resp.headers && resp.headers.get("cf-mitigated")) || "";
+    if (!resp.ok) {{
+        let errBody = "";
+        try {{ errBody = await resp.text(); }} catch (_) {{}}
+        return {{
+            ok: false,
+            status: resp.status,
+            body: errBody,
+            contentType: contentType,
+            cfMitigated: cfMitigated
+        }};
+    }}
+    if (typeof window.__arenaDirectMeta === "function") {{
+        await window.__arenaDirectMeta(contentType);
+    }}
+    if (!resp.body || typeof resp.body.getReader !== "function") {{
+        const full = await resp.text();
+        if (full && typeof window.__arenaDirectChunk === "function") {{
+            await window.__arenaDirectChunk(full);
+        }}
+        return {{ ok: true, status: resp.status, contentType: contentType }};
+    }}
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    while (true) {{
+        const {{ value, done }} = await reader.read();
+        if (done) break;
+        if (value && value.length) {{
+            const piece = decoder.decode(value, {{ stream: true }});
+            if (piece && typeof window.__arenaDirectChunk === "function") {{
+                await window.__arenaDirectChunk(piece);
+            }}
+        }}
+    }}
+    const tail = decoder.decode();
+    if (tail && typeof window.__arenaDirectChunk === "function") {{
+        await window.__arenaDirectChunk(tail);
+    }}
+    return {{ ok: true, status: resp.status, contentType: contentType }};
+}}
+"""
+
+
+class _RetryInHeadedBrowser(Exception):
+    """Internal signal to retry a Direct Chat browser request in headed mode."""
+
+
 class DirectVerificationToken:
     """Callable producing a fresh reCAPTCHA v3 assertion for Direct Chat.
 
@@ -1681,12 +1900,17 @@ class DirectVerificationToken:
         page_url: str | None = None,
         solver: Any | None = None,
         session_cookies: Mapping[str, str] | None = None,
+        session_manager: Any | None = None,
+        cookie_source: str | None = None,
     ) -> None:
         self.options = options or AutoOptions()
         self.page_url = page_url or (
             self.options.base_url.rstrip("/") + DIRECT_PAGE_PATH
         )
         self.session_cookies = dict(session_cookies) if session_cookies else None
+        self.session_manager = session_manager
+        self.cookie_source = cookie_source
+        self._refreshed_cookies: dict[str, str] | None = None
         base = solver or resolve_solver(self.options) or RecaptchaToolkitSolver(
             backend=self.options.captcha_backend
         )
@@ -1699,13 +1923,7 @@ class DirectVerificationToken:
             else base
         )
 
-    async def afetch(self) -> str:
-        """Fetch a token asynchronously.
-
-        :raises arena_api.exceptions.AuthenticationError: when the configured
-            solver cannot produce a token at all, or produced none -- an empty
-            assertion must never be sent silently.
-        """
+    def _check_solver_ready(self) -> None:
         self._require_a_token_solver()
         if isinstance(self.solver, RecaptchaToolkitSolver) and not (
             solver_dependencies_available(self.solver.backend)
@@ -1716,6 +1934,53 @@ class DirectVerificationToken:
                 "'.[auth-captcha]' and playwright install chromium "
                 f"(backend '{self.solver.backend}' reports them missing)."
             )
+
+    def _current_cookies(self) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        if self.session_cookies:
+            merged.update(self.session_cookies)
+        load = getattr(self.session_manager, "load_cookies", None)
+        if callable(load):
+            try:
+                loaded = load()
+            except Exception:  # noqa: BLE001
+                loaded = None
+            if isinstance(loaded, Mapping) and loaded:
+                merged.update({str(k): str(v) for k, v in loaded.items()})
+        if self._refreshed_cookies:
+            merged.update(self._refreshed_cookies)
+        return merged
+
+    async def _mint_token_on_page(self, page: Any) -> str:
+        if isinstance(self.solver, RecaptchaToolkitSolver) and callable(
+            getattr(page, "evaluate", None)
+        ):
+            js = _build_execute_recaptcha_v3_js(
+                _default_recaptcha_site_key(self.page_url)
+            )
+            try:
+                direct_tok = await page.evaluate(js)
+            except Exception:  # noqa: BLE001
+                direct_tok = None
+            if isinstance(direct_tok, str) and direct_tok.strip():
+                return direct_tok.strip()
+        attempt = await self.solver.asolve(page)
+        token = attempt.raise_for_status()
+        if not token:
+            raise AuthenticationError(
+                "the solver cleared the page but produced no assertion "
+                f"({attempt.describe()}); Direct Chat needs a v3 token"
+            )
+        return token
+
+    async def afetch(self) -> str:
+        """Fetch a token asynchronously.
+
+        :raises arena_api.exceptions.AuthenticationError: when the configured
+            solver cannot produce a token at all, or produced none -- an empty
+            assertion must never be sent silently.
+        """
+        self._check_solver_ready()
         resolved_proxy = resolve_proxy_url(
             self.options.base_url,
             self.options.proxy,
@@ -1748,8 +2013,15 @@ class DirectVerificationToken:
                     handler.solve_on_detection = False
                 page = await environment.new_page()
                 context = getattr(page, "context", None)
+                seed_cookies = (
+                    _seedable_browser_cookies(
+                        self.session_cookies, cookie_source=self.cookie_source
+                    )
+                    if self.session_cookies
+                    else None
+                )
                 if (
-                    self.session_cookies
+                    seed_cookies
                     and context is not None
                     and callable(getattr(context, "add_cookies", None))
                 ):
@@ -1760,35 +2032,16 @@ class DirectVerificationToken:
                                 "value": str(value),
                                 "url": self.options.base_url,
                             }
-                            for name, value in self.session_cookies.items()
+                            for name, value in seed_cookies.items()
                         ]
                     )
                 await page.goto(self.page_url, wait_until="domcontentloaded")
-                if isinstance(self.solver, RecaptchaToolkitSolver) and callable(
-                    getattr(page, "evaluate", None)
-                ):
-                    js = _build_execute_recaptcha_v3_js(
-                        _default_recaptcha_site_key(self.page_url)
-                    )
-                    try:
-                        direct_tok = await page.evaluate(js)
-                    except Exception:  # noqa: BLE001
-                        direct_tok = None
-                    if isinstance(direct_tok, str) and direct_tok.strip():
-                        return direct_tok.strip()
-                attempt = await self.solver.asolve(page)
-                token = attempt.raise_for_status()
-                if not token:
-                    raise AuthenticationError(
-                        "the solver cleared the page but produced no assertion "
-                        f"({attempt.describe()}); Direct Chat needs a v3 token"
-                    )
-                return token
+                return await self._mint_token_on_page(page)
         except ArenaError:
             raise
         except Exception as exc:  # noqa: BLE001
             detail = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-            if "Executable doesn't exist" in str(exc):
+            if _is_missing_browser_error(exc):
                 raise AuthenticationError(
                     f"Direct Chat verification browser could not be started: {detail} "
                     "Install Chromium (`python -m playwright install chromium`) or "
@@ -1796,6 +2049,369 @@ class DirectVerificationToken:
                     "`--channel chrome`."
                 ) from exc
             raise
+
+    def _raise_browser_http_error(
+        self,
+        status: int,
+        body: str,
+        headers: Mapping[str, str],
+    ) -> None:
+        mitigated = headers.get("cf-mitigated", "").lower() == "challenge"
+        if mitigated or (status in (403, 503) and _looks_like_challenge(body, headers)):
+            raise ChallengeRequiredError(
+                f"The service requested an interactive browser verification (HTTP {status}). "
+                "Refresh or verify the session in a normal browser and retry."
+            )
+        detail = _extract_error_detail(body)
+        suffix = f": {detail}" if detail else ""
+        if status in (401, 403):
+            if _is_verification_rejection(body):
+                raise ProtocolError(
+                    f"Arena rejected the request verification token (HTTP {status}){suffix}."
+                )
+            lowered = (body or "").lower()
+            if status == 401 or any(m in lowered for m in _AUTH_REJECT_MARKERS):
+                raise AuthenticationError(
+                    f"The supplied session was rejected (HTTP {status}){suffix}. "
+                    f"Sign in at {self.options.base_url} in your browser "
+                    "(or run `python -m arena_api --login`) and retry."
+                )
+            raise ArenaError(
+                f"Arena Direct Chat rejected the request (HTTP {status}){suffix}."
+            )
+        _raise_for_status(status, body, headers)
+
+    @asynccontextmanager
+    async def _attempt_browser_evaluation(
+        self,
+        endpoint_path: str,
+        body_factory: Callable[[str], Mapping[str, Any]],
+        *,
+        headless: bool,
+        allow_headed_retry: bool,
+        timeout: float,
+    ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
+        resolved_proxy = resolve_proxy_url(
+            self.options.base_url,
+            self.options.proxy,
+            fallback_proxy=_firefox_fallback_proxy(self.options),
+        )
+        channels = _candidate_browser_channels(self.options.channel)
+        environment: Any = None
+        last_missing_exc: BaseException | None = None
+        for channel in channels:
+            env_kwargs: dict[str, Any] = {
+                "headless": headless,
+                "artifacts_dir": self.options.artifacts_dir,
+                "install_determinism_script": False,
+                "reduced_motion": "no-preference",
+                "color_scheme": "no-preference",
+                "ignore_default_args": AUTOMATION_DEFAULT_ARGS_TO_DROP,
+                "launch_args": (AUTOMATION_BLINK_SWITCH,),
+                "extra_init_scripts": (HIDE_WEBDRIVER_SCRIPT,),
+            }
+            if channel is not None:
+                env_kwargs["channel"] = channel
+            if resolved_proxy:
+                env_kwargs["proxy"] = resolved_proxy
+            env_options = BrowserEnvironmentOptions.with_captcha_solving(
+                self.solver, **env_kwargs
+            )
+            candidate_env = BrowserEnvironment(env_options)
+            try:
+                environment = await candidate_env.__aenter__()
+                break
+            except Exception as exc:  # noqa: BLE001
+                if _is_missing_browser_error(exc):
+                    last_missing_exc = exc
+                    continue
+                raise
+        if environment is None:
+            detail = (
+                str(last_missing_exc).splitlines()[0]
+                if last_missing_exc
+                else "no browser executable found"
+            )
+            raise AuthenticationError(
+                f"Direct Chat verification browser could not be started: {detail} "
+                "Install Chromium (`python -m playwright install chromium`) or "
+                "use your installed browser with `--channel msedge` / "
+                "`--channel chrome`."
+            ) from last_missing_exc
+
+        try:
+            handler = getattr(environment, "challenge_handler", None)
+            if handler is not None:
+                handler.solve_on_detection = False
+            page = await environment.new_page()
+            context = getattr(page, "context", None)
+            raw_cookies = self._current_cookies()
+            seed_cookies = _seedable_browser_cookies(
+                raw_cookies, cookie_source=self.cookie_source
+            )
+            if (
+                seed_cookies
+                and context is not None
+                and callable(getattr(context, "add_cookies", None))
+            ):
+                await context.add_cookies(
+                    [
+                        {
+                            "name": str(name),
+                            "value": str(value),
+                            "url": self.options.base_url,
+                        }
+                        for name, value in seed_cookies.items()
+                    ]
+                )
+            await page.goto(self.page_url, wait_until="domcontentloaded")
+            wait_for_timeout = getattr(page, "wait_for_timeout", None)
+            if callable(wait_for_timeout):
+                await wait_for_timeout(500)
+            page_content_fn = getattr(page, "content", None)
+            if callable(page_content_fn):
+                try:
+                    html = await page_content_fn()
+                except Exception:  # noqa: BLE001
+                    html = ""
+                if isinstance(html, str) and _looks_like_challenge(html, None):
+                    if allow_headed_retry:
+                        raise _RetryInHeadedBrowser("Cloudflare challenge in headless mode")
+                    if not headless and callable(wait_for_timeout):
+                        wait_deadline = time.monotonic() + min(timeout, 45.0)
+                        while time.monotonic() < wait_deadline:
+                            await wait_for_timeout(500)
+                            try:
+                                html = await page_content_fn()
+                            except Exception:  # noqa: BLE001
+                                break
+                            if not (
+                                isinstance(html, str)
+                                and _looks_like_challenge(html, None)
+                            ):
+                                break
+            if _arena_auth_jwt_expired(raw_cookies) and callable(
+                getattr(page, "evaluate", None)
+            ):
+                stale_raw = _reconstruct_supabase_cookie(raw_cookies)
+                try:
+                    await page.evaluate(_build_wait_supabase_refresh_js(stale_raw))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            token = await self._mint_token_on_page(page)
+            payload_body = dict(body_factory(token))
+            serialized = json.dumps(payload_body, separators=(",", ":"))
+
+            async_q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            expose_fn = getattr(page, "expose_function", None)
+            if callable(expose_fn):
+                await expose_fn(
+                    "__arenaDirectMeta",
+                    lambda ct: async_q.put_nowait(("meta", str(ct or ""))),
+                )
+                await expose_fn(
+                    "__arenaDirectChunk",
+                    lambda piece: async_q.put_nowait(
+                        ("chunk", str(piece).encode("utf-8"))
+                    ),
+                )
+
+            eval_js = _build_browser_fetch_stream_js(endpoint_path, serialized)
+            eval_task: asyncio.Task[Any] = asyncio.create_task(page.evaluate(eval_js))
+            eval_task.add_done_callback(
+                lambda done_task: async_q.put_nowait(("done", done_task))
+            )
+
+            try:
+                first_kind, first_val = await asyncio.wait_for(
+                    async_q.get(), timeout=timeout
+                )
+            except asyncio.TimeoutError as exc:
+                eval_task.cancel()
+                raise TimeoutError(
+                    "Direct Chat browser request timed out waiting for response headers."
+                ) from exc
+
+            if first_kind == "done":
+                result = first_val.result()
+                if isinstance(result, Mapping) and not result.get("ok", True):
+                    status = int(result.get("status") or 500)
+                    err_body = str(result.get("body") or "")
+                    resp_headers = {
+                        "content-type": str(result.get("contentType") or ""),
+                        "cf-mitigated": str(result.get("cfMitigated") or ""),
+                    }
+                    lowered_err = err_body.lower()
+                    if (
+                        allow_headed_retry
+                        and status in (401, 403)
+                        and not any(m in lowered_err for m in _AUTH_REJECT_MARKERS)
+                    ):
+                        raise _RetryInHeadedBrowser(f"HTTP {status}")
+                    self._raise_browser_http_error(status, err_body, resp_headers)
+                content_type = (
+                    str(result.get("contentType") or "")
+                    if isinstance(result, Mapping)
+                    else ""
+                )
+
+                async def _empty_stream() -> AsyncIterator[bytes]:
+                    if False:
+                        yield b""
+
+                yield content_type, _empty_stream()
+                return
+
+            buffered_first_chunk: bytes | None = None
+            if first_kind == "chunk":
+                content_type = ""
+                buffered_first_chunk = first_val
+            else:
+                content_type = str(first_val or "")
+
+            async def _iter_chunks() -> AsyncIterator[bytes]:
+                try:
+                    if buffered_first_chunk:
+                        yield buffered_first_chunk
+                    while True:
+                        item_kind, item_val = await asyncio.wait_for(
+                            async_q.get(), timeout=timeout
+                        )
+                        if item_kind == "chunk":
+                            if item_val:
+                                yield item_val
+                        elif item_kind == "done":
+                            await item_val
+                            break
+                finally:
+                    if not eval_task.done():
+                        eval_task.cancel()
+                        try:
+                            await eval_task
+                        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                            pass
+
+            yield content_type, _iter_chunks()
+
+            cookies_fn = getattr(context, "cookies", None)
+            if callable(cookies_fn):
+                try:
+                    browser_cookies = await cookies_fn([self.options.base_url])
+                except Exception:  # noqa: BLE001
+                    browser_cookies = None
+                if isinstance(browser_cookies, Sequence):
+                    updated = {
+                        str(c["name"]): str(c["value"])
+                        for c in browser_cookies
+                        if isinstance(c, Mapping)
+                        and isinstance(c.get("name"), str)
+                        and c["name"].startswith("arena-auth-")
+                        and isinstance(c.get("value"), str)
+                    }
+                    if updated:
+                        self._refreshed_cookies = updated
+        finally:
+            await environment.__aexit__(None, None, None)
+
+    @asynccontextmanager
+    async def astream_evaluation(
+        self,
+        endpoint_path: str,
+        body_factory: Callable[[str], Mapping[str, Any]],
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+    ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
+        """Mint a fresh v3 assertion and stream ``endpoint_path`` inside the same browser tab."""
+        self._check_solver_ready()
+        allow_headed = bool(self.options.interactive)
+        try:
+            async with self._attempt_browser_evaluation(
+                endpoint_path,
+                body_factory,
+                headless=True,
+                allow_headed_retry=allow_headed,
+                timeout=timeout,
+            ) as outcome:
+                yield outcome
+                return
+        except _RetryInHeadedBrowser as reason:
+            print(
+                f"[arena-api] headless Direct Chat verification was rejected ({reason}); "
+                "retrying in a browser window...",
+                file=sys.stderr,
+                flush=True,
+            )
+        async with self._attempt_browser_evaluation(
+            endpoint_path,
+            body_factory,
+            headless=False,
+            allow_headed_retry=False,
+            timeout=timeout,
+        ) as outcome:
+            yield outcome
+
+    @contextmanager
+    def stream_evaluation(
+        self,
+        endpoint_path: str,
+        body_factory: Callable[[str], Mapping[str, Any]],
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+    ) -> Iterator[tuple[str, Iterator[bytes]]]:
+        """Synchronous streaming bridge over :meth:`astream_evaluation`."""
+        sync_q: queue.Queue[tuple[str, Any]] = queue.Queue()
+        stop_event = threading.Event()
+
+        async def _driver() -> None:
+            try:
+                async with self.astream_evaluation(
+                    endpoint_path, body_factory, timeout=timeout
+                ) as (content_type, async_chunks):
+                    sync_q.put(("meta", content_type))
+                    async for wire in async_chunks:
+                        if stop_event.is_set():
+                            break
+                        sync_q.put(("chunk", wire))
+                sync_q.put(("eof", None))
+            except BaseException as exc:
+                sync_q.put(("err", exc))
+
+        worker = threading.Thread(
+            target=lambda: asyncio.run(_driver()),
+            name="arena-direct-browser-stream",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            first_kind, first_payload = sync_q.get(timeout=timeout + 15.0)
+            if first_kind == "err":
+                raise first_payload
+            content_type = str(first_payload or "") if first_kind == "meta" else ""
+
+            def _sync_chunks() -> Iterator[bytes]:
+                if first_kind == "chunk" and first_payload:
+                    yield first_payload
+                while True:
+                    kind, payload = sync_q.get(timeout=timeout + 15.0)
+                    if kind == "chunk":
+                        if payload:
+                            yield payload
+                    elif kind == "eof":
+                        break
+                    elif kind == "err":
+                        raise payload
+
+            yield content_type, _sync_chunks()
+        finally:
+            stop_event.set()
+            worker.join(timeout=5.0)
+
+    def close(self) -> None:
+        self._refreshed_cookies = None
+
+    async def aclose(self) -> None:
+        self.close()
 
     def _require_a_token_solver(self) -> None:
         """Refuse a solver that cannot produce a reCAPTCHA token.
@@ -1825,6 +2441,9 @@ class DirectVerificationToken:
         return run_sync(self.afetch())
 
 
+setattr(DirectVerificationToken.afetch, "_is_default_direct_afetch", True)
+
+
 def auto_direct_client(
     options: AutoOptions | None = None,
     *,
@@ -1845,7 +2464,10 @@ def auto_direct_client(
     manager, _ = prepared
     if isinstance(verification_token, str) and verification_token.strip().lower() == "auto":
         verification_token = DirectVerificationToken(
-            options, session_cookies=manager.load_cookies()
+            options,
+            session_cookies=manager.load_cookies(),
+            session_manager=manager,
+            cookie_source=_cookie_source_for_manager(manager),
         )
     return _verified(
         DirectArenaClient(
@@ -1879,7 +2501,10 @@ async def auto_async_direct_client(
     manager, _ = prepared
     if isinstance(verification_token, str) and verification_token.strip().lower() == "auto":
         verification_token = DirectVerificationToken(
-            options, session_cookies=manager.load_cookies()
+            options,
+            session_cookies=manager.load_cookies(),
+            session_manager=manager,
+            cookie_source=_cookie_source_for_manager(manager),
         )
     return await _averified(
         AsyncDirectArenaClient(
@@ -2272,7 +2897,10 @@ def _direct_client_for_cli(
         tok = verification_token
         if isinstance(tok, str) and tok.strip().lower() == "auto":
             tok = DirectVerificationToken(
-                options, session_cookies=shared_manager.load_cookies()
+                options,
+                session_cookies=shared_manager.load_cookies(),
+                session_manager=shared_manager,
+                cookie_source=_cookie_source_for_manager(shared_manager),
             )
         return DirectArenaClient(
             base_url=options.base_url,
