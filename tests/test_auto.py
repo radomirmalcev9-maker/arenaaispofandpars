@@ -3230,3 +3230,489 @@ def test_direct_composer_submission_uses_native_ui_without_forcing_model_and_han
     assert getattr(seen_env_options[0], "timezone_id") is None
 
 
+def test_post_submit_recaptcha_anchor_checkbox_clicked_without_expose_function(
+    tmp_path, monkeypatch
+) -> None:
+    mouse_clicks: list[tuple[float, float]] = []
+    mouse_moves: list[tuple[float, float]] = []
+
+    class FakeRequest:
+        def __init__(self, url: str, method: str = "POST") -> None:
+            self.url = url
+            self.method = method
+
+    class FakeResponse:
+        def __init__(self, url: str, status: int, body: str, content_type: str) -> None:
+            self.url = url
+            self.status = status
+            self._body = body
+            self.headers = {"content-type": content_type}
+            self.request = FakeRequest(url, "POST")
+
+        async def text(self) -> str:
+            return self._body
+
+    class FakeLocator:
+        def __init__(self, selector: str, page: "NetworkEventPage") -> None:
+            self.selector = selector
+            self._page = page
+
+        @property
+        def first(self) -> "FakeLocator":
+            return self
+
+        async def click(self) -> None:
+            if "data-arena-send" in self.selector:
+                self._page._on_send_clicked()
+
+        async def fill(self, value: str) -> None:
+            return None
+
+        async def press(self, key: str) -> None:
+            raise AssertionError("Enter must not be pressed on explicit Send button")
+
+    class FakeKeyboard:
+        async def type(self, text: str, delay: int = 0) -> None:
+            return None
+
+    class FakeMouse:
+        def __init__(self, page: "NetworkEventPage") -> None:
+            self._page = page
+
+        async def move(self, x: float, y: float, steps: int = 1) -> None:
+            mouse_moves.append((x, y))
+
+        async def click(self, x: float, y: float, delay: int = 0) -> None:
+            mouse_clicks.append((x, y))
+            self._page._on_anchor_checkbox_clicked()
+
+    class FakeContext:
+        async def cookies(self, urls=None):
+            return [
+                {"name": "_GRECAPTCHA", "value": "existing-google-trust"},
+                {"name": "arena-auth-prod-v1.0", "value": "refreshed-jwt"},
+            ]
+
+        async def add_cookies(self, cookies) -> None:
+            return None
+
+    class NetworkEventPage:
+        def __init__(self, *, headless: bool) -> None:
+            self._headless = headless
+            self.context = FakeContext()
+            self.keyboard = FakeKeyboard()
+            self.mouse = FakeMouse(self)
+            self.frames: list[object] = []
+            self._listeners: dict[str, list[object]] = {}
+            self._anchor_visible = False
+
+        def on(self, event: str, cb: object) -> None:
+            self._listeners.setdefault(event, []).append(cb)
+
+        def remove_listener(self, event: str, cb: object) -> None:
+            if event in self._listeners and cb in self._listeners[event]:
+                self._listeners[event].remove(cb)
+
+        async def expose_function(self, name: str, fn: object) -> None:
+            raise AssertionError(
+                "expose_function must not be called when page.on('response') is available"
+            )
+
+        def _emit(self, event: str, payload: object) -> None:
+            for cb in list(self._listeners.get(event, ())):
+                assert callable(cb)
+                cb(payload)
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector, self)
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def content(self) -> str:
+            return "<html><body><form><textarea></textarea><button type='submit'>Send</button></form></body></html>"
+
+        def _on_send_clicked(self) -> None:
+            url = "https://arena.ai/nextjs-api/stream/create-evaluation"
+            self._emit("request", FakeRequest(url))
+            self._emit(
+                "response",
+                FakeResponse(
+                    url,
+                    403,
+                    '{"error":"recaptcha validation failed"}',
+                    "application/json",
+                ),
+            )
+            if not self._headless:
+                self._anchor_visible = True
+
+        def _on_anchor_checkbox_clicked(self) -> None:
+            self._anchor_visible = False
+            url = "https://arena.ai/nextjs-api/stream/create-evaluation"
+            self._emit("request", FakeRequest(url))
+            self._emit(
+                "response",
+                FakeResponse(
+                    url,
+                    200,
+                    'a0:"Капча пройдена автоматически!"\nad:{"finishReason":"stop"}\n',
+                    "text/plain; charset=utf-8",
+                ),
+            )
+
+        async def evaluate(self, script: str) -> object:
+            if "arena_cleanup_marks" in script:
+                return None
+            if "composer_nonempty" in script:
+                return True
+            if "data-arena-composer" in script and "data-arena-send" not in script:
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {
+                    "found": True,
+                    "confidence": "explicit",
+                    "x": 650,
+                    "y": 700,
+                }
+            if "recaptcha_anchor" in script:
+                if self._anchor_visible:
+                    return {
+                        "kind": "recaptcha_anchor",
+                        "x": 420,
+                        "y": 510,
+                        "width": 304,
+                        "height": 78,
+                    }
+                return {"kind": None}
+            raise AssertionError(f"unexpected evaluate script: {script[:80]}")
+
+    class FakeEnv:
+        def __init__(self, options) -> None:
+            self.options = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def new_page(self):
+            return NetworkEventPage(headless=self.options.headless)
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=RecaptchaToolkitSolver(),
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+        cookie_source="firefox",
+    )
+
+    client = auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        cookies={"arena-auth-prod-v1.0": "jwt"},
+        verification_token=tok,
+    )
+    try:
+        answer = client.complete("Привет!")
+        assert tok._refreshed_cookies == {"arena-auth-prod-v1.0": "refreshed-jwt"}
+    finally:
+        client.close()
+
+    assert answer == "Капча пройдена автоматически!"
+    assert mouse_clicks == [(420, 510)]
+    assert (420, 510) in mouse_moves
+
+
+def test_post_submit_bframe_skips_audio_without_ffmpeg_and_resends_after_human_solve(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(auto_module.shutil, "which", lambda cmd: None)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+    audio_solver = RecaptchaToolkitSolver(backend="audio")
+    assert auto_module._can_auto_solve_bframe(audio_solver) is False
+
+    send_clicks = 0
+    brought_to_front = 0
+
+    class FakeRequest:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.method = "POST"
+
+    class FakeResponse:
+        def __init__(self, url: str, status: int, body: str, content_type: str) -> None:
+            self.url = url
+            self.status = status
+            self._body = body
+            self.headers = {"content-type": content_type}
+            self.request = FakeRequest(url)
+
+        async def text(self) -> str:
+            return self._body
+
+    class FakeLocator:
+        def __init__(self, selector: str, page: "BframePage") -> None:
+            self.selector = selector
+            self._page = page
+
+        @property
+        def first(self) -> "FakeLocator":
+            return self
+
+        async def click(self) -> None:
+            nonlocal send_clicks
+            if "data-arena-send" in self.selector:
+                send_clicks += 1
+                self._page._on_send(send_clicks)
+
+        async def fill(self, value: str) -> None:
+            return None
+
+    class FakeKeyboard:
+        async def type(self, text: str, delay: int = 0) -> None:
+            return None
+
+    class FakeMouse:
+        async def move(self, x: float, y: float, steps: int = 1) -> None:
+            return None
+
+    class FakeContext:
+        async def cookies(self, urls=None):
+            return []
+
+        async def add_cookies(self, cookies) -> None:
+            return None
+
+    class BframePage:
+        def __init__(self) -> None:
+            self.context = FakeContext()
+            self.keyboard = FakeKeyboard()
+            self.mouse = FakeMouse()
+            self._listeners: dict[str, list[object]] = {}
+            self._bframe_checks = 0
+            self._composer_has_text = True
+
+        def on(self, event: str, cb: object) -> None:
+            self._listeners.setdefault(event, []).append(cb)
+
+        def remove_listener(self, event: str, cb: object) -> None:
+            return None
+
+        async def bring_to_front(self) -> None:
+            nonlocal brought_to_front
+            brought_to_front += 1
+
+        def _emit(self, event: str, payload: object) -> None:
+            for cb in list(self._listeners.get(event, ())):
+                assert callable(cb)
+                cb(payload)
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector, self)
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def content(self) -> str:
+            return "<html><body><form><textarea></textarea><button type='submit'>Send</button></form></body></html>"
+
+        def _on_send(self, attempt_no: int) -> None:
+            url = "https://arena.ai/nextjs-api/stream/create-evaluation"
+            self._emit("request", FakeRequest(url))
+            if attempt_no == 1:
+                self._emit(
+                    "response",
+                    FakeResponse(
+                        url,
+                        403,
+                        '{"error":"recaptcha validation failed"}',
+                        "application/json",
+                    ),
+                )
+            else:
+                self._composer_has_text = False
+                self._emit(
+                    "response",
+                    FakeResponse(
+                        url,
+                        200,
+                        'a0:"Ответ после ручной капчи"\nad:{"finishReason":"stop"}\n',
+                        "text/plain; charset=utf-8",
+                    ),
+                )
+
+        async def evaluate(self, script: str) -> object:
+            if "arena_cleanup_marks" in script:
+                return None
+            if "composer_nonempty" in script:
+                return self._composer_has_text
+            if "data-arena-composer" in script and "data-arena-send" not in script:
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {
+                    "found": True,
+                    "confidence": "explicit",
+                    "x": 650,
+                    "y": 700,
+                }
+            if "recaptcha_anchor" in script:
+                self._bframe_checks += 1
+                if self._bframe_checks <= 2:
+                    return {
+                        "kind": "recaptcha_bframe",
+                        "x": 500,
+                        "y": 400,
+                        "width": 400,
+                        "height": 580,
+                    }
+                return {"kind": None}
+            raise AssertionError(f"unexpected evaluate script: {script[:80]}")
+
+    class FakeEnv:
+        def __init__(self, options) -> None:
+            self.options = options
+
+        async def __aenter__(self):
+            if self.options.headless:
+                raise auto_module._RetryInHeadedBrowser("skip headless in test")
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def new_page(self):
+            return BframePage()
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnv)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=audio_solver,
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+    )
+    client = auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        cookies={"arena-auth-prod-v1.0": "jwt"},
+        verification_token=tok,
+        timeout=10.0,
+    )
+    try:
+        answer = client.complete("Тест капчи")
+    finally:
+        client.close()
+
+    stderr = capsys.readouterr().err
+    assert answer == "Ответ после ручной капчи"
+    assert "после отправки появилась капча" in stderr
+    assert brought_to_front >= 1
+    assert send_clicks == 2
+
+
+def test_seed_direct_context_cookies_preserves_existing_trust_cookies() -> None:
+    added_batches: list[list[dict[str, str]]] = []
+
+    class FakeContext:
+        async def cookies(self):
+            return [
+                {"name": "_GRECAPTCHA", "value": "persisted-grecaptcha"},
+                {"name": "cf_clearance", "value": "persisted-cf"},
+                {"name": "arena-auth-prod-v1.0", "value": "old-jwt"},
+            ]
+
+        async def add_cookies(self, cookies: list[dict[str, str]]) -> None:
+            added_batches.append(cookies)
+
+    asyncio.run(
+        auto_module._seed_direct_context_cookies(
+            FakeContext(),
+            {
+                "_GRECAPTCHA": "new-grecaptcha-should-not-overwrite",
+                "cf_clearance": "new-cf-should-not-overwrite",
+                "arena-auth-prod-v1.0": "fresh-jwt",
+            },
+            "https://arena.ai",
+        )
+    )
+    assert added_batches == [
+        [
+            {
+                "name": "arena-auth-prod-v1.0",
+                "value": "fresh-jwt",
+                "url": "https://arena.ai",
+            }
+        ]
+    ]
+
+
+def test_live_browser_interactive_skips_headless_preattempt_and_falls_back_if_no_display(
+    tmp_path, monkeypatch
+) -> None:
+    seen_calls: list[tuple[bool, object]] = []
+
+    monkeypatch.setattr(
+        auto_module, "BrowserEnvironment", auto_module._DEFAULT_BROWSER_ENVIRONMENT
+    )
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=RecaptchaToolkitSolver(),
+    )
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake_attempt(
+        endpoint_path,
+        body_factory,
+        *,
+        headless,
+        allow_headed_retry,
+        timeout,
+        prompt=None,
+        model_id_override=None,
+        generation_params=None,
+        follow_up=False,
+        user_data_dir=None,
+    ):
+        seen_calls.append((headless, user_data_dir))
+        if not headless:
+            raise RuntimeError("Missing X server or $DISPLAY")
+
+        async def _chunks():
+            yield b'a0:"ok"\nad:{"finishReason":"stop"}\n'
+
+        yield ("text/plain", _chunks())
+
+    monkeypatch.setattr(tok, "_attempt_browser_evaluation", fake_attempt)
+
+    async def _run() -> bytes:
+        out = bytearray()
+        async with tok.astream_evaluation(
+            "/nextjs-api/stream/create-evaluation",
+            lambda t: {"recaptchaV3Token": t},
+            prompt="Hi",
+        ) as (_, chunks):
+            async for part in chunks:
+                out.extend(part)
+        return bytes(out)
+
+    raw = asyncio.run(_run())
+    assert b'a0:"ok"' in raw
+    expected_profile = auto_module._direct_browser_profile_dir(tok.options)
+    assert seen_calls == [
+        (False, expected_profile),
+        (True, expected_profile),
+    ]
+
+
+

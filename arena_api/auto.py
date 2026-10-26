@@ -63,6 +63,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -1873,118 +1874,122 @@ async () => {{
 """
 
 
-_INSTALL_FETCH_STREAM_TAP_SCRIPT = """
-(function () {
-  if (window.__arenaFetchTapInstalled) return;
-  window.__arenaFetchTapInstalled = true;
+_EVAL_STREAM_URL_MARKERS = (
+    "/nextjs-api/stream/create-evaluation",
+    "/nextjs-api/stream/post-to-evaluation/",
+    "/nextjs-api/stream/create-chat",
+)
+
+_PRESERVED_TRUST_COOKIE_PREFIXES = (
+    "_GRECAPTCHA",
+    "cf_clearance",
+    "__cf_bm",
+    "_cfuvid",
+    "NID",
+    "AEC",
+)
+
+
+def _is_eval_stream_url(raw_url: str) -> bool:
+    return any(marker in raw_url for marker in _EVAL_STREAM_URL_MARKERS)
+
+
+def _is_missing_display_error(exc: BaseException) -> bool:
+    lowered = str(exc).lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "missing x server",
+            "cannot open display",
+            "$display",
+            "ozone_platform",
+            "headed browser without having a xserver",
+        )
+    )
+
+
+def _direct_browser_profile_dir(options: AutoOptions) -> Path:
+    base_state = (
+        Path(options.storage_path).expanduser()
+        if options.storage_path is not None
+        else Path(DEFAULT_STATE_PATH)
+    )
+    return base_state.parent / "direct_browser_profile"
+
+
+async def _seed_direct_context_cookies(
+    context: Any,
+    seed_cookies: Mapping[str, str],
+    base_url: str,
+) -> None:
+    if not seed_cookies or context is None:
+        return
+    add_cookies_fn = getattr(context, "add_cookies", None)
+    if not callable(add_cookies_fn):
+        return
+    preserved_existing: set[str] = set()
+    cookies_fn = getattr(context, "cookies", None)
+    if callable(cookies_fn):
+        try:
+            existing = await cookies_fn()
+        except Exception:  # noqa: BLE001
+            existing = None
+        if isinstance(existing, Sequence):
+            for item in existing:
+                if not isinstance(item, Mapping):
+                    continue
+                name = str(item.get("name") or "")
+                value = str(item.get("value") or "")
+                if value and name.startswith(_PRESERVED_TRUST_COOKIE_PREFIXES):
+                    preserved_existing.add(name)
+    payload = [
+        {
+            "name": str(name),
+            "value": str(value),
+            "url": base_url,
+        }
+        for name, value in seed_cookies.items()
+        if name not in preserved_existing
+    ]
+    if payload:
+        await add_cookies_fn(payload)
+
+
+def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
+    patch_literal = json.dumps(dict(patch_obj), separators=(",", ":"))
+    return f"""
+() => {{
+  const patch = {patch_literal};
   const origFetch = window.fetch;
-  if (typeof origFetch !== "function") return;
-
-  function isEvalStreamUrl(rawUrl) {
-    return (
-      typeof rawUrl === "string" &&
-      (rawUrl.indexOf("/nextjs-api/stream/create-evaluation") !== -1 ||
-        rawUrl.indexOf("/nextjs-api/stream/post-to-evaluation/") !== -1 ||
-        rawUrl.indexOf("/nextjs-api/stream/create-chat") !== -1)
-    );
-  }
-
-  window.fetch = async function (input, init) {
+  if (typeof origFetch !== "function" || window.__arenaPatchInstalled) return;
+  window.__arenaPatchInstalled = true;
+  window.fetch = function (input, init) {{
     let urlStr = "";
-    try {
+    try {{
       urlStr = typeof input === "string" ? input : (input && input.url) || "";
-    } catch (_) {}
-
-    if (!window.__arenaTapArmed || !isEvalStreamUrl(urlStr)) {
-      return origFetch.apply(this, arguments);
-    }
-
-    let nextInit = init;
-    const patch = window.__arenaBodyPatch;
-    if (patch && init && typeof init.body === "string") {
-      try {
+    }} catch (_) {{}}
+    if (
+      init &&
+      typeof init.body === "string" &&
+      (urlStr.indexOf("/nextjs-api/stream/create-evaluation") !== -1 ||
+        urlStr.indexOf("/nextjs-api/stream/post-to-evaluation/") !== -1 ||
+        urlStr.indexOf("/nextjs-api/stream/create-chat") !== -1)
+    ) {{
+      try {{
         const parsed = JSON.parse(init.body);
-        if (parsed && typeof parsed === "object") {
+        if (parsed && typeof parsed === "object") {{
           if (patch.modelAId) parsed.modelAId = patch.modelAId;
           if (patch.generationConfig) parsed.generationConfig = patch.generationConfig;
-          nextInit = Object.assign({}, init, { body: JSON.stringify(parsed) });
-        }
-      } catch (_) {}
-    }
-
-    const resp = nextInit === init
-      ? await origFetch.apply(this, arguments)
-      : await origFetch.call(this, input, nextInit);
-    const contentType = (resp.headers && resp.headers.get("content-type")) || "";
-    const cfMitigated = (resp.headers && resp.headers.get("cf-mitigated")) || "";
-
-    if (!resp.ok) {
-      let errBody = "";
-      try {
-        errBody = await resp.clone().text();
-      } catch (_) {}
-      if (typeof window.__arenaDirectHttpError === "function") {
-        try {
-          await window.__arenaDirectHttpError({
-            status: resp.status,
-            body: errBody,
-            contentType: contentType,
-            cfMitigated: cfMitigated
-          });
-        } catch (_) {}
-      }
-      return resp;
-    }
-
-    let clone = null;
-    try {
-      clone = resp.clone();
-    } catch (_) {
-      clone = null;
-    }
-    if (clone) {
-      (async () => {
-        try {
-          if (typeof window.__arenaDirectMeta === "function") {
-            await window.__arenaDirectMeta(contentType);
-          }
-          if (!clone.body || typeof clone.body.getReader !== "function") {
-            const full = await clone.text();
-            if (full && typeof window.__arenaDirectChunk === "function") {
-              await window.__arenaDirectChunk(full);
-            }
-          } else {
-            const reader = clone.body.getReader();
-            const decoder = new TextDecoder("utf-8");
-            while (true) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              if (value && value.length) {
-                const piece = decoder.decode(value, { stream: true });
-                if (piece && typeof window.__arenaDirectChunk === "function") {
-                  await window.__arenaDirectChunk(piece);
-                }
-              }
-            }
-            const tail = decoder.decode();
-            if (tail && typeof window.__arenaDirectChunk === "function") {
-              await window.__arenaDirectChunk(tail);
-            }
-          }
-          if (typeof window.__arenaDirectEof === "function") {
-            await window.__arenaDirectEof();
-          }
-        } catch (err) {
-          if (typeof window.__arenaDirectStreamError === "function") {
-            try { await window.__arenaDirectStreamError(String(err)); } catch (_) {}
-          }
-        }
-      })();
-    }
-    return resp;
-  };
-})();
+          const nextInit = Object.assign({{}}, init, {{ body: JSON.stringify(parsed) }});
+          return origFetch.call(this, input, nextInit);
+        }}
+      }} catch (_) {{}}
+    }}
+    return origFetch.apply(this, arguments);
+  }};
+}}
 """.strip()
+
 
 _FIND_COMPOSER_JS = """
 async () => {
@@ -2047,7 +2052,8 @@ _MARK_SEND_BUTTON_JS = """
   for (const old of document.querySelectorAll("[data-arena-send]")) {
     old.removeAttribute("data-arena-send");
   }
-  const composer = document.querySelector('[data-arena-composer="1"]');
+  const composer = document.querySelector('[data-arena-composer="1"]') ||
+    document.querySelector('textarea:not([id*="recaptcha"]):not([name*="recaptcha"]), [contenteditable="true"]');
   if (!composer) return { found: false };
   const skipRe = /attach|upload|file|image|photo|plus|add|model|mode|search|web|globe|mic|voice|audio|new|clear|copy|history|menu|sidebar|close|cancel|stop/i;
   const sendRe = /send|submit|ask|отправ/i;
@@ -2072,6 +2078,7 @@ _MARK_SEND_BUTTON_JS = """
     return rect && rect.width >= 16 && rect.height >= 16;
   });
 
+  let confidence = "explicit";
   let chosen = buttons.find((btn) => (btn.getAttribute("type") || "").toLowerCase() === "submit");
   if (!chosen) {
     chosen = buttons.find((btn) => {
@@ -2086,6 +2093,7 @@ _MARK_SEND_BUTTON_JS = """
     });
     if (filtered.length > 0) {
       chosen = filtered[filtered.length - 1];
+      confidence = "fallback";
     }
   }
   if (!chosen) return { found: false };
@@ -2093,27 +2101,262 @@ _MARK_SEND_BUTTON_JS = """
   const rect = chosen.getBoundingClientRect();
   return {
     found: true,
+    confidence: confidence,
     x: Math.round(rect.left + rect.width / 2),
     y: Math.round(rect.top + rect.height / 2)
   };
 }
 """.strip()
 
-_HAS_VISIBLE_RECAPTCHA_CHALLENGE_JS = """
+_DETECT_POST_SUBMIT_CHALLENGE_JS = """
 () => {
-  for (const frame of document.querySelectorAll('iframe[src*="recaptcha"][src*="bframe"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare.com"]')) {
+  const vw = Math.max(window.innerWidth || 0, 320);
+  const vh = Math.max(window.innerHeight || 0, 240);
+  function isFrameVisible(frame, minW, minH) {
     const style = window.getComputedStyle(frame);
-    if (!style || style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity || "1") === 0) {
-      continue;
+    if (
+      !style ||
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      parseFloat(style.opacity || "1") <= 0.1
+    ) {
+      return null;
     }
     const rect = frame.getBoundingClientRect();
-    if (rect && rect.width >= 120 && rect.height >= 60 && rect.bottom > 0 && rect.right > 0) {
-      return true;
+    if (!rect || rect.width < minW || rect.height < minH) {
+      return null;
+    }
+    if (rect.bottom <= 16 || rect.right <= 16 || rect.top >= vh - 16 || rect.left >= vw - 16) {
+      return null;
+    }
+    return rect;
+  }
+
+  for (const frame of document.querySelectorAll('iframe[src*="recaptcha"][src*="bframe"]')) {
+    const rect = isFrameVisible(frame, 180, 180);
+    if (rect) {
+      return {
+        kind: "recaptcha_bframe",
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height)
+      };
     }
   }
-  return false;
+
+  for (const frame of document.querySelectorAll('iframe[src*="recaptcha"][src*="anchor"]')) {
+    const src = String(frame.getAttribute("src") || "");
+    if (frame.closest(".grecaptcha-badge") || src.indexOf("size=invisible") !== -1) {
+      continue;
+    }
+    const rect = isFrameVisible(frame, 140, 45);
+    if (rect && rect.left >= -10 && rect.right <= vw + 24) {
+      return {
+        kind: "recaptcha_anchor",
+        x: Math.round(rect.left + 28),
+        y: Math.round(rect.top + Math.min(38, rect.height / 2)),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height)
+      };
+    }
+  }
+
+  for (const frame of document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]')) {
+    const rect = isFrameVisible(frame, 140, 40);
+    if (rect && rect.left >= -10) {
+      return {
+        kind: "turnstile",
+        x: Math.round(rect.left + 32),
+        y: Math.round(rect.top + rect.height / 2),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height)
+      };
+    }
+  }
+
+  for (const frame of document.querySelectorAll('iframe[src*="hcaptcha"]')) {
+    const rect = isFrameVisible(frame, 140, 45);
+    if (rect && rect.left >= -10) {
+      return {
+        kind: "hcaptcha",
+        x: Math.round(rect.left + 30),
+        y: Math.round(rect.top + rect.height / 2),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height)
+      };
+    }
+  }
+
+  return { kind: null };
 }
 """.strip()
+
+_COMPOSER_NONEMPTY_JS = (
+    "/* composer_nonempty */ () => { "
+    "const el = document.querySelector('[data-arena-composer=\"1\"]') || "
+    "document.querySelector('textarea:not([id*=\"recaptcha\"]):not([name*=\"recaptcha\"]), [contenteditable=\"true\"]'); "
+    "return !!(el && ((el.value || el.textContent || '').trim().length > 0)); }"
+)
+
+_CLEANUP_ARENA_DOM_MARKS_JS = (
+    "/* arena_cleanup_marks */ () => { "
+    "for (const el of document.querySelectorAll('[data-arena-composer],[data-arena-send]')) { "
+    "el.removeAttribute('data-arena-composer'); el.removeAttribute('data-arena-send'); } }"
+)
+
+
+def _can_auto_solve_bframe(solver: Any) -> bool:
+    if not isinstance(solver, RecaptchaToolkitSolver):
+        return False
+    if not solver_dependencies_available(solver.backend):
+        return False
+    if solver.backend == "audio" and shutil.which("ffmpeg") is None:
+        return False
+    if solver.backend == "image":
+        return False
+    return True
+
+
+async def _detect_post_submit_challenge(page: Any) -> dict[str, Any]:
+    eval_fn = getattr(page, "evaluate", None)
+    if not callable(eval_fn):
+        return {"kind": None}
+    try:
+        raw = await eval_fn(_DETECT_POST_SUBMIT_CHALLENGE_JS)
+    except Exception:  # noqa: BLE001
+        return {"kind": None}
+    if isinstance(raw, bool):
+        return {"kind": "recaptcha_bframe" if raw else None}
+    if isinstance(raw, Mapping):
+        kind = raw.get("kind")
+        return dict(raw) if isinstance(kind, str) and kind else {"kind": None}
+    return {"kind": None}
+
+
+async def _safe_bring_to_front(page: Any) -> None:
+    bring_fn = getattr(page, "bring_to_front", None)
+    if callable(bring_fn):
+        try:
+            await bring_fn()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _click_challenge_checkbox(page: Any, obs: Mapping[str, Any]) -> bool:
+    kind = str(obs.get("kind") or "")
+    if kind == "recaptcha_anchor":
+        for frame in getattr(page, "frames", ()) or ():
+            f_url = str(getattr(frame, "url", "") or "")
+            if (
+                "recaptcha" in f_url
+                and "anchor" in f_url
+                and "size=invisible" not in f_url
+            ):
+                loc_fn = getattr(frame, "locator", None)
+                if callable(loc_fn):
+                    try:
+                        checked = await loc_fn(
+                            '#recaptcha-anchor[aria-checked="true"]'
+                        ).count()
+                        if checked > 0:
+                            return False
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    await _safe_bring_to_front(page)
+    wait_fn = getattr(page, "wait_for_timeout", None)
+    if callable(wait_fn):
+        await wait_fn(350)
+
+    x = float(obs.get("x") or 0)
+    y = float(obs.get("y") or 0)
+    mouse = getattr(page, "mouse", None)
+    if x > 0 and y > 0 and mouse is not None:
+        move_fn = getattr(mouse, "move", None)
+        click_fn = getattr(mouse, "click", None)
+        if callable(move_fn):
+            try:
+                await move_fn(max(20.0, x - 90.0), max(20.0, y - 50.0), steps=8)
+                await move_fn(x, y, steps=14)
+            except Exception:  # noqa: BLE001
+                pass
+        if callable(wait_fn):
+            await wait_fn(90)
+        if callable(click_fn):
+            try:
+                await click_fn(x, y, delay=70)
+                return True
+            except Exception:  # noqa: BLE001
+                pass
+
+    if kind == "recaptcha_anchor":
+        for frame in getattr(page, "frames", ()) or ():
+            f_url = str(getattr(frame, "url", "") or "")
+            if (
+                "recaptcha" in f_url
+                and "anchor" in f_url
+                and "size=invisible" not in f_url
+            ):
+                loc_fn = getattr(frame, "locator", None)
+                if callable(loc_fn):
+                    try:
+                        await loc_fn("#recaptcha-anchor").first.click()
+                        return True
+                    except Exception:  # noqa: BLE001
+                        pass
+    return False
+
+
+async def _gentle_page_warmup(page: Any) -> None:
+    mouse = getattr(page, "mouse", None)
+    move_fn = getattr(mouse, "move", None) if mouse is not None else None
+    wait_fn = getattr(page, "wait_for_timeout", None)
+    if callable(move_fn):
+        try:
+            await move_fn(280.0, 260.0, steps=6)
+            if callable(wait_fn):
+                await wait_fn(80)
+            await move_fn(460.0, 420.0, steps=8)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _reclick_send_button_if_unsent(page: Any) -> bool:
+    eval_fn = getattr(page, "evaluate", None)
+    locator_fn = getattr(page, "locator", None)
+    if not (callable(eval_fn) and callable(locator_fn)):
+        return False
+    try:
+        has_text = bool(await eval_fn(_COMPOSER_NONEMPTY_JS))
+    except Exception:  # noqa: BLE001
+        return False
+    if not has_text:
+        return False
+    try:
+        btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
+    except Exception:  # noqa: BLE001
+        return False
+    if not (isinstance(btn_info, Mapping) and btn_info.get("found")):
+        return False
+    mouse = getattr(page, "mouse", None)
+    if mouse is not None and callable(getattr(mouse, "move", None)):
+        try:
+            await mouse.move(
+                float(btn_info.get("x") or 500),
+                float(btn_info.get("y") or 700),
+                steps=6,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await locator_fn('[data-arena-send="1"]').first.click()
+    finally:
+        try:
+            await eval_fn(_CLEANUP_ARENA_DOM_MARKS_JS)
+        except Exception:  # noqa: BLE001
+            pass
+    return True
 
 
 async def _submit_prompt_via_composer(
@@ -2122,6 +2365,8 @@ async def _submit_prompt_via_composer(
     *,
     model_id_override: str | None = None,
     generation_params: Mapping[str, Any] | None = None,
+    has_submitted: Callable[[], bool] | None = None,
+    install_legacy_tap_flags: bool = False,
 ) -> bool:
     locator_fn = getattr(page, "locator", None)
     eval_fn = getattr(page, "evaluate", None)
@@ -2133,14 +2378,16 @@ async def _submit_prompt_via_composer(
         patch_obj["modelAId"] = model_id_override
     if generation_params:
         patch_obj["generationConfig"] = dict(generation_params)
-    patch_literal = json.dumps(patch_obj) if patch_obj else "null"
-    await eval_fn(
-        f"() => {{ window.__arenaBodyPatch = {patch_literal}; window.__arenaTapArmed = true; }}"
-    )
+    if patch_obj:
+        await eval_fn(_build_main_frame_body_patch_js(patch_obj))
+    if install_legacy_tap_flags:
+        patch_literal = json.dumps(patch_obj) if patch_obj else "null"
+        await eval_fn(
+            f"() => {{ window.__arenaBodyPatch = {patch_literal}; window.__arenaTapArmed = true; }}"
+        )
 
     info = await eval_fn(_FIND_COMPOSER_JS)
     if not isinstance(info, Mapping) or not info.get("found"):
-        await eval_fn("() => { window.__arenaTapArmed = false; }")
         return False
 
     mouse = getattr(page, "mouse", None)
@@ -2148,8 +2395,8 @@ async def _submit_prompt_via_composer(
         cx = float(info.get("x") or 400)
         cy = float(info.get("y") or 700)
         try:
-            await mouse.move(max(40.0, cx - 120.0), max(40.0, cy - 80.0), steps=4)
-            await mouse.move(cx, cy, steps=6)
+            await mouse.move(max(40.0, cx - 120.0), max(40.0, cy - 80.0), steps=5)
+            await mouse.move(cx, cy, steps=8)
         except Exception:  # noqa: BLE001
             pass
 
@@ -2164,12 +2411,9 @@ async def _submit_prompt_via_composer(
         and keyboard is not None
         and callable(getattr(keyboard, "type", None))
     ):
-        await keyboard.type(prompt, delay=10)
+        await keyboard.type(prompt, delay=12)
         try:
-            non_empty = await eval_fn(
-                "/* composer_nonempty */ () => { const el = document.querySelector('[data-arena-composer=\"1\"]'); "
-                "return !!(el && ((el.value || el.textContent || '').trim().length > 0)); }"
-            )
+            non_empty = await eval_fn(_COMPOSER_NONEMPTY_JS)
         except Exception:  # noqa: BLE001
             non_empty = True
         if not non_empty:
@@ -2181,7 +2425,7 @@ async def _submit_prompt_via_composer(
             and keyboard is not None
             and callable(getattr(keyboard, "type", None))
         ):
-            await keyboard.type(first_line, delay=10)
+            await keyboard.type(first_line, delay=12)
         await composer.fill(prompt)
 
     wait_fn = getattr(page, "wait_for_timeout", None)
@@ -2189,31 +2433,44 @@ async def _submit_prompt_via_composer(
         await wait_fn(150)
 
     btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
-    if isinstance(btn_info, Mapping) and btn_info.get("found"):
-        if mouse is not None and callable(getattr(mouse, "move", None)):
-            try:
-                await mouse.move(
-                    float(btn_info.get("x") or 500),
-                    float(btn_info.get("y") or 700),
-                    steps=5,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-        send_btn = locator_fn('[data-arena-send="1"]').first
-        await send_btn.click()
-        if callable(wait_fn):
-            await wait_fn(600)
-        try:
-            still_has_text = await eval_fn(
-                "/* composer_nonempty */ () => { const el = document.querySelector('[data-arena-composer=\"1\"]'); "
-                "return !!(el && ((el.value || el.textContent || '').trim().length > 0)); }"
-            )
-        except Exception:  # noqa: BLE001
-            still_has_text = False
-        if still_has_text:
+    try:
+        if isinstance(btn_info, Mapping) and btn_info.get("found"):
+            if mouse is not None and callable(getattr(mouse, "move", None)):
+                try:
+                    await mouse.move(
+                        float(btn_info.get("x") or 500),
+                        float(btn_info.get("y") or 700),
+                        steps=6,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            send_btn = locator_fn('[data-arena-send="1"]').first
+            await send_btn.click()
+            # Only press Enter as a fallback when no explicit submit/Send button
+            # matched and no evaluation request or challenge has started yet;
+            # pressing Enter on top of an explicit Send click fires a duplicate
+            # submission while grecaptcha.enterprise.execute() is still running.
+            if btn_info.get("confidence") == "fallback":
+                if callable(wait_fn):
+                    await wait_fn(900)
+                already_started = bool(has_submitted and has_submitted())
+                if not already_started:
+                    challenge = await _detect_post_submit_challenge(page)
+                    already_started = challenge.get("kind") is not None
+                if not already_started:
+                    try:
+                        still_has_text = bool(await eval_fn(_COMPOSER_NONEMPTY_JS))
+                    except Exception:  # noqa: BLE001
+                        still_has_text = False
+                    if still_has_text:
+                        await composer.press("Enter")
+        else:
             await composer.press("Enter")
-    else:
-        await composer.press("Enter")
+    finally:
+        try:
+            await eval_fn(_CLEANUP_ARENA_DOM_MARKS_JS)
+        except Exception:  # noqa: BLE001
+            pass
     return True
 
 
@@ -2438,6 +2695,7 @@ class DirectVerificationToken:
         model_id_override: str | None = None,
         generation_params: Mapping[str, Any] | None = None,
         follow_up: bool = False,
+        user_data_dir: str | Path | None = None,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
         resolved_proxy = resolve_proxy_url(
             self.options.base_url,
@@ -2458,11 +2716,10 @@ class DirectVerificationToken:
                 "color_scheme": "no-preference",
                 "ignore_default_args": AUTOMATION_DEFAULT_ARGS_TO_DROP,
                 "launch_args": (AUTOMATION_BLINK_SWITCH,),
-                "extra_init_scripts": (
-                    HIDE_WEBDRIVER_SCRIPT,
-                    _INSTALL_FETCH_STREAM_TAP_SCRIPT,
-                ),
+                "extra_init_scripts": (HIDE_WEBDRIVER_SCRIPT,),
             }
+            if user_data_dir is not None:
+                env_kwargs["user_data_dir"] = user_data_dir
             if channel is not None:
                 env_kwargs["channel"] = channel
             if resolved_proxy:
@@ -2492,6 +2749,9 @@ class DirectVerificationToken:
                 "`--channel chrome`."
             ) from last_missing_exc
 
+        registered_listeners: list[tuple[str, Callable[..., Any]]] = []
+        response_tasks: set[asyncio.Task[None]] = set()
+        page: Any = None
         try:
             handler = getattr(environment, "challenge_handler", None)
             if handler is not None:
@@ -2502,47 +2762,124 @@ class DirectVerificationToken:
             seed_cookies = _seedable_browser_cookies(
                 raw_cookies, cookie_source=self.cookie_source
             )
-            if (
-                seed_cookies
-                and context is not None
-                and callable(getattr(context, "add_cookies", None))
-            ):
-                await context.add_cookies(
-                    [
-                        {
-                            "name": str(name),
-                            "value": str(value),
-                            "url": self.options.base_url,
-                        }
-                        for name, value in seed_cookies.items()
-                    ]
-                )
+            await _seed_direct_context_cookies(
+                context, seed_cookies, self.options.base_url
+            )
 
             async_q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-            expose_fn = getattr(page, "expose_function", None)
-            if callable(expose_fn):
-                await expose_fn(
-                    "__arenaDirectMeta",
-                    lambda ct: async_q.put_nowait(("meta", str(ct or ""))),
-                )
-                await expose_fn(
-                    "__arenaDirectChunk",
-                    lambda piece: async_q.put_nowait(
-                        ("chunk", str(piece).encode("utf-8"))
-                    ),
-                )
-                await expose_fn(
-                    "__arenaDirectEof",
-                    lambda: async_q.put_nowait(("eof", None)),
-                )
-                await expose_fn(
-                    "__arenaDirectHttpError",
-                    lambda info: async_q.put_nowait(("http_error", info)),
-                )
-                await expose_fn(
-                    "__arenaDirectStreamError",
-                    lambda err: async_q.put_nowait(("stream_error", str(err or ""))),
-                )
+            on_fn = getattr(page, "on", None)
+            has_network_events = callable(on_fn)
+            in_flight_eval_requests = 0
+            eval_request_seen = False
+
+            if has_network_events:
+                assert callable(on_fn)
+
+                def _on_request(req: Any) -> None:
+                    nonlocal in_flight_eval_requests, eval_request_seen
+                    method = str(getattr(req, "method", "POST") or "POST").upper()
+                    url = str(getattr(req, "url", "") or "")
+                    if method == "POST" and _is_eval_stream_url(url):
+                        eval_request_seen = True
+                        in_flight_eval_requests += 1
+
+                def _on_request_failed(req: Any) -> None:
+                    nonlocal in_flight_eval_requests
+                    method = str(getattr(req, "method", "POST") or "POST").upper()
+                    url = str(getattr(req, "url", "") or "")
+                    if method == "POST" and _is_eval_stream_url(url):
+                        in_flight_eval_requests = max(0, in_flight_eval_requests - 1)
+
+                async def _consume_eval_response(resp: Any) -> None:
+                    nonlocal in_flight_eval_requests
+                    try:
+                        status = int(getattr(resp, "status", 200))
+                        raw_hdrs = getattr(resp, "headers", None)
+                        hdrs: dict[str, str] = {}
+                        if isinstance(raw_hdrs, Mapping):
+                            hdrs = {
+                                str(k).lower(): str(v) for k, v in raw_hdrs.items()
+                            }
+                        if status >= 400:
+                            err_body = ""
+                            text_fn = getattr(resp, "text", None)
+                            if callable(text_fn):
+                                try:
+                                    err_body = str(await text_fn() or "")
+                                except Exception:  # noqa: BLE001
+                                    err_body = ""
+                            async_q.put_nowait(
+                                (
+                                    "http_error",
+                                    {
+                                        "status": status,
+                                        "body": err_body,
+                                        "contentType": hdrs.get("content-type", ""),
+                                        "cfMitigated": hdrs.get("cf-mitigated", ""),
+                                    },
+                                )
+                            )
+                            return
+                        async_q.put_nowait(("meta", hdrs.get("content-type", "")))
+                        body_text = ""
+                        text_fn = getattr(resp, "text", None)
+                        if callable(text_fn):
+                            body_text = str(await text_fn() or "")
+                        if body_text:
+                            async_q.put_nowait(("chunk", body_text.encode("utf-8")))
+                        async_q.put_nowait(("eof", None))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        async_q.put_nowait(("stream_error", str(exc)))
+                    finally:
+                        in_flight_eval_requests = max(0, in_flight_eval_requests - 1)
+
+                def _on_response(resp: Any) -> None:
+                    req = getattr(resp, "request", None)
+                    method = str(
+                        getattr(req, "method", "POST") if req is not None else "POST"
+                    ).upper()
+                    url = str(getattr(resp, "url", "") or "")
+                    if method == "POST" and _is_eval_stream_url(url):
+                        task = asyncio.create_task(_consume_eval_response(resp))
+                        response_tasks.add(task)
+                        task.add_done_callback(response_tasks.discard)
+
+                for ev_name, cb in (
+                    ("request", _on_request),
+                    ("requestfailed", _on_request_failed),
+                    ("response", _on_response),
+                ):
+                    on_fn(ev_name, cb)
+                    registered_listeners.append((ev_name, cb))
+            else:
+                expose_fn = getattr(page, "expose_function", None)
+                if callable(expose_fn):
+                    await expose_fn(
+                        "__arenaDirectMeta",
+                        lambda ct: async_q.put_nowait(("meta", str(ct or ""))),
+                    )
+                    await expose_fn(
+                        "__arenaDirectChunk",
+                        lambda piece: async_q.put_nowait(
+                            ("chunk", str(piece).encode("utf-8"))
+                        ),
+                    )
+                    await expose_fn(
+                        "__arenaDirectEof",
+                        lambda: async_q.put_nowait(("eof", None)),
+                    )
+                    await expose_fn(
+                        "__arenaDirectHttpError",
+                        lambda info: async_q.put_nowait(("http_error", info)),
+                    )
+                    await expose_fn(
+                        "__arenaDirectStreamError",
+                        lambda err: async_q.put_nowait(
+                            ("stream_error", str(err or ""))
+                        ),
+                    )
 
             await page.goto(self.page_url, wait_until="domcontentloaded")
             wait_for_timeout = getattr(page, "wait_for_timeout", None)
@@ -2556,11 +2893,17 @@ class DirectVerificationToken:
                     html = ""
                 if isinstance(html, str) and _looks_like_challenge(html, None):
                     if allow_headed_retry:
-                        raise _RetryInHeadedBrowser("Cloudflare challenge in headless mode")
+                        raise _RetryInHeadedBrowser(
+                            "Cloudflare challenge in headless mode"
+                        )
                     if not headless and callable(wait_for_timeout):
-                        wait_deadline = time.monotonic() + min(timeout, 45.0)
+                        await _safe_bring_to_front(page)
+                        wait_deadline = time.monotonic() + max(timeout, 120.0)
                         while time.monotonic() < wait_deadline:
-                            await wait_for_timeout(500)
+                            obs_cf = await _detect_post_submit_challenge(page)
+                            if obs_cf.get("kind") == "turnstile":
+                                await _click_challenge_checkbox(page, obs_cf)
+                            await wait_for_timeout(600)
                             try:
                                 html = await page_content_fn()
                             except Exception:  # noqa: BLE001
@@ -2579,6 +2922,8 @@ class DirectVerificationToken:
                 except Exception:  # noqa: BLE001
                     pass
 
+            await _gentle_page_warmup(page)
+
             used_composer = False
             if prompt is not None and not follow_up:
                 used_composer = await _submit_prompt_via_composer(
@@ -2586,6 +2931,8 @@ class DirectVerificationToken:
                     prompt,
                     model_id_override=model_id_override,
                     generation_params=generation_params,
+                    has_submitted=lambda: eval_request_seen,
+                    install_legacy_tap_flags=not has_network_events,
                 )
 
             eval_task: asyncio.Task[Any] | None = None
@@ -2601,14 +2948,44 @@ class DirectVerificationToken:
 
             first_kind: str = ""
             first_val: Any = None
-            try:
-                while True:
-                    first_kind, first_val = await asyncio.wait_for(
-                        async_q.get(), timeout=timeout
+            deadline = time.monotonic() + timeout
+            pending_verification_err: tuple[int, str, dict[str, str]] | None = None
+            grace_until = 0.0
+            clicked_checkbox_kinds: set[str] = set()
+            solver_attempted_bframe = False
+            notified_user = False
+            challenge_active = False
+            challenge_cleared_at: float | None = None
+            retried_send_after_clear = False
+
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    if pending_verification_err is not None:
+                        self._raise_browser_http_error(*pending_verification_err)
+                    if eval_task is not None:
+                        eval_task.cancel()
+                    raise TimeoutError(
+                        "Direct Chat browser request timed out waiting for response headers."
                     )
-                    if first_kind != "http_error":
+
+                poll_slice = min(0.5, max(0.05, deadline - now))
+                got_event = False
+                ev_kind = ""
+                ev_val: Any = None
+                try:
+                    ev_kind, ev_val = await asyncio.wait_for(
+                        async_q.get(), timeout=poll_slice
+                    )
+                    got_event = True
+                except asyncio.TimeoutError:
+                    got_event = False
+
+                if got_event:
+                    if ev_kind != "http_error":
+                        first_kind, first_val = ev_kind, ev_val
                         break
-                    err_map = first_val if isinstance(first_val, Mapping) else {}
+                    err_map = ev_val if isinstance(ev_val, Mapping) else {}
                     status = int(err_map.get("status") or 500)
                     err_body = str(err_map.get("body") or "")
                     resp_headers = {
@@ -2625,65 +3002,91 @@ class DirectVerificationToken:
                     if (
                         used_composer
                         and not headless
-                        and status == 403
-                        and _is_verification_rejection(err_body)
+                        and status in (403, 429, 503)
+                        and (
+                            _is_verification_rejection(err_body)
+                            or _looks_like_challenge(err_body, resp_headers)
+                        )
                     ):
-                        # arena.ai's React UI escalates a rejected v3 token to
-                        # v2 / retry automatically; wait for its follow-up POST.
-                        prompted_challenge = False
-                        escalation_deadline = time.monotonic() + 8.0
-                        got_retry = False
-                        while time.monotonic() < escalation_deadline:
-                            if not prompted_challenge and callable(
-                                getattr(page, "evaluate", None)
-                            ):
-                                try:
-                                    vis = await page.evaluate(
-                                        _HAS_VISIBLE_RECAPTCHA_CHALLENGE_JS
-                                    )
-                                except Exception:  # noqa: BLE001
-                                    vis = False
-                                if vis:
-                                    prompted_challenge = True
-                                    escalation_deadline = time.monotonic() + timeout
-                                    print(
-                                        "[arena-api] complete the verification "
-                                        "challenge in the browser window...",
-                                        file=sys.stderr,
-                                        flush=True,
-                                    )
+                        pending_verification_err = (status, err_body, resp_headers)
+                        grace_until = max(grace_until, time.monotonic() + 12.0)
+                    else:
+                        self._raise_browser_http_error(
+                            status, err_body, resp_headers
+                        )
+
+                if used_composer and not headless:
+                    obs = await _detect_post_submit_challenge(page)
+                    obs_kind = obs.get("kind")
+                    if isinstance(obs_kind, str) and obs_kind:
+                        challenge_active = True
+                        challenge_cleared_at = None
+                        interactive_budget = max(timeout, 300.0)
+                        deadline = max(deadline, time.monotonic() + interactive_budget)
+                        grace_until = deadline
+
+                        if (
+                            obs_kind in ("recaptcha_anchor", "turnstile", "hcaptcha")
+                            and obs_kind not in clicked_checkbox_kinds
+                        ):
+                            clicked_checkbox_kinds.add(obs_kind)
+                            await _click_challenge_checkbox(page, obs)
+                            if callable(wait_for_timeout):
+                                await wait_for_timeout(700)
+                            obs = await _detect_post_submit_challenge(page)
+                            obs_kind = obs.get("kind")
+
+                        if (
+                            obs_kind == "recaptcha_bframe"
+                            and not solver_attempted_bframe
+                            and _can_auto_solve_bframe(self.solver)
+                        ):
+                            solver_attempted_bframe = True
                             try:
-                                next_kind, next_val = await asyncio.wait_for(
-                                    async_q.get(), timeout=0.5
+                                v2_solver = replace(
+                                    self.solver, version="v2", reload_for_v3=False
                                 )
-                            except asyncio.TimeoutError:
-                                continue
-                            if next_kind in ("meta", "chunk"):
-                                first_kind, first_val = next_kind, next_val
-                                got_retry = True
-                                break
-                            if next_kind == "http_error" and isinstance(
-                                next_val, Mapping
-                            ):
-                                status = int(next_val.get("status") or status)
-                                err_body = str(next_val.get("body") or err_body)
-                                resp_headers = {
-                                    "content-type": str(
-                                        next_val.get("contentType") or ""
-                                    ),
-                                    "cf-mitigated": str(
-                                        next_val.get("cfMitigated") or ""
-                                    ),
-                                }
-                        if got_retry:
-                            break
-                    self._raise_browser_http_error(status, err_body, resp_headers)
-            except asyncio.TimeoutError as exc:
-                if eval_task is not None:
-                    eval_task.cancel()
-                raise TimeoutError(
-                    "Direct Chat browser request timed out waiting for response headers."
-                ) from exc
+                                await v2_solver.asolve(page)
+                            except Exception:  # noqa: BLE001
+                                pass
+                            obs = await _detect_post_submit_challenge(page)
+                            obs_kind = obs.get("kind")
+
+                        if isinstance(obs_kind, str) and obs_kind and not notified_user:
+                            notified_user = True
+                            await _safe_bring_to_front(page)
+                            print(
+                                "[arena-api] после отправки появилась капча — "
+                                "решите её в открытом окне браузера "
+                                "(ожидание до 5 мин)...",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                    else:
+                        if challenge_active:
+                            challenge_active = False
+                            challenge_cleared_at = time.monotonic()
+                            grace_until = max(
+                                grace_until, challenge_cleared_at + 15.0
+                            )
+                        if (
+                            challenge_cleared_at is not None
+                            and not retried_send_after_clear
+                            and in_flight_eval_requests == 0
+                            and (time.monotonic() - challenge_cleared_at) >= 2.5
+                        ):
+                            if await _reclick_send_button_if_unsent(page):
+                                retried_send_after_clear = True
+                                grace_until = max(
+                                    grace_until, time.monotonic() + 15.0
+                                )
+                        if (
+                            pending_verification_err is not None
+                            and not challenge_active
+                            and in_flight_eval_requests == 0
+                            and time.monotonic() >= grace_until
+                        ):
+                            self._raise_browser_http_error(*pending_verification_err)
 
             if first_kind == "stream_error":
                 raise ArenaError(
@@ -2779,6 +3182,18 @@ class DirectVerificationToken:
                     if updated:
                         self._refreshed_cookies = updated
         finally:
+            remove_fn = (
+                getattr(page, "remove_listener", None) if page is not None else None
+            )
+            if callable(remove_fn):
+                for ev_name, cb in registered_listeners:
+                    try:
+                        remove_fn(ev_name, cb)
+                    except Exception:  # noqa: BLE001
+                        pass
+            for task in list(response_tasks):
+                if not task.done():
+                    task.cancel()
             await environment.__aexit__(None, None, None)
 
     @asynccontextmanager
@@ -2796,6 +3211,44 @@ class DirectVerificationToken:
         """Mint a fresh v3 assertion and stream ``endpoint_path`` inside the same browser tab."""
         self._check_solver_ready()
         allow_headed = bool(self.options.interactive)
+        is_live_browser = BrowserEnvironment is _DEFAULT_BROWSER_ENVIRONMENT
+        profile_dir = (
+            _direct_browser_profile_dir(self.options) if is_live_browser else None
+        )
+        if is_live_browser and allow_headed:
+            try:
+                async with self._attempt_browser_evaluation(
+                    endpoint_path,
+                    body_factory,
+                    headless=False,
+                    allow_headed_retry=False,
+                    timeout=timeout,
+                    prompt=prompt,
+                    model_id_override=model_id_override,
+                    generation_params=generation_params,
+                    follow_up=follow_up,
+                    user_data_dir=profile_dir,
+                ) as outcome:
+                    yield outcome
+                    return
+            except Exception as exc:  # noqa: BLE001
+                if not _is_missing_display_error(exc):
+                    raise
+            async with self._attempt_browser_evaluation(
+                endpoint_path,
+                body_factory,
+                headless=True,
+                allow_headed_retry=False,
+                timeout=timeout,
+                prompt=prompt,
+                model_id_override=model_id_override,
+                generation_params=generation_params,
+                follow_up=follow_up,
+                user_data_dir=profile_dir,
+            ) as outcome:
+                yield outcome
+            return
+
         try:
             async with self._attempt_browser_evaluation(
                 endpoint_path,
@@ -2807,6 +3260,7 @@ class DirectVerificationToken:
                 model_id_override=model_id_override,
                 generation_params=generation_params,
                 follow_up=follow_up,
+                user_data_dir=profile_dir,
             ) as outcome:
                 yield outcome
                 return
@@ -2827,6 +3281,7 @@ class DirectVerificationToken:
             model_id_override=model_id_override,
             generation_params=generation_params,
             follow_up=follow_up,
+            user_data_dir=profile_dir,
         ) as outcome:
             yield outcome
 
@@ -2845,6 +3300,11 @@ class DirectVerificationToken:
         """Synchronous streaming bridge over :meth:`astream_evaluation`."""
         sync_q: queue.Queue[tuple[str, Any]] = queue.Queue()
         stop_event = threading.Event()
+        sync_wait = (
+            max(timeout, 300.0) + 30.0
+            if self.options.interactive
+            else timeout + 15.0
+        )
 
         async def _driver() -> None:
             try:
@@ -2873,7 +3333,7 @@ class DirectVerificationToken:
         )
         worker.start()
         try:
-            first_kind, first_payload = sync_q.get(timeout=timeout + 15.0)
+            first_kind, first_payload = sync_q.get(timeout=sync_wait)
             if first_kind == "err":
                 raise first_payload
             content_type = str(first_payload or "") if first_kind == "meta" else ""

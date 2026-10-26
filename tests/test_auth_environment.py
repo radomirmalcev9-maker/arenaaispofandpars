@@ -278,4 +278,170 @@ def test_context_kwargs_allows_native_host_locale_and_timezone() -> None:
     assert "timezone_id" not in ctx_kwargs
 
 
+def test_hide_webdriver_script_skips_redefine_when_already_false() -> None:
+    """When ``--disable-blink-features=AutomationControlled`` sets native ``false``, keep C++ getter."""
+    assert "if (navigator.webdriver === false)" in HIDE_WEBDRIVER_SCRIPT
+
+
+def test_persistent_context_reuses_initial_page_and_closes_cleanly(
+    tmp_path, monkeypatch
+) -> None:
+    import asyncio
+    import sys
+    import types
+
+    launched_persistent: list[tuple[str, dict[str, object]]] = []
+    closed_contexts: list[object] = []
+
+    class FakePage:
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+            self.init_scripts: list[str] = []
+
+        async def add_init_script(self, script: str) -> None:
+            self.init_scripts.append(script)
+
+    class FakePersistentContext:
+        def __init__(self) -> None:
+            self.pages = [FakePage("initial-blank")]
+            self.default_timeout: float | None = None
+            self.nav_timeout: float | None = None
+
+        def set_default_timeout(self, timeout: float) -> None:
+            self.default_timeout = timeout
+
+        def set_default_navigation_timeout(self, timeout: float) -> None:
+            self.nav_timeout = timeout
+
+        async def new_page(self) -> FakePage:
+            page = FakePage(f"page-{len(self.pages)}")
+            self.pages.append(page)
+            return page
+
+        async def close(self) -> None:
+            closed_contexts.append(self)
+
+    class FakeChromium:
+        async def launch_persistent_context(self, user_data_dir: str, **kwargs: object):
+            launched_persistent.append((user_data_dir, dict(kwargs)))
+            return FakePersistentContext()
+
+        async def launch(self, **kwargs: object):  # pragma: no cover
+            raise AssertionError("ephemeral launch should not be used")
+
+    class FakePlaywright:
+        def __init__(self) -> None:
+            self.chromium = FakeChromium()
+            self.stopped = False
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    pw_instance = FakePlaywright()
+
+    class FakeAPIManager:
+        async def start(self) -> FakePlaywright:
+            return pw_instance
+
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: FakeAPIManager()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    profile_dir = tmp_path / "direct_browser_profile"
+    opts = BrowserEnvironmentOptions(
+        user_data_dir=profile_dir,
+        storage_state=tmp_path / "unused_state.json",
+        locale=None,
+        timezone_id=None,
+        install_determinism_script=False,
+    )
+    p_kwargs = opts.persistent_context_kwargs()
+    assert "storage_state" not in p_kwargs
+
+    async def _exercise() -> tuple[FakePage, FakePage]:
+        async with BrowserEnvironment(opts) as env:
+            p1 = await env.new_page()
+            p2 = await env.new_page()
+            return p1, p2
+
+    first_page, second_page = asyncio.run(_exercise())
+    assert first_page.tag == "initial-blank"
+    assert second_page.tag == "page-1"
+    assert len(launched_persistent) == 1
+    assert launched_persistent[0][0] == str(profile_dir)
+    assert profile_dir.is_dir()
+    assert len(closed_contexts) == 1
+    assert pw_instance.stopped is True
+
+
+def test_persistent_context_lock_falls_back_to_ephemeral_launch(
+    tmp_path, monkeypatch
+) -> None:
+    import asyncio
+    import sys
+    import types
+
+    ephemeral_launches: list[dict[str, object]] = []
+
+    class FakeContext:
+        pages: list[object] = []
+
+        def set_default_timeout(self, timeout: float) -> None:
+            return None
+
+        def set_default_navigation_timeout(self, timeout: float) -> None:
+            return None
+
+        async def new_page(self) -> object:
+            return types.SimpleNamespace(add_init_script=lambda **kw: None)
+
+        async def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs: object) -> FakeContext:
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch_persistent_context(self, user_data_dir: str, **kwargs: object):
+            raise RuntimeError(
+                "Target page, context or browser has been closed: ProcessSingleton: The profile appears to be in use by another Google Chrome process"
+            )
+
+        async def launch(self, **kwargs: object) -> FakeBrowser:
+            ephemeral_launches.append(dict(kwargs))
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def stop(self) -> None:
+            return None
+
+    class FakeAPIManager:
+        async def start(self) -> FakePlaywright:
+            return FakePlaywright()
+
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: FakeAPIManager()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    opts = BrowserEnvironmentOptions(
+        user_data_dir=tmp_path / "locked_profile",
+        install_determinism_script=False,
+    )
+
+    async def _run() -> None:
+        async with BrowserEnvironment(opts) as env:
+            ctx = await env.new_context()
+            assert isinstance(ctx, FakeContext)
+
+    asyncio.run(_run())
+    assert len(ephemeral_launches) == 1
+
+
+
 

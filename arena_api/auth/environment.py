@@ -60,13 +60,16 @@ __all__ = [
 #: Use it there and nowhere else.
 HIDE_WEBDRIVER_SCRIPT = """
 (function () {
+  if (navigator.webdriver === false) {
+    return;
+  }
   const proto = Object.getPrototypeOf(navigator);
   try {
     delete navigator.webdriver;
   } catch (error) {
     /* A hardened build can refuse the delete; fall through to defineProperty. */
   }
-  if ('webdriver' in proto) {
+  if ('webdriver' in proto && navigator.webdriver) {
     Object.defineProperty(proto, 'webdriver', {
       get: () => false,
       configurable: true
