@@ -135,7 +135,7 @@ def test_version_is_recorded_in_the_changelog(pyproject: dict) -> None:
 
 def test_readme_mentions_every_example() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    examples = sorted(path.name for path in ROOT.glob("example*.py"))
+    examples = sorted(path.name for path in (ROOT / "examples").glob("*.py"))
     assert examples, "the example scripts disappeared"
     assert [name for name in examples if name not in readme] == []
 

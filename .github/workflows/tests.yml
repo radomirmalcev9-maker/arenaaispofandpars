@@ -71,7 +71,7 @@ jobs:
           python -m pip install -e '.[dev]'
 
       - name: pyflakes
-        run: python -m pyflakes arena_api tests examples example*.py
+        run: python -m pyflakes arena_api tests examples
 
       - name: mypy
         run: python -m mypy

@@ -4212,7 +4212,9 @@ def test_hide_headed_page_window_cdp_moves_bounds_offscreen() -> None:
 
 
 def test_windows_descendant_pids_and_cloaker_smoke() -> None:
-    pids = auto_module._windows_descendant_pids(os.getpid())
+    from arena_api._window_cloak import _windows_descendant_pids
+
+    pids = _windows_descendant_pids(os.getpid())
     if sys.platform == "win32":
         assert os.getpid() in pids
     else:
