@@ -5,6 +5,22 @@
 
 ## Unreleased
 
+### Ещё быстрее: ленивый импорт пакета и кэш чтения cookie-хранилища Firefox
+
+- **Ускорено (`import arena_api`, `import arena_api.auth`):** все публичные
+  имена теперь подгружаются лениво через `__getattr__` модуля (PEP 562), так что
+  `import arena_api` больше не тянет `httpx`, `asyncio`, `sqlite3`, Playwright-
+  обёртку и весь `arena_api.auto` заранее: ~350 мс → ~5 мс на холодном старте.
+  `__all__`, `dir()`, `from arena_api import *`, `arena_api.Client` и доступ к
+  подмодулям (`arena_api.auto`, `arena_api.auth.browser`) работают как раньше;
+  тяжёлые модули импортируются при первом обращении.
+- **Ускорено (`FirefoxSessionManager.load_cookies()` / `cookie_records()`):**
+  результат последнего чтения кэшируется по stat-отпечатку (`mtime_ns`, размер)
+  `cookies.sqlite`, `cookies.sqlite-wal` и `sessionstore-backups/*`. Повторные
+  проверки сессии перед каждым запросом Direct Chat больше не открывают
+  SQLite/rookiepy, пока Firefox ничего не записал на диск; любая запись
+  инвалидирует кэш автоматически.
+
 ### Точный отпечаток Firefox (`User-Agent`, `Accept-Language`, H2-заголовки) и фильтрация пассивного `jsd`-маяка Cloudflare
 
 - **Исправлено (`FirefoxSessionManager.user_agent()`):** начиная с Firefox 120

@@ -214,3 +214,28 @@ def test_license_is_declared_and_shipped(pyproject: dict) -> None:
     assert any("setuptools>=77" in req for req in pyproject["build-system"]["requires"])
 
     assert "Apache-2.0" in (ROOT / "README.md").read_text(encoding="utf-8")
+
+
+def test_importing_the_package_is_lazy_and_still_exposes_everything() -> None:
+    """``import arena_api`` must not import httpx/asyncio-heavy submodules eagerly."""
+    code = (
+        "import sys, arena_api\n"
+        "eager = [m for m in ('httpx', 'arena_api.auto', 'arena_api.client', "
+        "'arena_api.auth.browser', 'sqlite3') if m in sys.modules]\n"
+        "assert not eager, f'import arena_api eagerly pulled in: {eager}'\n"
+        "assert arena_api.Client is arena_api.ArenaClient\n"
+        "assert arena_api.auto.main is arena_api.auto.main\n"
+        "from arena_api import StreamChunk, auto_client\n"
+        "assert callable(auto_client) and StreamChunk is not None\n"
+        "assert 'auto_client' in dir(arena_api)\n"
+        "try:\n"
+        "    arena_api.does_not_exist\n"
+        "except AttributeError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise SystemExit('missing AttributeError for unknown name')\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=180
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
