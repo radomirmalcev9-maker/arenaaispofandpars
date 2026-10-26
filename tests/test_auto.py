@@ -3653,20 +3653,15 @@ def test_seed_direct_context_cookies_preserves_existing_trust_cookies() -> None:
     ]
 
 
-def test_live_browser_interactive_skips_headless_preattempt_and_falls_back_if_no_display(
+def test_live_browser_runs_invisible_by_default_and_honours_show_browser(
     tmp_path, monkeypatch
 ) -> None:
-    seen_calls: list[tuple[bool, object]] = []
+    seen_calls: list[tuple[bool, bool, object]] = []
 
     monkeypatch.setattr(
         auto_module, "BrowserEnvironment", auto_module._DEFAULT_BROWSER_ENVIRONMENT
     )
     monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
-
-    tok = DirectVerificationToken(
-        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
-        solver=RecaptchaToolkitSolver(),
-    )
 
     from contextlib import asynccontextmanager
 
@@ -3684,7 +3679,7 @@ def test_live_browser_interactive_skips_headless_preattempt_and_falls_back_if_no
         follow_up=False,
         user_data_dir=None,
     ):
-        seen_calls.append((headless, user_data_dir))
+        seen_calls.append((headless, allow_headed_retry, user_data_dir))
         if not headless:
             raise RuntimeError("Missing X server or $DISPLAY")
 
@@ -3693,9 +3688,14 @@ def test_live_browser_interactive_skips_headless_preattempt_and_falls_back_if_no
 
         yield ("text/plain", _chunks())
 
-    monkeypatch.setattr(tok, "_attempt_browser_evaluation", fake_attempt)
+    # 1) Default (show_browser=False): runs 100% invisibly (headless=True, allow_headed_retry=False).
+    tok_invisible = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=RecaptchaToolkitSolver(),
+    )
+    monkeypatch.setattr(tok_invisible, "_attempt_browser_evaluation", fake_attempt)
 
-    async def _run() -> bytes:
+    async def _run(tok: DirectVerificationToken) -> bytes:
         out = bytearray()
         async with tok.astream_evaluation(
             "/nextjs-api/stream/create-evaluation",
@@ -3706,12 +3706,26 @@ def test_live_browser_interactive_skips_headless_preattempt_and_falls_back_if_no
                 out.extend(part)
         return bytes(out)
 
-    raw = asyncio.run(_run())
-    assert b'a0:"ok"' in raw
-    expected_profile = auto_module._direct_browser_profile_dir(tok.options)
+    assert b'a0:"ok"' in asyncio.run(_run(tok_invisible))
+    expected_profile = auto_module._direct_browser_profile_dir(tok_invisible.options)
+    assert seen_calls == [(True, False, expected_profile)]
+
+    # 2) Explicit --show-browser (show_browser=True): tries headed first, falls back to headless if no display.
+    seen_calls.clear()
+    tok_visible = DirectVerificationToken(
+        isolated_options(
+            tmp_path,
+            base_url="https://arena.ai",
+            interactive=True,
+            show_browser=True,
+        ),
+        solver=RecaptchaToolkitSolver(),
+    )
+    monkeypatch.setattr(tok_visible, "_attempt_browser_evaluation", fake_attempt)
+    assert b'a0:"ok"' in asyncio.run(_run(tok_visible))
     assert seen_calls == [
-        (False, expected_profile),
-        (True, expected_profile),
+        (False, False, expected_profile),
+        (True, False, expected_profile),
     ]
 
 
@@ -4078,6 +4092,57 @@ def test_safe_stdout_write_handles_legacy_windows_codepage(monkeypatch) -> None:
     written = raw_buf.getvalue().decode("cp1251")
     assert "Привет!" in written
     assert "Всё отлично!" in written
+
+
+def test_headless_cdp_sanitizes_headless_chrome_ua_and_client_hints() -> None:
+    sent_commands: list[tuple[str, object]] = []
+    detached: list[bool] = []
+
+    class FakeCDPSession:
+        async def send(self, method: str, params: object = None):
+            sent_commands.append((method, params))
+            if method == "Browser.getVersion":
+                return {
+                    "product": "Chrome/145.0.7632.117",
+                    "userAgent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "HeadlessChrome/145.0.7632.117 Safari/537.36 Edg/145.0.3179.98"
+                    ),
+                }
+            return {}
+
+        async def detach(self) -> None:
+            detached.append(True)
+
+    class FakeContext:
+        async def new_cdp_session(self, page):
+            return FakeCDPSession()
+
+    async def _run():
+        cdp = await auto_module._sanitize_headless_page_cdp(
+            FakeContext(), object(), channel="msedge"
+        )
+        assert cdp is not None
+        await cdp.detach()
+
+    asyncio.run(_run())
+    assert detached == [True]
+    override_calls = [
+        params
+        for method, params in sent_commands
+        if method == "Emulation.setUserAgentOverride"
+    ]
+    assert len(override_calls) == 1
+    override = override_calls[0]
+    assert isinstance(override, dict)
+    assert "Headless" not in override["userAgent"]
+    assert "Chrome/145.0.7632.117" in override["userAgent"]
+    meta = override["userAgentMetadata"]
+    assert meta["platform"] == "Windows"
+    assert any(b["brand"] == "Microsoft Edge" for b in meta["brands"])
+    assert all("Headless" not in b["brand"] for b in meta["brands"])
+
 
 
 

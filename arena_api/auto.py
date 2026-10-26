@@ -376,6 +376,10 @@ class AutoOptions:
     #: Where browser artefacts (challenge captures, traces) are written.
     artifacts_dir: str | Path | None = "./artifacts"
 
+    #: Show the Direct Chat verification browser window instead of running
+    #: invisibly in New Headless mode (default ``False`` = invisible).
+    show_browser: bool = False
+
     def __post_init__(self) -> None:
         if self.storage_path is not None:
             self.storage_path = Path(self.storage_path)
@@ -1745,6 +1749,103 @@ def _recover_cdp_utf8_text(text: str, content_type: str = "") -> str:
     )
 
 
+def _build_clean_ua_metadata(
+    clean_ua: str, product: str = "", channel: str | None = None
+) -> dict[str, Any] | None:
+    full_ver = ""
+    if "/" in product:
+        cand = product.split("/", 1)[1].strip()
+        if cand and cand[0].isdigit():
+            full_ver = cand
+    if not full_ver:
+        m = re.search(r"Chrome/([0-9]+(?:\.[0-9]+)*)", clean_ua)
+        if m:
+            full_ver = m.group(1)
+    if not full_ver:
+        return None
+    major = full_ver.split(".", 1)[0]
+    ch_lower = (channel or "").lower()
+    if "edg" in ch_lower or "Edg/" in clean_ua:
+        primary_brand = "Microsoft Edge"
+    elif ch_lower.startswith("chrome") and ch_lower != "chromium":
+        primary_brand = "Google Chrome"
+    else:
+        primary_brand = "Chromium"
+
+    brands = [
+        {"brand": "Not:A-Brand", "version": "99"},
+        {"brand": "Chromium", "version": major},
+    ]
+    full_list = [
+        {"brand": "Not:A-Brand", "version": "99.0.0.0"},
+        {"brand": "Chromium", "version": full_ver},
+    ]
+    if primary_brand != "Chromium":
+        brands.insert(1, {"brand": primary_brand, "version": major})
+        full_list.insert(1, {"brand": primary_brand, "version": full_ver})
+
+    if "Windows NT" in clean_ua:
+        plat, plat_ver = "Windows", "15.0.0"
+    elif "Macintosh" in clean_ua:
+        plat, plat_ver = "macOS", "14.5.0"
+    else:
+        plat, plat_ver = "Linux", "6.8.0"
+    arch = "arm" if ("aarch64" in clean_ua or "ARM64" in clean_ua) else "x86"
+
+    return {
+        "brands": brands,
+        "fullVersionList": full_list,
+        "platform": plat,
+        "platformVersion": plat_ver,
+        "architecture": arch,
+        "model": "",
+        "mobile": False,
+        "bitness": "64",
+        "wow64": False,
+    }
+
+
+async def _sanitize_headless_page_cdp(
+    context: Any, page: Any, *, channel: str | None = None
+) -> Any:
+    """Strip ``HeadlessChrome`` from UA and Client Hints via CDP on headless tabs."""
+    if context is None:
+        return None
+    new_cdp = getattr(context, "new_cdp_session", None)
+    if not callable(new_cdp):
+        return None
+    cdp: Any = None
+    try:
+        cdp = await new_cdp(page)
+        ver_info = await cdp.send("Browser.getVersion")
+        if not isinstance(ver_info, Mapping):
+            await cdp.detach()
+            return None
+        raw_ua = str(ver_info.get("userAgent") or "")
+        product = str(ver_info.get("product") or "")
+        if not raw_ua or "Headless" not in raw_ua:
+            await cdp.detach()
+            return None
+        clean_ua = (
+            raw_ua.replace("HeadlessChrome/", "Chrome/")
+            .replace("HeadlessEdg/", "Edg/")
+            .replace("Headless", "")
+        )
+        override_params: dict[str, Any] = {"userAgent": clean_ua}
+        ua_meta = _build_clean_ua_metadata(clean_ua, product, channel=channel)
+        if ua_meta is not None:
+            override_params["userAgentMetadata"] = ua_meta
+        await cdp.send("Emulation.setUserAgentOverride", override_params)
+        return cdp
+    except Exception:  # noqa: BLE001
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:  # noqa: BLE001
+                pass
+        return None
+
+
 def _seedable_browser_cookies(
     cookies: Mapping[str, str], *, cookie_source: str | None
 ) -> dict[str, str]:
@@ -2284,6 +2385,26 @@ async def _detect_post_submit_challenge(page: Any) -> dict[str, Any]:
         return {"kind": "recaptcha_bframe" if raw else None}
     if isinstance(raw, Mapping):
         kind = raw.get("kind")
+        if kind == "recaptcha_anchor":
+            for frame in getattr(page, "frames", ()) or ():
+                f_url = str(getattr(frame, "url", "") or "")
+                if (
+                    "recaptcha" in f_url
+                    and "anchor" in f_url
+                    and "size=invisible" not in f_url
+                ):
+                    loc_fn = getattr(frame, "locator", None)
+                    if callable(loc_fn):
+                        try:
+                            if (
+                                await loc_fn(
+                                    '#recaptcha-anchor[aria-checked="true"]'
+                                ).count()
+                                > 0
+                            ):
+                                return {"kind": None}
+                        except Exception:  # noqa: BLE001
+                            pass
         return dict(raw) if isinstance(kind, str) and kind else {"kind": None}
     return {"kind": None}
 
@@ -2811,7 +2932,18 @@ class DirectVerificationToken:
         )
         channels = _candidate_browser_channels(self.options.channel)
         environment: Any = None
+        selected_channel: str | None = None
         last_missing_exc: BaseException | None = None
+        ignored_default_args = (
+            (*AUTOMATION_DEFAULT_ARGS_TO_DROP, "--hide-scrollbars")
+            if headless
+            else AUTOMATION_DEFAULT_ARGS_TO_DROP
+        )
+        launch_args: tuple[str, ...] = (
+            (AUTOMATION_BLINK_SWITCH, "--window-size=1280,800")
+            if headless
+            else (AUTOMATION_BLINK_SWITCH,)
+        )
         for channel in channels:
             env_kwargs: dict[str, Any] = {
                 "headless": headless,
@@ -2821,8 +2953,8 @@ class DirectVerificationToken:
                 "install_determinism_script": False,
                 "reduced_motion": "no-preference",
                 "color_scheme": "no-preference",
-                "ignore_default_args": AUTOMATION_DEFAULT_ARGS_TO_DROP,
-                "launch_args": (AUTOMATION_BLINK_SWITCH,),
+                "ignore_default_args": ignored_default_args,
+                "launch_args": launch_args,
                 "extra_init_scripts": (HIDE_WEBDRIVER_SCRIPT,),
             }
             if user_data_dir is not None:
@@ -2837,6 +2969,7 @@ class DirectVerificationToken:
             candidate_env = BrowserEnvironment(env_options)
             try:
                 environment = await candidate_env.__aenter__()
+                selected_channel = channel
                 break
             except Exception as exc:  # noqa: BLE001
                 if _is_missing_browser_error(exc):
@@ -2859,12 +2992,17 @@ class DirectVerificationToken:
         registered_listeners: list[tuple[str, Callable[..., Any]]] = []
         response_tasks: set[asyncio.Task[None]] = set()
         page: Any = None
+        ua_cdp_session: Any = None
         try:
             handler = getattr(environment, "challenge_handler", None)
             if handler is not None:
                 handler.solve_on_detection = False
             page = await environment.new_page()
             context = getattr(page, "context", None)
+            if headless:
+                ua_cdp_session = await _sanitize_headless_page_cdp(
+                    context, page, channel=selected_channel
+                )
             raw_cookies = self._current_cookies()
             seed_cookies = _seedable_browser_cookies(
                 raw_cookies, cookie_source=self.cookie_source
@@ -3015,9 +3153,11 @@ class DirectVerificationToken:
                         raise _RetryInHeadedBrowser(
                             "Cloudflare challenge in headless mode"
                         )
-                    if not headless and callable(wait_for_timeout):
-                        await _safe_bring_to_front(page)
-                        wait_deadline = time.monotonic() + max(timeout, 120.0)
+                    if callable(wait_for_timeout):
+                        if not headless:
+                            await _safe_bring_to_front(page)
+                        cf_budget = 25.0 if headless else max(timeout, 120.0)
+                        wait_deadline = time.monotonic() + cf_budget
                         while time.monotonic() < wait_deadline:
                             obs_cf = await _detect_post_submit_challenge(page)
                             if obs_cf.get("kind") == "turnstile":
@@ -3207,7 +3347,17 @@ class DirectVerificationToken:
 
                         if isinstance(obs_kind, str) and obs_kind:
                             if headless:
-                                if pending_verification_err is not None:
+                                bframe_exhausted = obs_kind == "recaptcha_bframe" and (
+                                    auto_solve_attempts >= 2
+                                    or (
+                                        self.options.solve_captchas is False
+                                        and not self._explicit_solver
+                                    )
+                                )
+                                if (
+                                    bframe_exhausted
+                                    and pending_verification_err is not None
+                                ):
                                     self._raise_browser_http_error(
                                         *pending_verification_err
                                     )
@@ -3358,6 +3508,13 @@ class DirectVerificationToken:
                     if updated:
                         self._refreshed_cookies = updated
         finally:
+            if ua_cdp_session is not None:
+                detach_fn = getattr(ua_cdp_session, "detach", None)
+                if callable(detach_fn):
+                    try:
+                        await detach_fn()
+                    except Exception:  # noqa: BLE001
+                        pass
             remove_fn = (
                 getattr(page, "remove_listener", None) if page is not None else None
             )
@@ -3391,25 +3548,26 @@ class DirectVerificationToken:
         profile_dir = (
             _direct_browser_profile_dir(self.options) if is_live_browser else None
         )
-        if is_live_browser and allow_headed:
-            try:
-                async with self._attempt_browser_evaluation(
-                    endpoint_path,
-                    body_factory,
-                    headless=False,
-                    allow_headed_retry=False,
-                    timeout=timeout,
-                    prompt=prompt,
-                    model_id_override=model_id_override,
-                    generation_params=generation_params,
-                    follow_up=follow_up,
-                    user_data_dir=profile_dir,
-                ) as outcome:
-                    yield outcome
-                    return
-            except Exception as exc:  # noqa: BLE001
-                if not _is_missing_display_error(exc):
-                    raise
+        if is_live_browser:
+            if self.options.show_browser:
+                try:
+                    async with self._attempt_browser_evaluation(
+                        endpoint_path,
+                        body_factory,
+                        headless=False,
+                        allow_headed_retry=False,
+                        timeout=timeout,
+                        prompt=prompt,
+                        model_id_override=model_id_override,
+                        generation_params=generation_params,
+                        follow_up=follow_up,
+                        user_data_dir=profile_dir,
+                    ) as outcome:
+                        yield outcome
+                        return
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_missing_display_error(exc):
+                        raise
             async with self._attempt_browser_evaluation(
                 endpoint_path,
                 body_factory,
@@ -3822,6 +3980,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Chat is used; also ARENA_VERIFICATION_TOKEN)"
         ),
     )
+    parser.add_argument(
+        "--show-browser",
+        action="store_true",
+        help="show the Direct Chat browser window instead of running invisibly in the background",
+    )
     parser.add_argument("--prompt", default=None, help="send one prompt and print the answer")
     return parser
 
@@ -3848,6 +4011,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         proxy=args.proxy,
         profiles_root=args.profile_root,
         profile_name=args.profile,
+        show_browser=bool(getattr(args, "show_browser", False)),
     )
 
 
