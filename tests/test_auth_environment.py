@@ -271,3 +271,11 @@ def test_hide_webdriver_script_sets_boolean_false_on_prototype() -> None:
     assert "get: () => false" in HIDE_WEBDRIVER_SCRIPT
 
 
+def test_context_kwargs_allows_native_host_locale_and_timezone() -> None:
+    opts = BrowserEnvironmentOptions(locale=None, timezone_id=None)
+    ctx_kwargs = opts.context_kwargs()
+    assert "locale" not in ctx_kwargs
+    assert "timezone_id" not in ctx_kwargs
+
+
+

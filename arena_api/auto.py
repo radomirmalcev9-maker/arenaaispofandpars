@@ -1873,6 +1873,350 @@ async () => {{
 """
 
 
+_INSTALL_FETCH_STREAM_TAP_SCRIPT = """
+(function () {
+  if (window.__arenaFetchTapInstalled) return;
+  window.__arenaFetchTapInstalled = true;
+  const origFetch = window.fetch;
+  if (typeof origFetch !== "function") return;
+
+  function isEvalStreamUrl(rawUrl) {
+    return (
+      typeof rawUrl === "string" &&
+      (rawUrl.indexOf("/nextjs-api/stream/create-evaluation") !== -1 ||
+        rawUrl.indexOf("/nextjs-api/stream/post-to-evaluation/") !== -1 ||
+        rawUrl.indexOf("/nextjs-api/stream/create-chat") !== -1)
+    );
+  }
+
+  window.fetch = async function (input, init) {
+    let urlStr = "";
+    try {
+      urlStr = typeof input === "string" ? input : (input && input.url) || "";
+    } catch (_) {}
+
+    if (!window.__arenaTapArmed || !isEvalStreamUrl(urlStr)) {
+      return origFetch.apply(this, arguments);
+    }
+
+    let nextInit = init;
+    const patch = window.__arenaBodyPatch;
+    if (patch && init && typeof init.body === "string") {
+      try {
+        const parsed = JSON.parse(init.body);
+        if (parsed && typeof parsed === "object") {
+          if (patch.modelAId) parsed.modelAId = patch.modelAId;
+          if (patch.generationConfig) parsed.generationConfig = patch.generationConfig;
+          nextInit = Object.assign({}, init, { body: JSON.stringify(parsed) });
+        }
+      } catch (_) {}
+    }
+
+    const resp = nextInit === init
+      ? await origFetch.apply(this, arguments)
+      : await origFetch.call(this, input, nextInit);
+    const contentType = (resp.headers && resp.headers.get("content-type")) || "";
+    const cfMitigated = (resp.headers && resp.headers.get("cf-mitigated")) || "";
+
+    if (!resp.ok) {
+      let errBody = "";
+      try {
+        errBody = await resp.clone().text();
+      } catch (_) {}
+      if (typeof window.__arenaDirectHttpError === "function") {
+        try {
+          await window.__arenaDirectHttpError({
+            status: resp.status,
+            body: errBody,
+            contentType: contentType,
+            cfMitigated: cfMitigated
+          });
+        } catch (_) {}
+      }
+      return resp;
+    }
+
+    let clone = null;
+    try {
+      clone = resp.clone();
+    } catch (_) {
+      clone = null;
+    }
+    if (clone) {
+      (async () => {
+        try {
+          if (typeof window.__arenaDirectMeta === "function") {
+            await window.__arenaDirectMeta(contentType);
+          }
+          if (!clone.body || typeof clone.body.getReader !== "function") {
+            const full = await clone.text();
+            if (full && typeof window.__arenaDirectChunk === "function") {
+              await window.__arenaDirectChunk(full);
+            }
+          } else {
+            const reader = clone.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (value && value.length) {
+                const piece = decoder.decode(value, { stream: true });
+                if (piece && typeof window.__arenaDirectChunk === "function") {
+                  await window.__arenaDirectChunk(piece);
+                }
+              }
+            }
+            const tail = decoder.decode();
+            if (tail && typeof window.__arenaDirectChunk === "function") {
+              await window.__arenaDirectChunk(tail);
+            }
+          }
+          if (typeof window.__arenaDirectEof === "function") {
+            await window.__arenaDirectEof();
+          }
+        } catch (err) {
+          if (typeof window.__arenaDirectStreamError === "function") {
+            try { await window.__arenaDirectStreamError(String(err)); } catch (_) {}
+          }
+        }
+      })();
+    }
+    return resp;
+  };
+})();
+""".strip()
+
+_FIND_COMPOSER_JS = """
+async () => {
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    for (const btn of document.querySelectorAll("button")) {
+      const label = ((btn.textContent || "") + " " + (btn.getAttribute("aria-label") || "")).trim().toLowerCase();
+      if (label === "accept cookies" || label === "accept all") {
+        try { btn.click(); } catch (_) {}
+      }
+    }
+    for (const old of document.querySelectorAll("[data-arena-composer]")) {
+      old.removeAttribute("data-arena-composer");
+    }
+    const candidates = Array.from(
+      document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"][contenteditable="true"]')
+    );
+    let best = null;
+    let bestScore = -1;
+    for (const el of candidates) {
+      const id = (el.id || "").toLowerCase();
+      const name = (el.getAttribute("name") || "").toLowerCase();
+      if (id.includes("recaptcha") || name.includes("recaptcha") || id.includes("turnstile")) {
+        continue;
+      }
+      if (el.disabled || el.readOnly || el.getAttribute("aria-hidden") === "true") {
+        continue;
+      }
+      const style = window.getComputedStyle(el);
+      if (!style || style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity || "1") === 0) {
+        continue;
+      }
+      const rect = el.getBoundingClientRect();
+      if (!rect || rect.width < 100 || rect.height < 18) {
+        continue;
+      }
+      const score = rect.width + (el.closest("form") ? 500 : 0) + (el.tagName === "TEXTAREA" ? 200 : 0);
+      if (score > bestScore) {
+        best = { el, rect };
+        bestScore = score;
+      }
+    }
+    if (best) {
+      best.el.setAttribute("data-arena-composer", "1");
+      return {
+        found: true,
+        tag: best.el.tagName.toLowerCase(),
+        x: Math.round(best.rect.left + best.rect.width / 2),
+        y: Math.round(best.rect.top + best.rect.height / 2)
+      };
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return { found: false };
+}
+""".strip()
+
+_MARK_SEND_BUTTON_JS = """
+() => {
+  for (const old of document.querySelectorAll("[data-arena-send]")) {
+    old.removeAttribute("data-arena-send");
+  }
+  const composer = document.querySelector('[data-arena-composer="1"]');
+  if (!composer) return { found: false };
+  const skipRe = /attach|upload|file|image|photo|plus|add|model|mode|search|web|globe|mic|voice|audio|new|clear|copy|history|menu|sidebar|close|cancel|stop/i;
+  const sendRe = /send|submit|ask|отправ/i;
+
+  let scope = composer.closest("form");
+  if (!scope) {
+    let cur = composer.parentElement;
+    for (let depth = 0; cur && depth < 5; depth += 1) {
+      if (cur.querySelectorAll("button").length > 0) {
+        scope = cur;
+      }
+      cur = cur.parentElement;
+    }
+  }
+  if (!scope) scope = document;
+
+  const buttons = Array.from(scope.querySelectorAll("button")).filter((btn) => {
+    if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return false;
+    const style = window.getComputedStyle(btn);
+    if (!style || style.display === "none" || style.visibility === "hidden") return false;
+    const rect = btn.getBoundingClientRect();
+    return rect && rect.width >= 16 && rect.height >= 16;
+  });
+
+  let chosen = buttons.find((btn) => (btn.getAttribute("type") || "").toLowerCase() === "submit");
+  if (!chosen) {
+    chosen = buttons.find((btn) => {
+      const meta = [btn.getAttribute("aria-label"), btn.getAttribute("title"), btn.getAttribute("data-testid"), btn.textContent].filter(Boolean).join(" ");
+      return sendRe.test(meta);
+    });
+  }
+  if (!chosen && composer.closest("form")) {
+    const filtered = buttons.filter((btn) => {
+      const meta = [btn.getAttribute("aria-label"), btn.getAttribute("title"), btn.getAttribute("data-testid"), btn.textContent].filter(Boolean).join(" ");
+      return !skipRe.test(meta);
+    });
+    if (filtered.length > 0) {
+      chosen = filtered[filtered.length - 1];
+    }
+  }
+  if (!chosen) return { found: false };
+  chosen.setAttribute("data-arena-send", "1");
+  const rect = chosen.getBoundingClientRect();
+  return {
+    found: true,
+    x: Math.round(rect.left + rect.width / 2),
+    y: Math.round(rect.top + rect.height / 2)
+  };
+}
+""".strip()
+
+_HAS_VISIBLE_RECAPTCHA_CHALLENGE_JS = """
+() => {
+  for (const frame of document.querySelectorAll('iframe[src*="recaptcha"][src*="bframe"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare.com"]')) {
+    const style = window.getComputedStyle(frame);
+    if (!style || style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity || "1") === 0) {
+      continue;
+    }
+    const rect = frame.getBoundingClientRect();
+    if (rect && rect.width >= 120 && rect.height >= 60 && rect.bottom > 0 && rect.right > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+""".strip()
+
+
+async def _submit_prompt_via_composer(
+    page: Any,
+    prompt: str,
+    *,
+    model_id_override: str | None = None,
+    generation_params: Mapping[str, Any] | None = None,
+) -> bool:
+    locator_fn = getattr(page, "locator", None)
+    eval_fn = getattr(page, "evaluate", None)
+    if not (callable(locator_fn) and callable(eval_fn)):
+        return False
+
+    patch_obj: dict[str, Any] = {}
+    if model_id_override:
+        patch_obj["modelAId"] = model_id_override
+    if generation_params:
+        patch_obj["generationConfig"] = dict(generation_params)
+    patch_literal = json.dumps(patch_obj) if patch_obj else "null"
+    await eval_fn(
+        f"() => {{ window.__arenaBodyPatch = {patch_literal}; window.__arenaTapArmed = true; }}"
+    )
+
+    info = await eval_fn(_FIND_COMPOSER_JS)
+    if not isinstance(info, Mapping) or not info.get("found"):
+        await eval_fn("() => { window.__arenaTapArmed = false; }")
+        return False
+
+    mouse = getattr(page, "mouse", None)
+    if mouse is not None and callable(getattr(mouse, "move", None)):
+        cx = float(info.get("x") or 400)
+        cy = float(info.get("y") or 700)
+        try:
+            await mouse.move(max(40.0, cx - 120.0), max(40.0, cy - 80.0), steps=4)
+            await mouse.move(cx, cy, steps=6)
+        except Exception:  # noqa: BLE001
+            pass
+
+    composer = locator_fn('[data-arena-composer="1"]').first
+    await composer.click()
+
+    keyboard = getattr(page, "keyboard", None)
+    single_line = "\n" not in prompt and "\r" not in prompt
+    if (
+        single_line
+        and len(prompt) <= 160
+        and keyboard is not None
+        and callable(getattr(keyboard, "type", None))
+    ):
+        await keyboard.type(prompt, delay=10)
+        try:
+            non_empty = await eval_fn(
+                "/* composer_nonempty */ () => { const el = document.querySelector('[data-arena-composer=\"1\"]'); "
+                "return !!(el && ((el.value || el.textContent || '').trim().length > 0)); }"
+            )
+        except Exception:  # noqa: BLE001
+            non_empty = True
+        if not non_empty:
+            await composer.fill(prompt)
+    else:
+        first_line = prompt.splitlines()[0][:24] if prompt else ""
+        if (
+            first_line
+            and keyboard is not None
+            and callable(getattr(keyboard, "type", None))
+        ):
+            await keyboard.type(first_line, delay=10)
+        await composer.fill(prompt)
+
+    wait_fn = getattr(page, "wait_for_timeout", None)
+    if callable(wait_fn):
+        await wait_fn(150)
+
+    btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
+    if isinstance(btn_info, Mapping) and btn_info.get("found"):
+        if mouse is not None and callable(getattr(mouse, "move", None)):
+            try:
+                await mouse.move(
+                    float(btn_info.get("x") or 500),
+                    float(btn_info.get("y") or 700),
+                    steps=5,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        send_btn = locator_fn('[data-arena-send="1"]').first
+        await send_btn.click()
+        if callable(wait_fn):
+            await wait_fn(600)
+        try:
+            still_has_text = await eval_fn(
+                "/* composer_nonempty */ () => { const el = document.querySelector('[data-arena-composer=\"1\"]'); "
+                "return !!(el && ((el.value || el.textContent || '').trim().length > 0)); }"
+            )
+        except Exception:  # noqa: BLE001
+            still_has_text = False
+        if still_has_text:
+            await composer.press("Enter")
+    else:
+        await composer.press("Enter")
+    return True
+
+
 class _RetryInHeadedBrowser(Exception):
     """Internal signal to retry a Direct Chat browser request in headed mode."""
 
@@ -2090,6 +2434,10 @@ class DirectVerificationToken:
         headless: bool,
         allow_headed_retry: bool,
         timeout: float,
+        prompt: str | None = None,
+        model_id_override: str | None = None,
+        generation_params: Mapping[str, Any] | None = None,
+        follow_up: bool = False,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
         resolved_proxy = resolve_proxy_url(
             self.options.base_url,
@@ -2102,13 +2450,18 @@ class DirectVerificationToken:
         for channel in channels:
             env_kwargs: dict[str, Any] = {
                 "headless": headless,
+                "locale": None,
+                "timezone_id": None,
                 "artifacts_dir": self.options.artifacts_dir,
                 "install_determinism_script": False,
                 "reduced_motion": "no-preference",
                 "color_scheme": "no-preference",
                 "ignore_default_args": AUTOMATION_DEFAULT_ARGS_TO_DROP,
                 "launch_args": (AUTOMATION_BLINK_SWITCH,),
-                "extra_init_scripts": (HIDE_WEBDRIVER_SCRIPT,),
+                "extra_init_scripts": (
+                    HIDE_WEBDRIVER_SCRIPT,
+                    _INSTALL_FETCH_STREAM_TAP_SCRIPT,
+                ),
             }
             if channel is not None:
                 env_kwargs["channel"] = channel
@@ -2164,6 +2517,33 @@ class DirectVerificationToken:
                         for name, value in seed_cookies.items()
                     ]
                 )
+
+            async_q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            expose_fn = getattr(page, "expose_function", None)
+            if callable(expose_fn):
+                await expose_fn(
+                    "__arenaDirectMeta",
+                    lambda ct: async_q.put_nowait(("meta", str(ct or ""))),
+                )
+                await expose_fn(
+                    "__arenaDirectChunk",
+                    lambda piece: async_q.put_nowait(
+                        ("chunk", str(piece).encode("utf-8"))
+                    ),
+                )
+                await expose_fn(
+                    "__arenaDirectEof",
+                    lambda: async_q.put_nowait(("eof", None)),
+                )
+                await expose_fn(
+                    "__arenaDirectHttpError",
+                    lambda info: async_q.put_nowait(("http_error", info)),
+                )
+                await expose_fn(
+                    "__arenaDirectStreamError",
+                    lambda err: async_q.put_nowait(("stream_error", str(err or ""))),
+                )
+
             await page.goto(self.page_url, wait_until="domcontentloaded")
             wait_for_timeout = getattr(page, "wait_for_timeout", None)
             if callable(wait_for_timeout):
@@ -2199,39 +2579,116 @@ class DirectVerificationToken:
                 except Exception:  # noqa: BLE001
                     pass
 
-            token = await self._mint_token_on_page(page)
-            payload_body = dict(body_factory(token))
-            serialized = json.dumps(payload_body, separators=(",", ":"))
-
-            async_q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-            expose_fn = getattr(page, "expose_function", None)
-            if callable(expose_fn):
-                await expose_fn(
-                    "__arenaDirectMeta",
-                    lambda ct: async_q.put_nowait(("meta", str(ct or ""))),
-                )
-                await expose_fn(
-                    "__arenaDirectChunk",
-                    lambda piece: async_q.put_nowait(
-                        ("chunk", str(piece).encode("utf-8"))
-                    ),
+            used_composer = False
+            if prompt is not None and not follow_up:
+                used_composer = await _submit_prompt_via_composer(
+                    page,
+                    prompt,
+                    model_id_override=model_id_override,
+                    generation_params=generation_params,
                 )
 
-            eval_js = _build_browser_fetch_stream_js(endpoint_path, serialized)
-            eval_task: asyncio.Task[Any] = asyncio.create_task(page.evaluate(eval_js))
-            eval_task.add_done_callback(
-                lambda done_task: async_q.put_nowait(("done", done_task))
-            )
+            eval_task: asyncio.Task[Any] | None = None
+            if not used_composer:
+                token = await self._mint_token_on_page(page)
+                payload_body = dict(body_factory(token))
+                serialized = json.dumps(payload_body, separators=(",", ":"))
+                eval_js = _build_browser_fetch_stream_js(endpoint_path, serialized)
+                eval_task = asyncio.create_task(page.evaluate(eval_js))
+                eval_task.add_done_callback(
+                    lambda done_task: async_q.put_nowait(("done", done_task))
+                )
 
+            first_kind: str = ""
+            first_val: Any = None
             try:
-                first_kind, first_val = await asyncio.wait_for(
-                    async_q.get(), timeout=timeout
-                )
+                while True:
+                    first_kind, first_val = await asyncio.wait_for(
+                        async_q.get(), timeout=timeout
+                    )
+                    if first_kind != "http_error":
+                        break
+                    err_map = first_val if isinstance(first_val, Mapping) else {}
+                    status = int(err_map.get("status") or 500)
+                    err_body = str(err_map.get("body") or "")
+                    resp_headers = {
+                        "content-type": str(err_map.get("contentType") or ""),
+                        "cf-mitigated": str(err_map.get("cfMitigated") or ""),
+                    }
+                    lowered_err = err_body.lower()
+                    if (
+                        allow_headed_retry
+                        and status in (401, 403)
+                        and not any(m in lowered_err for m in _AUTH_REJECT_MARKERS)
+                    ):
+                        raise _RetryInHeadedBrowser(f"HTTP {status}")
+                    if (
+                        used_composer
+                        and not headless
+                        and status == 403
+                        and _is_verification_rejection(err_body)
+                    ):
+                        # arena.ai's React UI escalates a rejected v3 token to
+                        # v2 / retry automatically; wait for its follow-up POST.
+                        prompted_challenge = False
+                        escalation_deadline = time.monotonic() + 8.0
+                        got_retry = False
+                        while time.monotonic() < escalation_deadline:
+                            if not prompted_challenge and callable(
+                                getattr(page, "evaluate", None)
+                            ):
+                                try:
+                                    vis = await page.evaluate(
+                                        _HAS_VISIBLE_RECAPTCHA_CHALLENGE_JS
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    vis = False
+                                if vis:
+                                    prompted_challenge = True
+                                    escalation_deadline = time.monotonic() + timeout
+                                    print(
+                                        "[arena-api] complete the verification "
+                                        "challenge in the browser window...",
+                                        file=sys.stderr,
+                                        flush=True,
+                                    )
+                            try:
+                                next_kind, next_val = await asyncio.wait_for(
+                                    async_q.get(), timeout=0.5
+                                )
+                            except asyncio.TimeoutError:
+                                continue
+                            if next_kind in ("meta", "chunk"):
+                                first_kind, first_val = next_kind, next_val
+                                got_retry = True
+                                break
+                            if next_kind == "http_error" and isinstance(
+                                next_val, Mapping
+                            ):
+                                status = int(next_val.get("status") or status)
+                                err_body = str(next_val.get("body") or err_body)
+                                resp_headers = {
+                                    "content-type": str(
+                                        next_val.get("contentType") or ""
+                                    ),
+                                    "cf-mitigated": str(
+                                        next_val.get("cfMitigated") or ""
+                                    ),
+                                }
+                        if got_retry:
+                            break
+                    self._raise_browser_http_error(status, err_body, resp_headers)
             except asyncio.TimeoutError as exc:
-                eval_task.cancel()
+                if eval_task is not None:
+                    eval_task.cancel()
                 raise TimeoutError(
                     "Direct Chat browser request timed out waiting for response headers."
                 ) from exc
+
+            if first_kind == "stream_error":
+                raise ArenaError(
+                    f"Direct Chat browser stream failed: {first_val}"
+                )
 
             if first_kind == "done":
                 result = first_val.result()
@@ -2267,11 +2724,15 @@ class DirectVerificationToken:
             if first_kind == "chunk":
                 content_type = ""
                 buffered_first_chunk = first_val
+            elif first_kind == "eof":
+                content_type = ""
             else:
                 content_type = str(first_val or "")
 
             async def _iter_chunks() -> AsyncIterator[bytes]:
                 try:
+                    if first_kind == "eof":
+                        return
                     if buffered_first_chunk:
                         yield buffered_first_chunk
                     while True:
@@ -2281,11 +2742,17 @@ class DirectVerificationToken:
                         if item_kind == "chunk":
                             if item_val:
                                 yield item_val
+                        elif item_kind == "eof":
+                            break
+                        elif item_kind == "stream_error":
+                            raise ArenaError(
+                                f"Direct Chat browser stream failed: {item_val}"
+                            )
                         elif item_kind == "done":
                             await item_val
                             break
                 finally:
-                    if not eval_task.done():
+                    if eval_task is not None and not eval_task.done():
                         eval_task.cancel()
                         try:
                             await eval_task
@@ -2321,6 +2788,10 @@ class DirectVerificationToken:
         body_factory: Callable[[str], Mapping[str, Any]],
         *,
         timeout: float = DEFAULT_TIMEOUT,
+        prompt: str | None = None,
+        model_id_override: str | None = None,
+        generation_params: Mapping[str, Any] | None = None,
+        follow_up: bool = False,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
         """Mint a fresh v3 assertion and stream ``endpoint_path`` inside the same browser tab."""
         self._check_solver_ready()
@@ -2332,6 +2803,10 @@ class DirectVerificationToken:
                 headless=True,
                 allow_headed_retry=allow_headed,
                 timeout=timeout,
+                prompt=prompt,
+                model_id_override=model_id_override,
+                generation_params=generation_params,
+                follow_up=follow_up,
             ) as outcome:
                 yield outcome
                 return
@@ -2348,6 +2823,10 @@ class DirectVerificationToken:
             headless=False,
             allow_headed_retry=False,
             timeout=timeout,
+            prompt=prompt,
+            model_id_override=model_id_override,
+            generation_params=generation_params,
+            follow_up=follow_up,
         ) as outcome:
             yield outcome
 
@@ -2358,6 +2837,10 @@ class DirectVerificationToken:
         body_factory: Callable[[str], Mapping[str, Any]],
         *,
         timeout: float = DEFAULT_TIMEOUT,
+        prompt: str | None = None,
+        model_id_override: str | None = None,
+        generation_params: Mapping[str, Any] | None = None,
+        follow_up: bool = False,
     ) -> Iterator[tuple[str, Iterator[bytes]]]:
         """Synchronous streaming bridge over :meth:`astream_evaluation`."""
         sync_q: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -2366,7 +2849,13 @@ class DirectVerificationToken:
         async def _driver() -> None:
             try:
                 async with self.astream_evaluation(
-                    endpoint_path, body_factory, timeout=timeout
+                    endpoint_path,
+                    body_factory,
+                    timeout=timeout,
+                    prompt=prompt,
+                    model_id_override=model_id_override,
+                    generation_params=generation_params,
+                    follow_up=follow_up,
                 ) as (content_type, async_chunks):
                     sync_q.put(("meta", content_type))
                     async for wire in async_chunks:
@@ -2829,62 +3318,6 @@ def _login(
     return 0 if outcome.verification.ok else 2
 
 
-_NON_TEXT_MODEL_HINTS: tuple[str, ...] = (
-    "image",
-    "video",
-    "flux",
-    "imagen",
-    "midjourney",
-    "ideogram",
-    "recraft",
-    "seedream",
-    "suno",
-    "veo",
-    "sora",
-    "kling",
-    "hailuo",
-    "runway",
-    "pika",
-    "luma",
-    "kontext",
-)
-_PREFERRED_DEFAULT_MODELS: tuple[str, ...] = (
-    "gemini-2.5-flash",
-    "gemini-3-flash",
-    "claude-haiku-4-5-20251001",
-    "gpt-4.1-mini",
-    "gpt-4o-mini",
-)
-
-
-def _default_direct_chat_model(models: Sequence[Any]) -> str:
-    """Pick a fast text chat model when ``--model`` was omitted on Direct Chat."""
-    available = [item for item in models if getattr(item, "available", True)]
-    pool = available or list(models)
-    if not pool:
-        raise ArenaError("No Direct Chat models were found on the frontend.")
-    text_pool = [
-        item
-        for item in pool
-        if not any(
-            hint
-            in f"{getattr(item, 'display_name', '')} {getattr(item, 'id', '')}".lower()
-            for hint in _NON_TEXT_MODEL_HINTS
-        )
-    ] or pool
-    ranked = sorted(text_pool, key=model_chat_score)
-    by_name: dict[str, Any] = {}
-    for item in ranked:
-        key = str(getattr(item, "display_name", "")).casefold()
-        by_name.setdefault(key, item)
-    for preferred in _PREFERRED_DEFAULT_MODELS:
-        match = by_name.get(preferred.casefold())
-        if match is not None and model_chat_score(match) < 50_000:
-            return str(getattr(match, "display_name", None) or match.id)
-    chosen = ranked[0]
-    return str(getattr(chosen, "display_name", None) or chosen.id)
-
-
 def _direct_client_for_cli(
     client: Any,
     options: AutoOptions,
@@ -3043,17 +3476,16 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
                 with _direct_client_for_cli(
                     client, options, verification_token=resolved_vtoken
                 ) as direct:
-                    direct_models = (
-                        list(models) if models is not None else direct.get_models()
-                    )
-                    target_model = requested_model
-                    if target_model is None:
-                        target_model = _default_direct_chat_model(direct_models)
-                    else:
-                        direct._resolve_model(target_model, direct_models)
-                    print(f"model             : {target_model}")
+                    if requested_model is not None:
+                        direct_models = (
+                            list(models)
+                            if models is not None
+                            else direct.get_models()
+                        )
+                        direct._resolve_model(requested_model, direct_models)
+                        print(f"model             : {requested_model}")
                     _stream_to_stdout(
-                        direct.stream(args.prompt, model=target_model)
+                        direct.stream(args.prompt, model=requested_model)
                     )
         if not (args.models or args.prompt):
             print("session           : ready")
