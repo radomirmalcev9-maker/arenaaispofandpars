@@ -48,6 +48,8 @@ from .firefox_session import (
     FirefoxSessionError,
     FirefoxSessionManager,
     _expiry_seconds,
+    looks_like_anonymous_cookie,
+    looks_like_auth_cookie,
 )
 
 __all__ = [
@@ -62,22 +64,6 @@ __all__ = [
 #: Cookies detailed per profile. Enough for a real session (a frontend sets a
 #: handful) and short enough to stay readable in a bug report.
 MAX_REPORTED_COOKIES = 25
-
-#: Cookie names that usually carry the session itself, used only to point a
-#: reader at the interesting rows -- never to decide whether a session is valid.
-_AUTH_HINTS: tuple[str, ...] = (
-    "session",
-    "sess",
-    "sid",
-    "token",
-    "auth",
-    "jwt",
-    "login",
-    "csrf",
-    "clearance",
-    "__secure",
-    "__host",
-)
 
 _SAME_SITE: dict[int, str] = {0: "none", 1: "lax", 2: "strict"}
 
@@ -188,8 +174,8 @@ def _value_shape(value: str) -> str:
 
 
 def _looks_like_auth(name: str) -> bool:
-    lowered = name.lower()
-    return any(hint in lowered for hint in _AUTH_HINTS)
+    """Session-looking name, or one a signed-out visitor is given."""
+    return looks_like_auth_cookie(name) or looks_like_anonymous_cookie(name)
 
 
 # --------------------------------------------------------------------------- #
@@ -310,18 +296,28 @@ def _row(record: Any, key: str, default: Any = None) -> Any:
     return record[key] if key in record.keys() else default
 
 
-def _fingerprints(
-    database: Path, targets: Sequence[str]
-) -> tuple[list[CookieFingerprint], int, list[str], list[str], int]:
-    """Fingerprints for the matching cookies, plus what else is worth knowing.
+@dataclass(frozen=True)
+class ProfileScan:
+    """What one profile holds, split into live and expired cookies."""
 
-    Returns ``(matching, expired_matching, other_hosts, subdomain_hosts,
-    total_rows)``. ``subdomain_hosts`` matters because a cookie stored for
-    ``beta.arena.ai`` is *not* sent to ``arena.ai`` by any browser: if the whole
-    session lives there, the base URL is the thing to change, not the reader.
+    matching: list[CookieFingerprint]
+    expired: list[CookieFingerprint]
+    other_hosts: list[str]
+    subdomain_hosts: list[str]
+    rows: int
+
+
+def _fingerprints(database: Path, targets: Sequence[str]) -> ProfileScan:
+    """Fingerprints of the cookies this profile stores for the targets.
+
+    Expired rows are returned too, not dropped: "0 cookies, 12 expired" is the
+    difference between "you never signed in here" and "you signed in, the
+    session died on the 21st". ``subdomain_hosts`` matters because a cookie
+    stored for ``beta.arena.ai`` is *not* sent to ``arena.ai`` by any browser: if
+    the whole session lives there, the base URL is the thing to change.
     """
     matching: list[CookieFingerprint] = []
-    expired = 0
+    expired: list[CookieFingerprint] = []
     others: set[str] = set()
     subdomains: set[str] = set()
     rows = _raw_rows(database)
@@ -342,12 +338,10 @@ def _fingerprints(
         ):
             subdomains.add(host)
         moment = _expiry_seconds(_row(row, "expiry"))
-        if moment is not None and moment < now:
-            expired += 1
-            continue
+        dead = moment is not None and moment < now
         length, digest, shape = _fingerprint_value(str(value))
         same_site = _row(row, "sameSite", 0)
-        matching.append(
+        (expired if dead else matching).append(
             CookieFingerprint(
                 host=host,
                 name=name,
@@ -365,8 +359,15 @@ def _fingerprints(
                 looks_like_auth=_looks_like_auth(name),
             )
         )
-    matching.sort(key=lambda item: (not item.looks_like_auth, item.name))
-    return matching, expired, sorted(others), sorted(subdomains), len(rows)
+    for group in (matching, expired):
+        group.sort(key=lambda item: (not item.looks_like_auth, item.name))
+    return ProfileScan(
+        matching=matching,
+        expired=expired,
+        other_hosts=sorted(others),
+        subdomain_hosts=sorted(subdomains),
+        rows=len(rows),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -475,32 +476,32 @@ def collect_firefox_report(
             "cookies_sqlite": _database_overview(database),
             "matching": 0,
             "expired_matching": 0,
+            "verdict": None,
             "other_arena_hosts": [],
             "subdomain_hosts": [],
             "cookies": [],
+            "expired_cookies": [],
         }
         if database.is_file():
             try:
-                matching, expired, others, subdomains, _ = _fingerprints(
-                    database, targets
-                )
+                scan = _fingerprints(database, targets)
             except (sqlite3.DatabaseError, OSError) as exc:
                 entry["error"] = f"{type(exc).__name__}: {exc}"
             else:
-                entry["matching"] = len(matching)
-                entry["expired_matching"] = expired
-                entry["other_arena_hosts"] = others
-                entry["subdomain_hosts"] = subdomains
+                entry["matching"] = len(scan.matching)
+                entry["expired_matching"] = len(scan.expired)
+                entry["other_arena_hosts"] = scan.other_hosts
+                entry["subdomain_hosts"] = scan.subdomain_hosts
                 entry["cookies"] = [
-                    item.as_dict() for item in matching[:MAX_REPORTED_COOKIES]
+                    item.as_dict() for item in scan.matching[:MAX_REPORTED_COOKIES]
                 ]
-                if len(matching) > MAX_REPORTED_COOKIES:
-                    entry["omitted"] = len(matching) - MAX_REPORTED_COOKIES
-                report["warnings"].extend(
-                    _profile_warnings(
-                        profile, matching, expired, others, subdomains, targets
-                    )
-                )
+                entry["expired_cookies"] = [
+                    item.as_dict() for item in scan.expired[:MAX_REPORTED_COOKIES]
+                ]
+                if len(scan.matching) > MAX_REPORTED_COOKIES:
+                    entry["omitted"] = len(scan.matching) - MAX_REPORTED_COOKIES
+                entry["verdict"] = _verdict(scan)
+                report["warnings"].extend(_profile_warnings(profile, scan, targets))
         report["profiles"].append(entry)
 
     try:
@@ -541,40 +542,107 @@ def collect_firefox_report(
     return report
 
 
+def _verdict(scan: ProfileScan) -> str:
+    """One sentence a person can act on: did the login survive?
+
+    The cases are distinct and lead to different fixes, which is why they are
+    not collapsed into "no session": never signed in, signed in and the session
+    expired (with the date), signed in through a visitor cookie, alive.
+    """
+    live_auth = [
+        item.name for item in scan.matching if looks_like_auth_cookie(item.name)
+    ]
+    dead_auth = [
+        item.name for item in scan.expired if looks_like_auth_cookie(item.name)
+    ]
+    anonymous = [
+        item.name
+        for item in scan.matching
+        if looks_like_anonymous_cookie(item.name)
+    ]
+    if live_auth:
+        return "signed in: " + ", ".join(sorted(live_auth))
+    if dead_auth:
+        died = max(
+            item.expires
+            for item in scan.expired
+            if looks_like_auth_cookie(item.name) and item.expires
+        )
+        when = (
+            datetime.fromtimestamp(died, tz=timezone.utc).strftime("%Y-%m-%d")
+            if died
+            else "unknown date"
+        )
+        return (
+            "was signed in, but the session cookie(s) "
+            + ", ".join(sorted(dead_auth))
+            + f" expired on {when}: sign in to the site again"
+        )
+    if anonymous:
+        return (
+            "not signed in: the profile only holds visitor cookie(s) "
+            + ", ".join(sorted(anonymous))
+        )
+    if scan.matching:
+        return (
+            "no login cookie: only "
+            + ", ".join(sorted(item.name for item in scan.matching))
+            + " are present"
+        )
+    if scan.expired:
+        return (
+            f"no live cookie at all ({len(scan.expired)} expired, oldest "
+            f"{_oldest(scan.expired)}): the browser must visit the site again"
+        )
+    return "no cookie for these domains: the site was never opened in this profile"
+
+
+def _oldest(items: Sequence[CookieFingerprint]) -> str:
+    stamps = [item.expires for item in items if item.expires]
+    if not stamps:
+        return "session"
+    return datetime.fromtimestamp(min(stamps), tz=timezone.utc).strftime("%Y-%m-%d")
+
+
 def _profile_warnings(
-    profile: Path,
-    matching: Sequence[CookieFingerprint],
-    expired: int,
-    others: Sequence[str],
-    subdomains: Sequence[str],
-    targets: Sequence[str],
+    profile: Path, scan: ProfileScan, targets: Sequence[str]
 ) -> list[str]:
     warnings: list[str] = []
     name = profile.name
-    if expired:
+    if scan.expired:
+        auth = [item for item in scan.expired if looks_like_auth_cookie(item.name)]
+        detail = ""
+        if auth:
+            detail = " (session cookie(s) among them: " + ", ".join(
+                sorted(item.name for item in auth)
+            ) + ")"
         warnings.append(
-            f"{name}: {expired} cookie(s) for {', '.join(targets)} are expired "
-            "and were skipped -- the browser needs to renew the session"
+            f"{name}: {len(scan.expired)} cookie(s) for "
+            f"{', '.join(targets)} expired and were skipped{detail}"
         )
-    if others:
+    if scan.other_hosts:
         warnings.append(
-            f"{name}: cookies exist for other Arena hosts ({', '.join(others)}) "
-            f"but not for {', '.join(targets)} -- is the site served from a "
-            "different domain? use --base-url to match it"
+            f"{name}: cookies exist for other Arena hosts "
+            f"({', '.join(scan.other_hosts)}) but not for {', '.join(targets)} -- "
+            "is the site served from a different domain? use --base-url to match it"
         )
-    if subdomains:
-        readable = subdomains[0].lstrip(".")
+    if scan.subdomain_hosts:
+        readable = scan.subdomain_hosts[0].lstrip(".")
         warnings.append(
-            f"{name}: cookies are stored for the subdomain {', '.join(subdomains)}; "
-            f"a browser would not send them to {', '.join(targets)}. If the site "
-            f"is served from there, pass --base-url https://{readable}"
+            f"{name}: cookies are stored for the subdomain "
+            f"{', '.join(scan.subdomain_hosts)}; a browser would not send them to "
+            f"{', '.join(targets)}. If the site is served from there, pass "
+            f"--base-url https://{readable}"
         )
-    if matching and not any(item.looks_like_auth for item in matching):
+    if scan.matching and not any(
+        looks_like_auth_cookie(item.name) for item in scan.matching
+    ):
         warnings.append(
-            f"{name}: {len(matching)} cookie(s) match, but none of their names "
-            "looks like a session token -- the sign-in may have expired"
+            f"{name}: {len(scan.matching)} live cookie(s) match, but none of their "
+            "names looks like a login cookie -- the account is not signed in "
+            "in this profile"
         )
-    empty = [item.name for item in matching if item.shape == "empty"]
+    empty = [item.name for item in scan.matching if item.shape == "empty"]
     if empty:
         warnings.append(
             f"{name}: cookie(s) with an empty value: {', '.join(sorted(set(empty)))}"
@@ -593,6 +661,20 @@ def _report_warnings(
             + ", ".join(str(root["path"]) for root in roots)
         )
     profiles = list(report.get("profiles") or [])
+    if profiles and not any(
+        str(entry.get("verdict") or "").startswith("signed in")
+        for entry in profiles
+    ):
+        verdicts = [
+            f"  - {entry.get('profile')}: {entry.get('verdict')}"
+            for entry in profiles
+            if entry.get("verdict")
+        ]
+        if verdicts:
+            warnings.append(
+                "no profile holds a live login cookie:"
+            )
+            warnings.extend(verdicts)
     if profiles and not any(entry.get("matching") for entry in profiles):
         warnings.append(
             f"none of the {len(profiles)} profile(s) holds a cookie for "
@@ -676,9 +758,9 @@ def format_firefox_report(report: Mapping[str, Any]) -> list[str]:
         if database.get("error"):
             line("  read error", database["error"])
         line(
-            "  matching cookies",
+            "  live cookies",
             f"{entry.get('matching', 0)} "
-            f"({entry.get('expired_matching', 0)} expired skipped)",
+            f"({entry.get('expired_matching', 0)} expired, kept aside)",
         )
         for cookie in entry.get("cookies") or []:
             lines.append(
@@ -693,6 +775,19 @@ def format_firefox_report(report: Mapping[str, Any]) -> list[str]:
             )
         if entry.get("omitted"):
             lines.append(f"    ... and {entry['omitted']} more")
+        # Expired rows are the interesting ones when a login "disappeared":
+        # their dates say whether the session died before or after the last
+        # sign-in, which points at completely different fixes.
+        for cookie in entry.get("expired_cookies") or []:
+            lines.append(
+                "    "
+                + "- "
+                + f"{cookie.get('host', ''):<22} {cookie.get('name', ''):<24} "
+                + f"EXPIRED {cookie.get('expires')} "
+                + f"len={cookie.get('value_length', 0)}"
+            )
+        if entry.get("verdict"):
+            line("  verdict", entry["verdict"])
         if entry.get("other_arena_hosts"):
             line("  other hosts", ", ".join(entry["other_arena_hosts"]))
         if entry.get("subdomain_hosts"):

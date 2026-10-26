@@ -53,6 +53,8 @@ __all__ = [
     "FirefoxSessionManager",
     "SessionManager",
     "cookies_from_rookiepy",
+    "looks_like_anonymous_cookie",
+    "looks_like_auth_cookie",
     "default_profiles_root",
     "firefox_profiles_roots",
     "read_firefox_cookie_records",
@@ -68,6 +70,36 @@ DEFAULT_COOKIE_DOMAINS: tuple[str, ...] = ("arena.ai", "lmarena.ai")
 FIREFOX_ROOT_ENV = "ARENA_FIREFOX_ROOT"
 #: Name or absolute path of the profile to use, skipping discovery entirely.
 FIREFOX_PROFILE_ENV = "ARENA_FIREFOX_PROFILE"
+
+#: Cookie names that carry the login itself. Used only to tell "the account is
+#: signed in" from "the browser merely visited the site": a session made of
+#: ``_ga`` / ``cf_clearance`` / ``provisional_user_id`` is an anonymous visitor,
+#: and no amount of retrying turns it into an account. Never used to decide that
+#: a cookie is *invalid* -- only to pick between two sources and to explain.
+AUTH_COOKIE_HINTS: tuple[str, ...] = (
+    "arena-auth",
+    "session",
+    "auth",
+    "token",
+    "jwt",
+    "login",
+    "signed",
+    "user_id",
+    "userid",
+)
+
+#: Short names that are only a login marker as a whole segment: ``sid`` in
+#: ``sid=...`` yes, ``sid`` inside ``sidebar_state`` obviously not.
+AUTH_COOKIE_SEGMENTS: frozenset[str] = frozenset({"sid", "sess", "sessid", "uid"})
+
+#: Cookie names a visitor gets before signing in. Their presence is a *positive*
+#: signal that nobody is logged in, which is exactly what a stuck user needs to
+#: hear instead of "no cookies found".
+ANONYMOUS_COOKIE_HINTS: tuple[str, ...] = (
+    "provisional_user_id",
+    "anonymous",
+    "guest",
+)
 
 #: Roots tried after the platform default. Distribution packaging puts the real
 #: profile inside a sandbox, where ``~/.mozilla/firefox`` does not exist at all;
@@ -151,9 +183,30 @@ def default_profiles_root() -> Path:
 
 
 def _platform_profile_roots() -> tuple[str, ...]:
-    """Sandboxed roots for this platform (snap/Flatpak packaging)."""
+    """Roots beyond the conventional one, per platform.
+
+    Linux: snap and Flatpak keep the profile inside a sandbox, and
+    ``~/.mozilla/firefox`` does not exist there at all. Windows: a Firefox
+    installed from the Microsoft Store redirects ``%APPDATA%`` into
+    ``%LOCALAPPDATA%\\Packages\\Mozilla.Firefox_*\\LocalCache\\Roaming``, so the
+    profile is written where nothing conventional looks for it.
+    """
     if sys.platform.startswith("linux"):
         return _SANDBOX_PROFILE_ROOTS.get("linux", ())
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
+            return ()
+        packages = Path(local) / "Packages"
+        try:
+            return tuple(
+                sorted(
+                    str(package / "LocalCache" / "Roaming" / "Mozilla" / "Firefox")
+                    for package in packages.glob("Mozilla.Firefox_*")
+                )
+            )
+        except OSError:  # pragma: no cover - unreadable profile store
+            return ()
     return ()
 
 
@@ -197,6 +250,35 @@ def _normalize_domains(domains: Sequence[str]) -> tuple[str, ...]:
     if not normalized:
         raise ValueError("at least one cookie domain is required")
     return tuple(normalized)
+
+
+def _name_segments(name: str) -> set[str]:
+    parts: set[str] = set()
+    for piece in str(name).lower().replace("-", "_").replace(".", "_").split("_"):
+        if piece:
+            parts.add(piece)
+    return parts
+
+
+def looks_like_auth_cookie(name: str) -> bool:
+    """Whether a cookie name usually carries a login.
+
+    A visitor cookie is never a login, however much its name resembles one:
+    ``provisional_user_id`` contains ``user_id`` but marks exactly the opposite
+    state, and telling those apart is the whole point of this predicate.
+    """
+    if looks_like_anonymous_cookie(name):
+        return False
+    lowered = str(name).lower()
+    if any(hint in lowered for hint in AUTH_COOKIE_HINTS):
+        return True
+    return bool(_name_segments(name) & AUTH_COOKIE_SEGMENTS)
+
+
+def looks_like_anonymous_cookie(name: str) -> bool:
+    """Whether a cookie marks a visitor who never signed in."""
+    lowered = str(name).lower()
+    return any(hint in lowered for hint in ANONYMOUS_COOKIE_HINTS)
 
 
 def _as_profiles_root(path: Path) -> Path:
@@ -323,60 +405,118 @@ def cookies_from_rookiepy(records: Any) -> dict[str, str]:
     return _records_to_cookies(_normalize_rookiepy_records(records))
 
 
-def _query_cookie_snapshot(
-    snapshot: Path, domains: Sequence[str]
+def _rows_from_connection(
+    connection: sqlite3.Connection,
+    domains: Sequence[str],
+    *,
+    include_expired: bool,
 ) -> list[dict[str, Any]]:
+    """Collect matching cookie records over one open connection."""
     records: list[dict[str, Any]] = []
-    connection = sqlite3.connect(str(snapshot))
-    try:
-        connection.row_factory = sqlite3.Row
-        now = time.time()
-        for domain in domains:
-            rows = connection.execute(
-                _COOKIE_RECORD_QUERY,
+    now = time.time()
+    for domain in domains:
+        rows = connection.execute(
+            _COOKIE_RECORD_QUERY,
+            {
+                "exact": domain,
+                "dotted": f".{domain}",
+                "subdomain": f"%.{domain}",
+            },
+        ).fetchall()
+        for row in rows:
+            name = row["name"]
+            value = row["value"]
+            if not name or value is None:
+                continue
+            moment = _expiry_seconds(row["expiry"])
+            expired = moment is not None and moment < now
+            if expired and not include_expired:
+                continue
+            records.append(
                 {
-                    "exact": domain,
-                    "dotted": f".{domain}",
-                    "subdomain": f"%.{domain}",
-                },
-            ).fetchall()
-            for row in rows:
-                name = row["name"]
-                value = row["value"]
-                if not name or value is None:
-                    continue
-                moment = _expiry_seconds(row["expiry"])
-                if moment is not None and moment < now:
-                    continue
-                records.append(
-                    {
-                        "name": name,
-                        "value": value,
-                        "domain": row["host"],
-                        "path": row["path"],
-                        "expires": int(moment) if moment is not None else 0,
-                        "secure": bool(row["isSecure"]),
-                        "http_only": bool(row["isHttpOnly"]),
-                    }
-                )
-    finally:
-        connection.close()
+                    "name": name,
+                    "value": value,
+                    "domain": row["host"],
+                    "path": row["path"],
+                    "expires": int(moment) if moment is not None else 0,
+                    "expired": expired,
+                    "secure": bool(row["isSecure"]),
+                    "http_only": bool(row["isHttpOnly"]),
+                }
+            )
     return records
 
 
+def _read_live_database(
+    database: Path, domains: Sequence[str], *, include_expired: bool
+) -> list[dict[str, Any]]:
+    """Read the profile database in place, without copying it.
+
+    WAL exists precisely so a reader can look at a database a writer is
+    appending to, and it is the only way to see the *newest* committed rows:
+    copying ``cookies.sqlite`` plus its sidecars mid-write can produce a
+    snapshot that stops just before the page load that stored the session,
+    which reads as "my login is not there". ``mode=ro`` makes the intent
+    explicit -- the browser's data is never touched.
+    """
+    uri = "file:" + database.as_posix().replace("?", "%3f").replace("#", "%23")
+    connection = sqlite3.connect(
+        f"{uri}?mode=ro", uri=True, timeout=5.0
+    )
+    try:
+        connection.row_factory = sqlite3.Row
+        return _rows_from_connection(
+            connection, domains, include_expired=include_expired
+        )
+    finally:
+        connection.close()
+
+
+def _query_cookie_snapshot(
+    snapshot: Path,
+    domains: Sequence[str],
+    *,
+    include_expired: bool = False,
+) -> list[dict[str, Any]]:
+    connection = sqlite3.connect(str(snapshot))
+    try:
+        connection.row_factory = sqlite3.Row
+        return _rows_from_connection(
+            connection, domains, include_expired=include_expired
+        )
+    finally:
+        connection.close()
+
+
 def read_firefox_cookie_records(
-    database: Path, domains: Sequence[str]
+    database: Path,
+    domains: Sequence[str],
+    *,
+    include_expired: bool = False,
 ) -> list[dict[str, Any]]:
     """Read full cookie records from a Firefox ``cookies.sqlite`` safely.
 
-    Firefox keeps the database in WAL mode and may hold it open while running.
-    The database and its ``-wal``/``-shm`` sidecars are copied to a private
-    temporary directory first, so SQLite reads a consistent snapshot without
-    contending for locks with a running browser. Cookie values in
+    The live database is read in place through a read-only connection, which is
+    what WAL is for: a running Firefox keeps appending to ``-wal``, and the
+    newest commits (the ones a fresh sign-in creates) are only visible there.
+    When that is refused -- a permission problem, a filesystem where SQLite
+    cannot share the ``-shm`` file, a database being checkpointed -- the
+    database and its ``-wal``/``-shm`` sidecars are copied to a private
+    temporary directory and read as a snapshot instead. Cookie values in
     ``cookies.sqlite`` are stored in plain text; no key material is needed.
+
+    ``include_expired=True`` returns the rows Firefox has not purged yet,
+    flagged ``expired``: they are how a report can say *when* a session ended
+    rather than only that none is left.
     """
     database = Path(database)
     targets = _normalize_domains(domains)
+    try:
+        return _read_live_database(
+            database, targets, include_expired=include_expired
+        )
+    except sqlite3.Error:
+        pass
     with tempfile.TemporaryDirectory(prefix="arena-api-firefox-") as temporary:
         snapshot = Path(temporary) / database.name
         shutil.copy2(database, snapshot)
@@ -386,7 +526,9 @@ def read_firefox_cookie_records(
                 shutil.copy2(
                     sidecar, snapshot.with_name(snapshot.name + suffix)
                 )
-        return _query_cookie_snapshot(snapshot, targets)
+        return _query_cookie_snapshot(
+            snapshot, targets, include_expired=include_expired
+        )
 
 
 def read_firefox_cookies(database: Path, domains: Sequence[str]) -> dict[str, str]:
@@ -824,10 +966,8 @@ class FirefoxSessionManager:
     ) -> list[dict[str, Any]] | None:
         rookiepy = self._rookiepy_module()
         if rookiepy is None:
-            warnings.append(
-                "rookiepy is not installed; reading cookies.sqlite directly "
-                "(pip install rookiepy for the supported path)"
-            )
+            # Not an error: the built-in reader is the documented fallback, and
+            # --explain / --diagnose already report whether rookiepy is present.
             return None
         for attempt in range(self.max_cookie_attempts):
             try:

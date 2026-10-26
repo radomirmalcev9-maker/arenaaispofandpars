@@ -172,7 +172,9 @@ Firefox представляется Firefox, после обновления в
 `sandbox`-варианты — `~/snap/firefox/common/.mozilla/firefox` и
 `~/.var/app/org.mozilla.firefox/.mozilla/firefox`. Без этого на Ubuntu с snap-сборкой
 Firefox (и на Flatpak) `~/.mozilla/firefox` просто не существует, и поиск всегда
-заканчивался «профиль не найден».
+заканчивался «профиль не найден». На Windows дополнительно просматриваются профили
+сборки из Microsoft Store:
+`%LOCALAPPDATA%\Packages\Mozilla.Firefox_*\LocalCache\Roaming\Mozilla\Firefox`.
 
 Указать место вручную можно переменными окружения или флагами CLI:
 
@@ -185,6 +187,47 @@ python -m arena_api --profile-root /data/firefox --profile ab12.work --status
 `--explain` печатает по строке на каждый найденный профиль с числом cookie и
 отдельную строку `Firefox selected` — видно, какой профиль выбран и почему, без
 чтения чего-либо вручную.
+
+#### «13 cookie нашлись, а доступа нет» — что это значит
+
+Частая картина: `--status` показывает десяток имён (`__cf_bm`, `_ga`, `cf_clearance`,
+`provisional_user_id`, `arena_build_bucket`, …) и запросы всё равно отбиваются. Это не
+ошибка чтения — это **гостевая сессия**. `provisional_user_id` выдаётся до входа, а
+`arena-auth-prod-v1.0` (та самая cookie входа) отсутствует. Три вещи в библиотеке
+теперь говорят об этом прямо:
+
+- `--status` печатает строку `login cookie : none -- these are visitor cookies; …`,
+  вместо того чтобы молча отдавать анонимный набор;
+- `--explain` помечает сохранённый файл: `(exists, 13 names, no login cookie -- a
+  browser profile with one is preferred)`;
+- **сохранённый `state/cookies.json` больше не перекрывает живой профиль**, если в нём
+  нет cookie входа, а в профиле она есть. Файл — это копия, снятая однажды; профиль —
+  живой источник. Раньше именно из-за этого «вход в браузере есть, а библиотека его
+  не видит».
+
+В `--diagnose` у каждого профиля появилась строка `verdict` — фраза, по которой сразу
+виден следующий шаг:
+
+```
+verdict : signed in: arena-auth-prod-v1.0
+verdict : was signed in, but the session cookie(s) arena-auth-prod-v1.0 expired
+          on 2026-10-21: sign in to the site again
+verdict : not signed in: the profile only holds visitor cookie(s) provisional_user_id
+verdict : no cookie for these domains: the site was never opened in this profile
+```
+
+Просроченные строки показываются отдельно (`- .arena.ai arena-auth-prod-v1.0 EXPIRED
+2026-10-21T04:49Z`): в `cookies.sqlite` они остаются после истечения, и по дате видно,
+истекла сессия до последнего входа или после.
+
+#### Чтение базы, которую браузер держит открытой
+
+Firefox работает в режиме WAL: свежий вход сначала попадает в `cookies.sqlite-wal` и
+только потом — в основной файл. Поэтому база читается **на месте** через соединение
+`mode=ro` (WAL для того и сделан, чтобы читатель не мешал писателю и видел последние
+коммиты), а копирование файла с `-wal`/`-shm` осталось запасным путём на случай, если
+SQLite не может открыть файл на чтение. Профиль при этом не меняется: библиотека только
+читает. Firefox можно не закрывать.
 
 #### Что прислать, если сессия всё равно не читается: `--diagnose`
 
@@ -207,9 +250,11 @@ bearer-учётные данные, и одна строка из такого �
   строк, сколько cookie подходит под целевые домены (и сколько из них просрочено);
 - выбранный профиль и причину выбора;
 - что именно вернул `load_cookies()` (имена, без значений);
-- предупреждения: профиль пуст, cookie просрочены, cookie лежат на другом хосте
-  (`beta.arena.ai` — тогда нужен `--base-url https://beta.arena.ai`), у cookie нет
-  «сессионного» имени, каталог профилей не найден.
+- `verdict` по каждому профилю и предупреждения: профиль пуст, cookie просрочены (с
+  датой и именами), cookie лежат на другом хосте или поддомене (`beta.arena.ai` —
+  тогда нужен `--base-url https://beta.arena.ai`), живые cookie есть, но ни одна не
+  похожа на вход, каталог профилей не найден;
+- явную строку «no profile holds a live login cookie», когда входа нет нигде.
 
 Если нужна помощь, присылайте именно вывод `--diagnose` (плюс версию Firefox из
 `about:support` и текст ошибки). **Не** присылайте `cookies.sqlite`, `cookies.json`

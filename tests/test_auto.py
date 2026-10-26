@@ -494,7 +494,8 @@ def test_the_discovery_report_names_a_configured_storage_file(tmp_path) -> None:
     path = write_storage(tmp_path, {"session": "stored"})
     lines = explain_sources(AutoOptions(storage_path=path, use_browser_profiles=False))
     stored = next(line for line in lines if line.startswith("stored cookies.json"))
-    assert str(path) in stored and "(exists)" in stored
+    assert str(path) in stored and "(exists" in stored
+    assert "login cookie present" in stored
 
 
 def test_explain_login_keeps_its_sentence_form(monkeypatch) -> None:
@@ -2287,3 +2288,141 @@ def test_no_firefox_cookies_mentions_the_diagnose_command(
     assert main(["--explain"]) == 0
     printed = capsys.readouterr().out
     assert "--diagnose" in printed
+
+
+# --------------------------------------------------------------------------- #
+# A stale cookie file must not eclipse a signed-in browser profile
+# --------------------------------------------------------------------------- #
+
+
+def visitor_storage(tmp_path, name="cookies.json") -> Path:
+    """A saved export from before the sign-in: real cookies, no account."""
+    path = tmp_path / "state" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "cf_clearance": "cf",
+                "_ga": "GA1",
+                "provisional_user_id": "abc",
+                "arena_build_bucket": "b",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def signed_in_profile(tmp_path) -> Path:
+    """A Firefox tree whose default profile holds a real login cookie."""
+    root = tmp_path / "firefox"
+    (root / "Profiles").mkdir(parents=True)
+    make_extra_firefox_profile(
+        root / "Profiles",
+        "aaaa.default-release",
+        [
+            ("arena-auth-prod-v1.0", "signed-in", ".arena.ai", FUTURE),
+            ("provisional_user_id", "old", ".arena.ai", FUTURE),
+        ],
+    )
+    (root / "profiles.ini").write_text(
+        "[Install1234]\nDefault=Profiles/aaaa.default-release\n", encoding="utf-8"
+    )
+    return root
+
+
+def test_a_visitor_cookie_file_does_not_hide_a_signed_in_profile(tmp_path) -> None:
+    """The reported bug: 13 anonymous cookies won over the live session."""
+    stored = visitor_storage(tmp_path)
+    profiles = signed_in_profile(tmp_path)
+    output = io.StringIO()
+    options = isolated_options(
+        tmp_path,
+        storage_path=stored,
+        use_browser_profiles=True,
+        profiles_root=profiles,
+        output=output,
+    )
+    found = discover_session(options)
+    assert found is not None
+    assert found.source == "firefox"
+    assert found.cookies["arena-auth-prod-v1.0"] == "signed-in"
+    assert "no login cookie in it" in output.getvalue()
+
+
+def test_a_cookie_file_with_a_login_still_wins(tmp_path) -> None:
+    stored = write_storage(tmp_path, {"arena-auth-prod-v1.0": "from-file"})
+    profiles = signed_in_profile(tmp_path)
+    options = isolated_options(
+        tmp_path, storage_path=stored, use_browser_profiles=True, profiles_root=profiles
+    )
+    found = discover_session(options)
+    assert found is not None
+    assert found.source == "storage"
+    assert found.cookies == {"arena-auth-prod-v1.0": "from-file"}
+
+
+def test_a_visitor_cookie_file_is_still_used_when_nothing_is_signed_in(tmp_path) -> None:
+    stored = visitor_storage(tmp_path)
+    root = tmp_path / "firefox"
+    (root / "Profiles").mkdir(parents=True)
+    make_extra_firefox_profile(
+        root / "Profiles",
+        "aaaa.default-release",
+        [("arena_build_bucket", "b", ".arena.ai", FUTURE)],
+    )
+    (root / "profiles.ini").write_text(
+        "[Install1234]\nDefault=Profiles/aaaa.default-release\n", encoding="utf-8"
+    )
+    options = isolated_options(
+        tmp_path, storage_path=stored, use_browser_profiles=True, profiles_root=root
+    )
+    found = discover_session(options)
+    assert found is not None
+    assert found.source == "storage"
+
+
+def test_explain_says_a_stored_file_has_no_login_cookie(tmp_path) -> None:
+    stored = visitor_storage(tmp_path)
+    lines = explain_sources(
+        isolated_options(tmp_path, storage_path=stored, use_browser_profiles=False)
+    )
+    stored_line = next(line for line in lines if line.startswith("stored cookies.json"))
+    assert "4 names" in stored_line
+    assert "no login cookie" in stored_line
+    assert "browser profile with one is preferred" in stored_line
+
+
+def test_explain_says_a_stored_file_has_a_login_cookie(tmp_path) -> None:
+    stored = write_storage(tmp_path, {"arena-auth-prod-v1.0": "x", "_ga": "GA1"})
+    lines = explain_sources(
+        isolated_options(tmp_path, storage_path=stored, use_browser_profiles=False)
+    )
+    stored_line = next(line for line in lines if line.startswith("stored cookies.json"))
+    assert "login cookie present" in stored_line
+
+
+def test_status_uses_the_profile_when_the_file_is_anonymous(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    stored = visitor_storage(tmp_path)
+    profiles = signed_in_profile(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_FIREFOX_ROOT", str(profiles))
+    assert main(["--storage", str(stored), "--status", "--no-verify"]) == 0
+    printed = capsys.readouterr().out
+    assert "Firefox profile" in printed
+    assert "arena-auth-prod-v1.0" in printed
+    assert "signed-in" not in printed  # values are never printed
+
+
+def test_status_says_when_only_visitor_cookies_were_found(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    stored = visitor_storage(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_FIREFOX_ROOT", str(tmp_path / "no-profiles"))
+    assert main(["--storage", str(stored), "--status", "--no-verify"]) == 0
+    printed = capsys.readouterr().out
+    assert "login cookie      : none" in printed
+    assert "visitor cookies" in printed
