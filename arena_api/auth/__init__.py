@@ -43,6 +43,15 @@ functions that need them, so importing this package stays cheap and works
 without them installed.
 """
 
+from .autosolve import (
+    AutoSolveOutcome,
+    BrowserChallengeAutoSolver,
+    auto_solve_challenge_on_page,
+    decode_mp3_via_browser_webaudio,
+    encode_pcm16le_to_flac,
+    parse_google_speech_response,
+    transcribe_pcm16_google,
+)
 from .browser import (
     SYNTHETIC_MONITOR_HEADER,
     BrowserEnvironment,
@@ -137,6 +146,8 @@ from .session import (
 
 __all__ = [
     "ANIMATION_FREEZE_CSS",
+    "AutoSolveOutcome",
+    "BrowserChallengeAutoSolver",
     "BrowserEnvironment",
     "BrowserEnvironmentOptions",
     "BrowserSessionManager",
@@ -193,11 +204,14 @@ __all__ = [
     "TrajectoryPlanner",
     "build_init_script",
     "alogin_and_save",
+    "auto_solve_challenge_on_page",
     "chromium_user_agent",
     "cubic_bezier_point",
+    "decode_mp3_via_browser_webaudio",
     "describe_solver",
     "detect_recaptcha_version",
     "detect_recaptcha_version_sync",
+    "encode_pcm16le_to_flac",
     "fitts_duration",
     "inspect_page",
     "inspect_page_sync",
@@ -205,8 +219,10 @@ __all__ = [
     "login_environment_options",
     "inspect_response",
     "normalize_state_payload",
+    "parse_google_speech_response",
     "solver_for",
     "observation_targets_recaptcha",
     "resolve_element_center",
     "run_sync",
+    "transcribe_pcm16_google",
 ]
