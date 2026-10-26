@@ -87,8 +87,10 @@ DEFAULT_PROFILE_HINTS: tuple[str, ...] = ("default-release", "default")
 # Used only when the profile's compatibility.ini cannot be read.
 FALLBACK_FIREFOX_VERSION = "156.0"
 
-# Firefox froze the Gecko trail version ("rv:") in the User-Agent at 109.0;
-# only the trailing "Firefox/<version>" tracks the real release.
+# Firefox froze the Gecko trail version ("rv:") at 109.0 only in releases
+# 110..119 (bug 1805967) and unfroze it in Firefox 120 (bug 1852935), where both
+# ``rv:`` and ``Firefox/`` carry ``MOZILLA_UAVERSION`` (``<major>.0``, hiding
+# security patch levels per bugs 572659 and 870868).
 FROZEN_GECKO_TRAIL_VERSION = "109.0"
 
 STALE_SESSION_TEMPLATE = (
@@ -107,6 +109,13 @@ _LAST_VERSION_RE = re.compile(r"LastVersion\s*=\s*(\d+(?:\.\d+)*)")
 _ACCEPT_LANGUAGES_RE = re.compile(
     r'user_pref\(\s*"intl\.accept_languages"\s*,\s*"([^"]*)"\s*\)'
 )
+_LOCALE_REQUESTED_RE = re.compile(
+    r'user_pref\(\s*"intl\.locale\.requested"\s*,\s*"([^"]*)"\s*\)'
+)
+_UA_OVERRIDE_RE = re.compile(
+    r'user_pref\(\s*"general\.useragent\.override"\s*,\s*"([^"]*)"\s*\)'
+)
+_BCP47_TAG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 
 _COOKIE_RECORD_QUERY = """
 SELECT host, name, value, path, expiry, isSecure, isHttpOnly
@@ -709,18 +718,72 @@ def _platform_token() -> str:
     return f"X11; Linux {arch}"
 
 
+def _clean_bcp47_tag(raw: str | None) -> str | None:
+    """Validate and normalize a POSIX/BCP-47 locale tag, rejecting Windows CRT
+    English names such as ``Russian_Russia`` or ``English_United States``."""
+    if not raw:
+        return None
+    base = raw.strip().split(".")[0].split("@")[0].split(":")[0].strip()
+    if not base or base in ("C", "POSIX"):
+        return None
+    tag = base.replace("_", "-")
+    return tag if _BCP47_TAG_RE.match(tag) else None
+
+
+def _windows_ui_locale_tag() -> str | None:
+    """Resolve the active Windows UI language into an ISO/BCP-47 tag."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return None
+        lang_id = int(windll.kernel32.GetUserDefaultUILanguage())
+    except Exception:  # noqa: BLE001 - defensive on non-standard runtimes
+        return None
+    posix = locale.windows_locale.get(lang_id)
+    return _clean_bcp47_tag(posix)
+
+
 def _system_locale_tag() -> str | None:
+    win_tag = _windows_ui_locale_tag()
+    if win_tag:
+        return win_tag
     try:
         current = locale.getlocale()
     except ValueError:
         current = None
     if current and current[0]:
-        return current[0].replace("_", "-")
+        cleaned = _clean_bcp47_tag(current[0])
+        if cleaned:
+            return cleaned
     for variable in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
-        value = os.environ.get(variable)
-        if value and value.split(".")[0] not in ("", "C", "POSIX"):
-            return value.split(".")[0].split(":")[0].replace("_", "-")
+        cleaned = _clean_bcp47_tag(os.environ.get(variable))
+        if cleaned:
+            return cleaned
     return None
+
+
+def _ua_versions(raw_version: str, *, explicit: bool) -> tuple[str, str]:
+    """Return ``(rv_version, firefox_version)`` matching ``nsHttpHandler.cpp``.
+
+    Firefox builds ``MOZILLA_UAVERSION`` as ``<major>.0`` (hiding ``.patch``
+    point releases such as ``148.0.2``) and uses it for both ``rv:`` and
+    ``Firefox/`` since Firefox 120 (releases 110..119 froze ``rv:109.0``).
+    An explicit ``firefox_version=`` override keeps its exact string in the
+    trailing ``Firefox/<version>`` token.
+    """
+    major_text = raw_version.strip().split(".", 1)[0]
+    try:
+        major = int(major_text)
+    except ValueError:
+        return (FROZEN_GECKO_TRAIL_VERSION, raw_version)
+    ua_milestone = f"{major}.0"
+    rv = FROZEN_GECKO_TRAIL_VERSION if 110 <= major < 120 else ua_milestone
+    shown = raw_version if explicit else ua_milestone
+    return rv, shown
 
 
 def _normalize_accept_language(value: str) -> str:
@@ -1289,16 +1352,7 @@ class FirefoxSessionManager:
                 return match.group(1)
         return FALLBACK_FIREFOX_VERSION
 
-    def user_agent(self) -> str:
-        """Return the User-Agent of the Firefox build matching this profile."""
-        version = self._installed_version()
-        return (
-            f"Mozilla/5.0 ({_platform_token()}; "
-            f"rv:{FROZEN_GECKO_TRAIL_VERSION}) Gecko/20100101 "
-            f"Firefox/{version}"
-        )
-
-    def _profile_accept_language(self) -> str | None:
+    def _prefs_text(self) -> str | None:
         try:
             profile = self.profile_path()
         except FirefoxSessionError:
@@ -1307,11 +1361,47 @@ class FirefoxSessionManager:
         if not prefs.is_file():
             return None
         try:
-            text = prefs.read_text(encoding="utf-8", errors="replace")
+            return prefs.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
+
+    def _profile_ua_override(self) -> str | None:
+        text = self._prefs_text()
+        if not text:
+            return None
+        match = _UA_OVERRIDE_RE.search(text)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+        return None
+
+    def user_agent(self) -> str:
+        """Return the User-Agent of the Firefox build matching this profile."""
+        if not self.firefox_version:
+            override = self._profile_ua_override()
+            if override:
+                return override
+        version = self._installed_version()
+        rv, shown = _ua_versions(version, explicit=bool(self.firefox_version))
+        return (
+            f"Mozilla/5.0 ({_platform_token()}; "
+            f"rv:{rv}) Gecko/20100101 "
+            f"Firefox/{shown}"
+        )
+
+    def _profile_accept_language(self) -> str | None:
+        text = self._prefs_text()
+        if not text:
+            return None
         match = _ACCEPT_LANGUAGES_RE.search(text)
-        return match.group(1) if match else None
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+        requested = _LOCALE_REQUESTED_RE.search(text)
+        if requested and requested.group(1).strip():
+            first = requested.group(1).split(",")[0].strip()
+            cleaned = _clean_bcp47_tag(first)
+            if cleaned:
+                return cleaned
+        return None
 
     def accept_language(self) -> str:
         """Return a Firefox-style ``Accept-Language`` for this machine."""

@@ -519,3 +519,24 @@ def test_the_async_transport_works_over_the_wire(wire, live_origin) -> None:
             await transport.close()
 
     assert asyncio.run(scenario()) == {"ok": True}
+
+
+def test_firefox_impersonation_sends_browser_wire_headers(wire, live_origin) -> None:
+    with ArenaTransport(
+        live_origin,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        },
+        impersonate="firefox",
+    ) as transport:
+        assert transport.get_json("/config") == {"ok": True}
+
+    sent = {k.lower(): v for k, v in SEEN[-1]["headers"].items()}
+    assert sent["accept-encoding"] == "gzip, deflate, br, zstd"
+    assert sent["te"] == "trailers"
+    assert sent["priority"] == "u=4"
+    assert sent["referer"] == live_origin.rstrip("/") + "/"
+

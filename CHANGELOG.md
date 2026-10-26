@@ -5,6 +5,32 @@
 
 ## Unreleased
 
+### Точный отпечаток Firefox (`User-Agent`, `Accept-Language`, H2-заголовки) и фильтрация пассивного `jsd`-маяка Cloudflare
+
+- **Исправлено (`FirefoxSessionManager.user_agent()`):** начиная с Firefox 120
+  Mozilla разморозила `rv:109.0` (`nsHttpHandler.cpp`: `rv:<major>.0` и
+  `Firefox/<major>.0` без `.patch`-версии из `compatibility.ini`). Старое
+  значение `rv:109.0` и передача `.patch`-номера ломали криптографическую
+  привязку `cf_clearance` к `User-Agent`, из-за чего Cloudflare отклонял живую
+  сессию Firefox даже с `impersonate="firefox"`. Также добавлено чтение
+  `general.useragent.override` из `prefs.js`.
+- **Исправлено (`FirefoxSessionManager.accept_language()` на Windows):** в
+  Windows `locale.getlocale()` возвращает словесные названия локалей CRT вроде
+  `Russian_Russia` или `English_United States` вместо BCP-47 (`ru-RU`, `en-US`),
+  что приводило к отправке невалидного заголовка
+  `Accept-Language: Russian-Russia,russian;q=0.8,...`. Теперь используется
+  Windows UI LCID (`GetUserDefaultUILanguage` -> `locale.windows_locale`),
+  `intl.locale.requested` из `prefs.js` и строгая проверка синтаксиса BCP-47.
+- **Исправлено (`ArenaTransport` при `impersonate=`):** при работе через
+  `curl_cffi` теперь передаются браузерные заголовки транспортного уровня
+  (`Accept-Encoding: gzip, deflate, br, zstd`, `Referer` для `same-origin`,
+  а для профилей `firefox*` — `Te: trailers` и `Priority: u=4`), вместо
+  урезанного `Accept-Encoding: gzip, deflate` от `httpx`.
+- **Исправлено (`transport.py`, `auto.py`, `challenge.py`):** пассивный скрипт
+  телеметрии Cloudflare `/cdn-cgi/challenge-platform/scripts/jsd/main.js` и
+  упоминание `turnstile` в обычных страницах Next.js (`200` и `404` на `/config`)
+  больше не принимаются ошибочно за блокирующую капчу `ChallengeRequiredError`.
+
 ### Приоритет авторизованного профиля над гостевым `state/cookies.json` и чистое поведение `--status`
 
 - **Исправлено:** незавершённый запуск `--login` мог сохранить в `./state/cookies.json`

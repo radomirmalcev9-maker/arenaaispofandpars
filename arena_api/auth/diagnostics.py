@@ -585,6 +585,8 @@ def collect_firefox_report(
     else:
         report["selected"]["profile"] = str(selected)
         report["selected"]["reason"] = manager.selection_reason()
+        report["selected"]["user_agent"] = manager.user_agent()
+        report["selected"]["accept_language"] = manager.accept_language()
 
     try:
         cookies = manager.load_cookies()
@@ -785,8 +787,13 @@ def format_firefox_report(report: Mapping[str, Any]) -> list[str]:
             line("  subdomain hosts", ", ".join(entry["subdomain_hosts"]))
 
     section("session the library would use")
+    selected_info = report.get("selected") or {}
     line("profile", selected or "-")
-    line("selection", (report.get("selected") or {}).get("reason") or "-")
+    line("selection", selected_info.get("reason") or "-")
+    if selected_info.get("user_agent"):
+        line("user-agent", selected_info.get("user_agent"))
+    if selected_info.get("accept_language"):
+        line("accept-language", selected_info.get("accept_language"))
     cookies = report.get("cookies") or {}
     if cookies.get("error"):
         line("cookies", f"ERROR {cookies['error']}")
