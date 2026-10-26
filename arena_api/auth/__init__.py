@@ -3,7 +3,13 @@
 Two backends live here:
 
 * :mod:`arena_api.auth.firefox_session` reuses the signed-in session of your
-  local Firefox profile (stdlib-only, ``rookiepy`` optional).
+  local Firefox profile (stdlib-only, ``rookiepy`` optional). Every profile of
+  every root is ranked -- snap, Flatpak, portable installs included -- and the
+  one that actually stores cookies for the target domains wins, because the
+  profile ``profiles.ini`` calls the default often is not that one.
+* :mod:`arena_api.auth.diagnostics` answers "why was no session found?" with a
+  report that is safe to paste: hosts, names, paths, flags, expiry, value
+  lengths and value fingerprints, never a cookie value.
 * :mod:`arena_api.auth.session` drives a real Playwright sign-in with your own
   credentials and persists the result as ``cookies.json`` /
   ``storage_state``, with :mod:`arena_api.auth.browser`,
@@ -83,11 +89,20 @@ from .environment import (
     DeterminismOptions,
     build_init_script,
 )
+from .diagnostics import (
+    CookieFingerprint,
+    collect_firefox_report,
+    format_firefox_report,
+    report_as_json,
+)
 from .firefox_session import (
     DEFAULT_COOKIE_DOMAINS,
+    FIREFOX_PROFILE_ENV,
+    FIREFOX_ROOT_ENV,
     FirefoxSessionError,
     FirefoxSessionManager,
     SessionManager,
+    firefox_profiles_roots,
 )
 from .kinematics import (
     KinematicMouse,
@@ -143,7 +158,14 @@ __all__ = [
     "DEFAULT_STATE_PATH",
     "DeterminismOptions",
     "FirefoxSessionError",
+    "CookieFingerprint",
+    "FIREFOX_PROFILE_ENV",
+    "FIREFOX_ROOT_ENV",
     "FirefoxSessionManager",
+    "collect_firefox_report",
+    "firefox_profiles_roots",
+    "format_firefox_report",
+    "report_as_json",
     "FormLoginFlow",
     "HCAPTCHA_SELECTORS",
     "HIDE_WEBDRIVER_SCRIPT",

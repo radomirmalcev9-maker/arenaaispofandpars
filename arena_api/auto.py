@@ -76,8 +76,15 @@ from .auth.captcha import (
 )
 from .auth.challenge import ChallengeHandler, ChallengeKind, ChallengeObservation
 from .auth.login import DEFAULT_STATE_PATH, LoginResult, login_and_save
+from .auth.diagnostics import (
+    collect_firefox_report,
+    format_firefox_report,
+    report_as_json,
+)
 from .auth.firefox_session import (
     DEFAULT_COOKIE_DOMAINS,
+    FIREFOX_PROFILE_ENV,
+    FIREFOX_ROOT_ENV,
     FirefoxSessionError,
     FirefoxSessionManager,
     SessionManager,
@@ -585,29 +592,7 @@ def explain_sources(options: AutoOptions | None = None) -> list[str]:
         )
         return report
 
-    manager = FirefoxSessionManager(
-        domains=_domains_for(options),
-        profiles_root=options.profiles_root,
-        profile_name=options.profile_name,
-        cookie_database=options.cookie_database,
-    )
-    try:
-        profile = manager.profile_path()
-    except FirefoxSessionError as exc:
-        report.append(_report_line("Firefox profile", f"unavailable ({exc})"))
-    else:
-        try:
-            found = len(manager.load_cookies())
-        except FirefoxSessionError as exc:
-            report.append(_report_line("Firefox profile", f"{profile} unreadable ({exc})"))
-        else:
-            report.append(
-                _report_line(
-                    "Firefox profile",
-                    f"{profile} ({found} cookie names for "
-                    f"{', '.join(_domains_for(options))})",
-                )
-            )
+    report.extend(_explain_firefox(options))
     if _rookiepy_module() is None:
         report.append(
             _report_line(
@@ -619,6 +604,58 @@ def explain_sources(options: AutoOptions | None = None) -> list[str]:
     else:
         report.append(_report_line("other browsers", "rookiepy available"))
     return report
+
+
+def _explain_firefox(options: AutoOptions) -> list[str]:
+    """One report line per Firefox profile, then the one that would be used.
+
+    A machine with several profiles is exactly where "no session found" used to
+    come from: the configured default is often not the profile holding the
+    cookies, and a single line that named only that default hid the others.
+    """
+    manager = FirefoxSessionManager(
+        domains=_domains_for(options),
+        profiles_root=options.profiles_root,
+        profile_name=options.profile_name,
+        cookie_database=options.cookie_database,
+    )
+    domains = ", ".join(_domains_for(options))
+    lines: list[str] = []
+    try:
+        candidates = manager.profile_candidates()
+    except FirefoxSessionError as exc:
+        return [_report_line("Firefox profile", f"unavailable ({exc})")]
+    for index, profile in enumerate(candidates[:6], start=1):
+        count = manager.profile_cookie_count(profile)
+        label = "Firefox profile" if index == 1 else f"Firefox profile {index}"
+        lines.append(_report_line(label, f"{profile} ({count} cookies for {domains})"))
+    if len(candidates) > 6:
+        lines.append(
+            _report_line(
+                "Firefox profiles",
+                f"... and {len(candidates) - 6} more (see --diagnose)",
+            )
+        )
+    try:
+        lines.append(_report_line("Firefox selected", manager.selection_reason()))
+    except FirefoxSessionError as exc:
+        lines.append(_report_line("Firefox selected", f"unavailable ({exc})"))
+    return lines
+
+
+def _firefox_cookie_total(options: AutoOptions) -> int:
+    """How many matching cookies all Firefox profiles hold together."""
+    manager = FirefoxSessionManager(
+        domains=_domains_for(options),
+        profiles_root=options.profiles_root,
+        profile_name=options.profile_name,
+        cookie_database=options.cookie_database,
+    )
+    try:
+        candidates = manager.profile_candidates()
+    except FirefoxSessionError:
+        return 0
+    return sum(manager.profile_cookie_count(profile) for profile in candidates)
 
 
 def _wait_for_login(options: AutoOptions) -> bool:
@@ -1601,6 +1638,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--status", action="store_true", help="report the session and stop")
     parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help=(
+            "print a redacted report about your Firefox profiles (hosts, names, "
+            "expiry, value fingerprints -- never a value) and stop; safe to share"
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="with --diagnose: print the report as JSON",
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Firefox profile directory name or absolute path "
+            f"(default: the profile holding the cookies; also {FIREFOX_PROFILE_ENV})"
+        ),
+    )
+    parser.add_argument(
+        "--profile-root",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Firefox profiles directory to search instead of the usual ones "
+            f"(also {FIREFOX_ROOT_ENV})"
+        ),
+    )
+    parser.add_argument(
         "--explain", action="store_true", help="list every source considered and why"
     )
     parser.add_argument("--models", action="store_true", help="print the model list")
@@ -1627,6 +1695,8 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         channel=args.channel,
         hide_automation=args.hide_automation,
         impersonate=args.impersonate,
+        profiles_root=args.profile_root,
+        profile_name=args.profile,
     )
 
 
@@ -1638,6 +1708,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = build_arg_parser().parse_args(argv)
     options = _options_from_args(args)
+
+    if args.diagnose:
+        report = collect_firefox_report(
+            domains=options.cookie_domains(),
+            profiles_root=options.profiles_root,
+            profile_name=options.profile_name,
+            cookie_database=options.cookie_database,
+        )
+        if args.json:
+            print(report_as_json(report))
+        else:
+            for line in format_firefox_report(report):
+                print(line)
+        return 0
 
     if args.explain:
         for line in explain_sources(options):
@@ -1655,6 +1739,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             detail += " -> off"
         print(_report_line("captcha solving", detail))
+        if options.use_browser_profiles and _firefox_cookie_total(options) == 0:
+            print(_report_line("no Firefox cookies", "run --diagnose for a redacted report"))
         return 0
 
     try:
@@ -1732,6 +1818,10 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
                 print(f"  {line}")
             return 1
         print(f"session           : {discovered.description}")
+        print(
+            "cookie names      : "
+            + (", ".join(sorted(discovered.cookies)) or "none")
+        )
         if not options.verify:
             return 0
         with auto_client(options) as client:
