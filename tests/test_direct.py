@@ -167,3 +167,165 @@ def test_async_direct_stream_and_session() -> None:
             assert len(chat.history) == 2
 
     asyncio.run(run())
+
+
+def test_direct_stream_parses_ai_frames_over_event_stream_and_preserves_repeated_prefixes() -> None:
+    seen_content_types: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/text/direct":
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/html"},
+                content=PAGE.encode(),
+            )
+        if request.url.path == "/nextjs-api/stream/create-evaluation":
+            seen_content_types.append(request.headers.get("content-type", ""))
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream; charset=utf-8"},
+                content=(
+                    b'a0:"1"\n'
+                    b'a2:[{"type":"heartbeat"}]\n'
+                    b'a0:"100"\n'
+                    b'ad:{"finishReason":"stop"}\n'
+                ),
+            )
+        raise AssertionError(request.url)
+
+    with DirectArenaClient(
+        base_url="https://arena.test",
+        verification_token="tok",
+        http_transport=httpx.MockTransport(handler),
+    ) as client:
+        assert client.complete("Count", model="Model A") == "1100"
+    assert seen_content_types == ["application/json"]
+
+
+def test_direct_stream_still_parses_standard_sse_events() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/text/direct":
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/html"},
+                content=PAGE.encode(),
+            )
+        if request.url.path == "/nextjs-api/stream/create-evaluation":
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream"},
+                content=b'data: {"delta": "SSE "}\n\ndata: {"delta": "ok"}\n\ndata: [DONE]\n\n',
+            )
+        raise AssertionError(request.url)
+
+    with DirectArenaClient(
+        base_url="https://arena.test",
+        verification_token="tok",
+        http_transport=httpx.MockTransport(handler),
+    ) as client:
+        assert client.complete("Hi", model="Model A") == "SSE ok"
+
+
+def test_direct_stream_surfaces_a3_and_arena_error_frames() -> None:
+    payloads = [
+        b'a3:"reCAPTCHA token rejected"\n',
+        b'a0:"hasArenaError"\nad:{"finishReason":"stop"}\n',
+        b'ad:{"finishReason":"error"}\n',
+    ]
+    for wire in payloads:
+        def handler(request: httpx.Request, body: bytes = wire) -> httpx.Response:
+            if request.url.path == "/text/direct":
+                return httpx.Response(
+                    200,
+                    request=request,
+                    headers={"content-type": "text/html"},
+                    content=PAGE.encode(),
+                )
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream"},
+                content=body,
+            )
+
+        with DirectArenaClient(
+            base_url="https://arena.test",
+            verification_token="tok",
+            http_transport=httpx.MockTransport(handler),
+        ) as client:
+            try:
+                client.complete("Hi", model="Model A")
+            except ProtocolError:
+                pass
+            else:
+                raise AssertionError(f"expected ProtocolError for {wire!r}")
+
+
+def test_resolve_model_prefers_ranked_chat_uuid_over_webdev_twin() -> None:
+    webdev_uuid = "11111111-1111-1111-1111-111111111111"
+    chat_uuid = "22222222-2222-2222-2222-222222222222"
+    twin_page = (
+        '<html><script id="__NEXT_DATA__" type="application/json">'
+        + json.dumps(
+            {
+                "props": {
+                    "pageProps": {
+                        "models": [
+                            {
+                                "id": webdev_uuid,
+                                "publicName": "gemini-2.5-flash",
+                                "userSelectable": False,
+                                "capabilities": {
+                                    "inputCapabilities": {"text": True},
+                                    "outputCapabilities": {"text": False, "web": True},
+                                },
+                                "rankByModality": {"chat": 9007199254740991},
+                            },
+                            {
+                                "id": chat_uuid,
+                                "publicName": "gemini-2.5-flash",
+                                "userSelectable": True,
+                                "capabilities": {
+                                    "inputCapabilities": {"text": True},
+                                    "outputCapabilities": {"text": True},
+                                },
+                                "rankByModality": {"chat": 3},
+                            },
+                        ]
+                    }
+                }
+            }
+        )
+        + "</script></html>"
+    )
+    chosen_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/text/direct":
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/html"},
+                content=twin_page.encode(),
+            )
+        payload = json.loads(request.content)
+        chosen_ids.append(payload["modelAId"])
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=b'a0:"ok"\nad:{"finishReason":"stop"}\n',
+        )
+
+    with DirectArenaClient(
+        base_url="https://arena.test",
+        verification_token="tok",
+        http_transport=httpx.MockTransport(handler),
+    ) as client:
+        assert client.complete("Hi", model="gemini-2.5-flash") == "ok"
+    assert chosen_ids == [chat_uuid]
+

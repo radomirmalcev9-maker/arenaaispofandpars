@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as _distribution_version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import unquote, urlparse, urlunparse
 
 from .challenge import ChallengeHandler, ChallengeObservation
 from .environment import DeterminismOptions, build_init_script
@@ -74,6 +75,10 @@ class BrowserEnvironmentOptions:
     #: Chromium channel, e.g. ``"chromium"`` or ``"chrome"``. ``None`` uses
     #: Playwright's bundled build.
     channel: str | None = None
+
+    #: Outbound proxy URL (``http://``, ``https://`` or ``socks5://``) passed to
+    #: Playwright's ``browser_type.launch(proxy=...)``.
+    proxy: str | None = None
 
     #: Sets ``navigator.language`` and ``navigator.languages``.
     locale: str = "en-US"
@@ -237,9 +242,41 @@ class BrowserEnvironmentOptions:
         }
         if self.channel:
             kwargs["channel"] = self.channel
+        if self.proxy:
+            kwargs["proxy"] = _playwright_proxy_settings(self.proxy)
         if self.ignore_default_args:
             kwargs["ignore_default_args"] = list(self.ignore_default_args)
         return kwargs
+
+
+def _playwright_proxy_settings(proxy_url: str) -> dict[str, str]:
+    """Convert a URL string into Playwright's ``ProxySettings`` dictionary.
+
+    Chromium resolves hostnames remotely over ``socks5://`` automatically and
+    rejects libcurl's ``socks5h://`` scheme, so ``socks5h`` is normalised to
+    ``socks5`` here while any embedded credentials are split out.
+    """
+    raw = proxy_url.strip()
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    parsed = urlparse(raw)
+    scheme = parsed.scheme.lower()
+    if scheme in ("socks5h", "socks4", "socks4a", "socks"):
+        scheme = "socks5"
+    host = parsed.hostname or ""
+    if scheme not in ("http", "https", "socks5") or not host:
+        raise ValueError(f"Unsupported browser proxy URL: {proxy_url!r}")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    settings: dict[str, str] = {
+        "server": urlunparse((scheme, netloc, "", "", "", ""))
+    }
+    if parsed.username is not None:
+        settings["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        settings["password"] = unquote(parsed.password)
+    return settings
 
 
 class BrowserEnvironment:
