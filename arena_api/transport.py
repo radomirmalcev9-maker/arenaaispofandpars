@@ -67,12 +67,19 @@ SessionRefresher: TypeAlias = Callable[[ArenaError], Mapping[str, str] | None]
 
 _CHALLENGE_MARKERS = (
     "cf-chl-",
-    "challenge-platform",
-    "turnstile",
+    "__cf_chl_",
+    "_cf_chl_opt",
+    "cdn-cgi/challenge-platform/h/",
+    "cf-turnstile",
     "captcha-delivery",
     "just a moment...",
     "cf-error-details",
 )
+
+#: HTTP status codes that anti-bot edges use for challenge screens; a plain
+#: origin 404 (e.g. Next.js answering ``GET /config``) must not be mistaken for
+#: a challenge just because Cloudflare appended its passive ``jsd`` beacon.
+_CHALLENGE_STATUS_CODES = frozenset({401, 403, 429, 503})
 
 #: How to get the optional curl_cffi transport. Named in the error message, so
 #: a caller who asked for impersonation but never installed it gets one command
@@ -266,9 +273,12 @@ def _raise_for_status(
         )
     if status < 400:
         return
-    if _looks_like_challenge(body, headers):
+    mitigated = _header_value(headers, "cf-mitigated").lower() == "challenge"
+    if mitigated or (
+        status in _CHALLENGE_STATUS_CODES and _looks_like_challenge(body, headers)
+    ):
         raise ChallengeRequiredError(
-            "The service requested an interactive browser verification. "
+            f"The service requested an interactive browser verification (HTTP {status}). "
             "Refresh or verify the session in a normal browser and retry."
         )
     if status in (401, 403):
@@ -324,6 +334,35 @@ def _merged_default_headers(
                 del merged[key]
         merged.update(headers)
     return merged
+
+
+def _impersonation_wire_headers(
+    profile: str, base_url: str, headers: Mapping[str, str]
+) -> dict[str, str]:
+    """Add browser wire headers natively supported by ``curl_cffi`` / libcurl.
+
+    ``httpx`` advertises ``Accept-Encoding: gzip, deflate`` unless Python brotli
+    and zstd packages are installed, whereas libcurl inside ``curl_cffi`` decodes
+    ``gzip, deflate, br, zstd`` natively and real Firefox/Chrome always send all
+    four over HTTPS. Caller-supplied headers always win case-insensitively.
+    """
+    existing = {str(key).lower(): str(value) for key, value in headers.items()}
+    defaults: dict[str, str] = {
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+    }
+    if existing.get("sec-fetch-site", "").lower() == "same-origin":
+        defaults["Referer"] = base_url
+    if profile.lower().startswith("firefox"):
+        defaults["Te"] = "trailers"
+        if existing.get("sec-fetch-mode", "").lower() == "navigate":
+            defaults["Priority"] = "u=0, i"
+        else:
+            defaults["Priority"] = "u=4"
+    result = dict(headers)
+    for key, value in defaults.items():
+        if key.lower() not in existing:
+            result[key] = value
+    return result
 
 
 def _validate_max_auth_refreshes(value: int) -> None:
@@ -498,6 +537,9 @@ class ArenaTransport:
         if self.impersonate is not None:
             http_transport = build_impersonation_transport(
                 self.impersonate, verify=verify
+            )
+            merged_headers = _impersonation_wire_headers(
+                self.impersonate, self.base_url, merged_headers
             )
         self.session = httpx.Client(
             headers=merged_headers,
@@ -756,6 +798,9 @@ class AsyncArenaTransport:
         if self.impersonate is not None:
             http_transport = build_impersonation_transport(
                 self.impersonate, verify=verify, asynchronous=True
+            )
+            merged_headers = _impersonation_wire_headers(
+                self.impersonate, self.base_url, merged_headers
             )
         self.session = httpx.AsyncClient(
             headers=merged_headers,

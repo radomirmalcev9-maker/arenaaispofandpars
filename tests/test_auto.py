@@ -2441,3 +2441,20 @@ def test_cli_status_probes_once_without_launching_refresh_ladder(
     assert "not ok: browser verification challenge" in out
     assert "impersonate" in out
 
+
+def test_probe_accepts_nextjs_404_with_passive_cloudflare_jsd_beacon() -> None:
+    """When ``arena.ai`` (Next.js) answers ``GET /config`` with HTTP 404 plus
+    Cloudflare's passive ``jsd/main.js`` beacon, ``probe()`` must report the
+    session as reachable rather than a verification challenge."""
+    nextjs_404 = (
+        b"<!DOCTYPE html><html><head><title>404</title></head><body>"
+        b"<script src='/cdn-cgi/challenge-platform/scripts/jsd/main.js'></script>"
+        b"</body></html>"
+    )
+    recorder = Recorder((404, nextjs_404, "text/html"))
+    with ArenaClient(http_transport=recorder.transport) as client:
+        result = probe(client, "/config")
+    assert result.ok is True
+    assert result.auth_problem is False
+
+

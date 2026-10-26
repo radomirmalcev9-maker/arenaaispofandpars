@@ -195,7 +195,7 @@ _INTERSTITIAL_MARKERS: tuple[str, ...] = (
     "/recaptcha/api.js",
     "hcaptcha",
     "cf-turnstile",
-    "challenge-platform",
+    "cdn-cgi/challenge-platform/h/",
     "just a moment",
     "captcha-delivery",
 )
@@ -1908,18 +1908,33 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
         with auto_client(status_options) as client:
             result = probe(client, options.probe_path)
         print(f"verification      : {result.describe()}")
-        if not result.ok and result.auth_problem and not impersonation_available():
-            print(
-                "hint              : TLS fingerprint impersonation is not installed "
-                f'({IMPERSONATE_EXTRA} or pip install -e ".[impersonate]"); '
-                "Cloudflare often challenges browser cookies sent with Python's "
-                "default TLS stack"
-            )
+        if not result.ok and result.error is not None:
+            print(f"detail            : {result.error}")
+        if not result.ok and result.auth_problem:
+            if not impersonation_available():
+                print(
+                    "hint              : TLS fingerprint impersonation is not installed "
+                    f'({IMPERSONATE_EXTRA} or pip install -e ".[impersonate]"); '
+                    "Cloudflare often challenges browser cookies sent with Python's "
+                    "default TLS stack"
+                )
+            elif discovered.source == "firefox":
+                print(
+                    "hint              : if cf_clearance in Firefox has expired or was "
+                    f"issued for another IP/build, reload {options.base_url} in Firefox "
+                    "and run --status again"
+                )
         return 0 if result.ok else 2
 
     with auto_client(options) as client:
         if args.models:
-            models = client.get_models()
+            try:
+                models = client.get_models()
+            except ArenaError as exc:
+                if isinstance(exc, AuthenticationError):
+                    raise
+                with auto_direct_client(replace(options, verify=False)) as direct:
+                    models = direct.get_models()
             print(f"models            : {len(models)}")
             for model in models[:25]:
                 print(f"  {model.id} — {model.display_name}")

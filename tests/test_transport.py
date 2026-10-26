@@ -208,3 +208,31 @@ def test_requests_through_a_closed_async_transport_are_library_errors() -> None:
 
     errors = asyncio.run(run())
     assert len(errors) == 2, errors
+
+
+def test_nextjs_404_and_passive_jsd_beacon_are_not_misread_as_challenges() -> None:
+    """Cloudflare injects ``/cdn-cgi/challenge-platform/scripts/jsd/main.js`` into
+    normal origin 200/404 HTML pages, and Next.js bundles mention ``turnstile``.
+    Neither is a blocking challenge screen."""
+    nextjs_html = (
+        "<!DOCTYPE html><html><head><title>404: This page could not be found.</title>"
+        '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>'
+        "</head><body><div>404</div>"
+        "<script>a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';</script>"
+        "</body></html>"
+    )
+    with pytest.raises(ArenaError, match="HTTP 404") as exc_info:
+        _raise_for_status(404, nextjs_html, {"server": "cloudflare", "content-type": "text/html"})
+    assert not isinstance(exc_info.value, ChallengeRequiredError)
+
+    def ok_page(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/html", "server": "cloudflare"},
+            content=nextjs_html.encode("utf-8"),
+        )
+
+    with ArenaTransport("https://arena.test", http_transport=httpx.MockTransport(ok_page)) as tr:
+        assert "404" in tr.get_text("/text/direct")
+

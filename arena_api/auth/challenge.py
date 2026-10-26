@@ -377,7 +377,10 @@ def inspect_response(
         signals.append(
             ChallengeSignal("body-text", "challenges.cloudflare.com reference", ChallengeKind.TURNSTILE)
         )
-    if "cdn-cgi/challenge-platform" in body_lower:
+    if "cdn-cgi/challenge-platform" in body_lower and (
+        "cdn-cgi/challenge-platform/h/" in body_lower
+        or "cdn-cgi/challenge-platform/scripts/jsd/" not in body_lower
+    ):
         signals.append(
             ChallengeSignal(
                 "body-text", "cdn-cgi/challenge-platform", ChallengeKind.CLOUDFLARE_MANAGED

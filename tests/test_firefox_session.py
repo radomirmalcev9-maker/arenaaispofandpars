@@ -335,17 +335,28 @@ def test_cookie_database_override(tmp_path) -> None:
 def test_user_agent_reads_version_from_profile(tmp_path) -> None:
     root, release, _ = make_profile_tree(tmp_path)
     (release / "compatibility.ini").write_text(
-        "[Compatibility]\nLastVersion=141.0/20250825133129\n", encoding="utf-8"
+        "[Compatibility]\nLastVersion=148.0.2_20260315123456/20260315123456\n",
+        encoding="utf-8",
     )
     manager = FirefoxSessionManager(profiles_root=root, interactive=False)
     agent = manager.user_agent()
-    assert "Firefox/141.0" in agent
-    assert "rv:109.0" in agent  # Firefox freezes the Gecko trail version.
+    # Firefox >= 120 reports MOZILLA_UAVERSION (<major>.0) in both rv: and Firefox/
+    # so cf_clearance's User-Agent binding matches the real browser byte-for-byte.
+    assert "Firefox/148.0" in agent
+    assert "Firefox/148.0.2" not in agent
+    assert "rv:148.0" in agent
     assert agent.startswith("Mozilla/5.0 (")
+
+    esr_115 = FirefoxSessionManager(
+        profiles_root=root, firefox_version="115.0", interactive=False
+    )
+    assert "rv:109.0" in esr_115.user_agent()
+    assert "Firefox/115.0" in esr_115.user_agent()
 
     override = FirefoxSessionManager(
         profiles_root=root, firefox_version="137.0.1", interactive=False
     )
+    assert "rv:137.0" in override.user_agent()
     assert "Firefox/137.0.1" in override.user_agent()
 
 
@@ -592,3 +603,38 @@ def test_user_agent_matches_the_platform_token(monkeypatch, tmp_path) -> None:
         domains=("arena.ai",), profiles_root=tmp_path, cookie_database=tmp_path / "c.sqlite"
     )
     assert firefox_module._platform_token() in manager.user_agent()
+
+
+def test_windows_crt_locale_names_never_leak_into_accept_language(
+    monkeypatch, tmp_path
+) -> None:
+    """Windows ``locale.getlocale()`` returns ``('Russian_Russia', '1251')`` or
+    ``('English_United States', '1252')``; emitting that raw string produces an
+    invalid ``Accept-Language`` header that anti-bot edges flag immediately."""
+    root, release, _ = make_profile_tree(tmp_path)
+    monkeypatch.setattr(firefox_module, "_windows_ui_locale_tag", lambda: None)
+    monkeypatch.setattr(
+        firefox_module.locale, "getlocale", lambda: ("Russian_Russia", "1251")
+    )
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
+        monkeypatch.delenv(var, raising=False)
+
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    assert manager.accept_language() == "en-US,en;q=0.5"
+    assert "Russian" not in manager.accept_language()
+
+    monkeypatch.setattr(firefox_module, "_windows_ui_locale_tag", lambda: "ru-RU")
+    assert manager.accept_language() == "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3"
+
+
+def test_user_agent_and_locale_overrides_in_prefs_js(tmp_path) -> None:
+    root, release, _ = make_profile_tree(tmp_path)
+    (release / "prefs.js").write_text(
+        'user_pref("general.useragent.override", "CustomFirefox/150.0");\n'
+        'user_pref("intl.locale.requested", "sv-SE,en-US");\n',
+        encoding="utf-8",
+    )
+    manager = FirefoxSessionManager(profiles_root=root, interactive=False)
+    assert manager.user_agent() == "CustomFirefox/150.0"
+    assert manager.accept_language() == "sv-SE,sv;q=0.8,en-US;q=0.5,en;q=0.3"
+
