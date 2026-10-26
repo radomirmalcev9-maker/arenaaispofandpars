@@ -34,6 +34,7 @@ from .transport import (
     ArenaTransport,
     AsyncArenaTransport,
     CookieInput,
+    ProxyInput,
     SSEParser,
     _raise_if_challenge_page,
 )
@@ -515,6 +516,7 @@ class DirectArenaClient(_DirectMixin):
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
         verify: bool | str = True,
+        proxy: ProxyInput = None,
         verification_token: VerificationToken | None = None,
         direct_page_path: str = DIRECT_PAGE_PATH,
         direct_stream_path: str = DIRECT_STREAM_PATH,
@@ -536,6 +538,8 @@ class DirectArenaClient(_DirectMixin):
             timeout=timeout,
             http2=http2,
             verify=verify,
+            proxy=proxy,
+            fallback_proxy=session.proxy if session is not None else None,
             http_transport=http_transport,
             impersonate=resolve_impersonation(
                 impersonate,
@@ -754,6 +758,7 @@ class AsyncDirectArenaClient(_DirectMixin):
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
         verify: bool | str = True,
+        proxy: ProxyInput = None,
         verification_token: VerificationToken | None = None,
         direct_page_path: str = DIRECT_PAGE_PATH,
         direct_stream_path: str = DIRECT_STREAM_PATH,
@@ -775,6 +780,8 @@ class AsyncDirectArenaClient(_DirectMixin):
             timeout=timeout,
             http2=http2,
             verify=verify,
+            proxy=proxy,
+            fallback_proxy=session.proxy if session is not None else None,
             http_transport=http_transport,
             impersonate=resolve_impersonation(
                 impersonate,

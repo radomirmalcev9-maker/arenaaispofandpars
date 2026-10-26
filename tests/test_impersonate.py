@@ -58,6 +58,11 @@ from arena_api.transport import (
 # --------------------------------------------------------------------------- #
 
 
+class _FakeCurlSession:
+    def __init__(self) -> None:
+        self.trust_env = False
+
+
 class RecordingTransport:
     """Stands in for CurlTransport/AsyncCurlTransport."""
 
@@ -65,6 +70,7 @@ class RecordingTransport:
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
+        self._session = _FakeCurlSession()
         RecordingTransport.instances.append(self)
 
     def close(self) -> None:  # pragma: no cover - nothing to release
@@ -89,6 +95,9 @@ def fake_curl_cffi(monkeypatch) -> type[RecordingTransport]:
     derived default to fire must not depend on what the machine happens to have.
     """
     RecordingTransport.instances = []
+    monkeypatch.delenv("ARENA_PROXY", raising=False)
+    monkeypatch.setattr("urllib.request.getproxies", dict)
+    monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
     module = types.ModuleType("httpx_curl_cffi")
     module.CurlTransport = RecordingTransport  # type: ignore[attr-defined]
     module.AsyncCurlTransport = RecordingTransport  # type: ignore[attr-defined]
@@ -539,4 +548,206 @@ def test_firefox_impersonation_sends_browser_wire_headers(wire, live_origin) -> 
     assert sent["te"] == "trailers"
     assert sent["priority"] == "u=4"
     assert sent["referer"] == live_origin.rstrip("/") + "/"
+
+
+# --------------------------------------------------------------------------- #
+# Proxy routing & Windows Cyrillic CA bundle safeguards (curl-cffi >= 0.17.0)
+# --------------------------------------------------------------------------- #
+
+
+def test_curl_transport_restores_trust_env_unless_proxy_disabled(
+    fake_curl_cffi,
+) -> None:
+    auto_tr = build_impersonation_transport("firefox")
+    assert auto_tr._session.trust_env is True
+    assert "proxy" not in auto_tr.kwargs
+
+    off_tr = build_impersonation_transport("firefox", proxy=False)
+    assert off_tr._session.trust_env is False
+    assert "proxy" not in off_tr.kwargs
+
+
+def test_env_and_windows_system_proxy_flow_into_curl_transport(
+    fake_curl_cffi, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "urllib.request.getproxies",
+        lambda: {"https": "http://127.0.0.1:2080", "http": "http://127.0.0.1:2080"},
+    )
+    with ArenaTransport("https://arena.ai", impersonate="firefox") as tr:
+        assert tr.proxy == "http://127.0.0.1:2080"
+        assert fake_curl_cffi.instances[-1].kwargs["proxy"] == "http://127.0.0.1:2080"
+
+    # Loopback targets must never auto-route through an active system/env proxy.
+    with ArenaTransport("http://127.0.0.1:8123", impersonate="firefox") as local_tr:
+        assert local_tr.proxy is None
+        assert "proxy" not in fake_curl_cffi.instances[-1].kwargs
+
+    # Explicit opt-out overrides system/env proxies.
+    with ArenaTransport("https://arena.ai", impersonate="firefox", proxy="off") as off:
+        assert off.proxy is None
+        assert "proxy" not in fake_curl_cffi.instances[-1].kwargs
+        assert fake_curl_cffi.instances[-1]._session.trust_env is False
+
+    # Windows Internet Settings emits socks4:// for unprefixed SOCKS entries;
+    # modern local proxies speak SOCKS5 and httpx.Proxy rejects socks4://.
+    monkeypatch.setattr(
+        "urllib.request.getproxies",
+        lambda: {"https": "socks4://127.0.0.1:1080"},
+    )
+    async_tr = AsyncArenaTransport("https://arena.ai", impersonate="firefox")
+    try:
+        assert async_tr.proxy == "socks5://127.0.0.1:1080"
+        assert (
+            fake_curl_cffi.instances[-1].kwargs["proxy"] == "socks5://127.0.0.1:1080"
+        )
+    finally:
+        asyncio.run(async_tr.close())
+
+    # NO_PROXY bypasses system/env proxy for matching hosts.
+    monkeypatch.setattr(
+        "urllib.request.proxy_bypass", lambda host: host == "arena.ai"
+    )
+    with ArenaTransport("https://arena.ai", impersonate="firefox") as bypassed:
+        assert bypassed.proxy is None
+        assert "proxy" not in fake_curl_cffi.instances[-1].kwargs
+
+
+def test_firefox_manual_proxy_in_prefs_js_is_used_as_fallback(
+    tmp_path, fake_curl_cffi
+) -> None:
+    profile = tmp_path / "ixikld92.default-release"
+    profile.mkdir()
+    (tmp_path / "profiles.ini").write_text(
+        "[Profile0]\nName=default-release\nIsRelative=1\n"
+        f"Path={profile.name}\nDefault=1\n",
+        encoding="utf-8",
+    )
+    import sqlite3
+
+    db = profile / "cookies.sqlite"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE moz_cookies ("
+            "host TEXT, name TEXT, value TEXT, path TEXT, "
+            "expiry INTEGER, isSecure INTEGER, isHttpOnly INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO moz_cookies VALUES ('.arena.ai', 'arena-auth-prod-v1.0', "
+            "'tok', '/', 4102444800, 1, 1)"
+        )
+
+    # SOCKS5 with remote DNS enabled -> socks5h://
+    (profile / "prefs.js").write_text(
+        'user_pref("network.proxy.type", 1);\n'
+        'user_pref("network.proxy.socks", "127.0.0.1");\n'
+        'user_pref("network.proxy.socks_port", 10808);\n'
+        'user_pref("network.proxy.socks_remote_dns", true);\n',
+        encoding="utf-8",
+    )
+    manager = FirefoxSessionManager(domains=("arena.ai",), profiles_root=tmp_path)
+    assert manager.proxy_url(scheme="https", host="arena.ai") == "socks5h://127.0.0.1:10808"
+
+    with ArenaClient(base_url="https://arena.ai", session_source=manager) as client:
+        assert client.transport.proxy == "socks5h://127.0.0.1:10808"
+        assert (
+            fake_curl_cffi.instances[-1].kwargs["proxy"]
+            == "socks5h://127.0.0.1:10808"
+        )
+
+    # Shared HTTP proxy for all protocols -> http://
+    (profile / "prefs.js").write_text(
+        'user_pref("network.proxy.type", 1);\n'
+        'user_pref("network.proxy.http", "127.0.0.1");\n'
+        'user_pref("network.proxy.http_port", 2080);\n'
+        'user_pref("network.proxy.share_proxy_settings", true);\n',
+        encoding="utf-8",
+    )
+    with DirectArenaClient(
+        base_url="https://arena.ai", session_source=manager
+    ) as direct:
+        assert direct.transport.proxy == "http://127.0.0.1:2080"
+
+    # System proxy mode (5) ignores leftover manual fields.
+    (profile / "prefs.js").write_text(
+        'user_pref("network.proxy.type", 5);\n'
+        'user_pref("network.proxy.http", "127.0.0.1");\n'
+        'user_pref("network.proxy.http_port", 2080);\n',
+        encoding="utf-8",
+    )
+    assert manager.proxy_url(scheme="https", host="arena.ai") is None
+
+
+def test_windows_non_ascii_ca_bundle_is_staged_to_ascii_path(
+    tmp_path, monkeypatch
+) -> None:
+    from arena_api import transport as transport_mod
+
+    # Cyrillic 'а' (U+0430) in username directory, e.g. C:\Users\zаl0r\...
+    non_ascii_dir = tmp_path / "z\u0430l0r" / "certifi"
+    non_ascii_dir.mkdir(parents=True)
+    ca_src = non_ascii_dir / "cacert.pem"
+    ca_src.write_bytes(b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+
+    ascii_stage_dir = tmp_path / "ascii-public"
+    ascii_stage_dir.mkdir()
+    assert str(ascii_stage_dir).isascii()
+
+    fake_certifi = types.ModuleType("certifi")
+    fake_certifi.where = lambda: str(ca_src)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "certifi", fake_certifi)
+    monkeypatch.setattr(transport_mod.sys, "platform", "win32")
+    monkeypatch.setattr(transport_mod, "_windows_short_ascii_path", lambda _p: None)
+    monkeypatch.setattr(transport_mod.tempfile, "gettempdir", lambda: str(non_ascii_dir))
+    monkeypatch.setenv("PUBLIC", str(ascii_stage_dir))
+
+    adapted = transport_mod._adapt_verify(True)
+    assert isinstance(adapted, str)
+    assert adapted.isascii()
+    assert adapted != str(ca_src)
+    with open(adapted, "rb") as handle:
+        assert b"BEGIN CERTIFICATE" in handle.read()
+
+
+def test_impersonated_request_routes_through_explicit_http_proxy(
+    wire, live_origin
+) -> None:
+    """Real curl_cffi wire test proving explicit proxy= routes traffic."""
+    import urllib.request
+
+    proxied_urls: list[str] = []
+
+    class _ProxyHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:  # noqa: N802
+            proxied_urls.append(self.path)
+            # Rewrite the synthetic host to the local origin server.
+            path_only = "/" + self.path.split("/", 3)[-1]
+            with urllib.request.urlopen(live_origin + path_only) as upstream:
+                payload = upstream.read()
+                self.send_response(upstream.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+    proxy_server = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
+    thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+    thread.start()
+    proxy_url = f"http://127.0.0.1:{proxy_server.server_address[1]}"
+    try:
+        with ArenaTransport(
+            "http://arena.proxy.invalid",
+            impersonate="firefox",
+            proxy=proxy_url,
+        ) as transport:
+            assert transport.get_json("/config") == {"ok": True}
+        assert proxied_urls == ["http://arena.proxy.invalid/config"]
+    finally:
+        proxy_server.shutdown()
+        proxy_server.server_close()
+        thread.join(timeout=5)
+
 

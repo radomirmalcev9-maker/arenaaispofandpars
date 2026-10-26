@@ -2458,3 +2458,132 @@ def test_probe_accepts_nextjs_404_with_passive_cloudflare_jsd_beacon() -> None:
     assert result.auth_problem is False
 
 
+def test_probe_reports_connect_error_as_not_ok_and_preserves_curl_detail() -> None:
+    """A TCP/TLS/proxy ``ConnectError`` must not be misreported as reachable."""
+
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            "Failed to perform, curl: (7) Could not connect to server. "
+            "See https://curl.se/libcurl/c/libcurl-errors.html first for more details.",
+            request=request,
+        )
+
+    transport = httpx.MockTransport(broken)
+    with ArenaClient(http_transport=transport) as client:
+        result = probe(client, "/config")
+    assert result.ok is False
+    assert result.auth_problem is False
+    assert result.reason == "network error (ConnectError)"
+    assert result.describe() == "not ok: network error (ConnectError)"
+    assert result.error is not None
+    assert "curl: (7) Could not connect to server." in str(result.error)
+    assert "libcurl-errors.html" not in str(result.error)
+
+
+def test_cli_status_reports_connect_error_with_exit_code_1_and_proxy_hint(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_COOKIE", "arena-auth-prod-v1.0=tok")
+    monkeypatch.delenv("ARENA_PROXY", raising=False)
+    monkeypatch.setattr("urllib.request.getproxies", dict)
+
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("curl: (7) Connection refused", request=request)
+
+    real_from_args = auto_module._options_from_args
+    monkeypatch.setattr(
+        auto_module,
+        "_options_from_args",
+        lambda args: replace(
+            real_from_args(args), http_transport=httpx.MockTransport(broken)
+        ),
+    )
+
+    assert main(["--status", "--no-browser-profiles"]) == 1
+    out = capsys.readouterr().out
+    assert "not ok: network error (ConnectError)" in out
+    assert "curl: (7) Connection refused" in out
+    assert "--proxy" in out
+
+
+def test_cli_models_stops_immediately_on_network_error_without_second_attempt(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_COOKIE", "arena-auth-prod-v1.0=tok")
+    attempts: list[str] = []
+
+    def broken(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.path)
+        raise httpx.ConnectError("curl: (7) Connection refused", request=request)
+
+    real_from_args = auto_module._options_from_args
+    monkeypatch.setattr(
+        auto_module,
+        "_options_from_args",
+        lambda args: replace(
+            real_from_args(args), http_transport=httpx.MockTransport(broken)
+        ),
+    )
+
+    assert main(["--models", "--no-verify", "--no-browser-profiles"]) == 1
+    captured = capsys.readouterr()
+    assert attempts == ["/config"]
+    assert captured.err.count("[arena-api] session:") == 1
+    assert "curl: (7) Connection refused" in captured.err
+
+
+def test_cli_models_direct_fallback_does_not_repeat_session_banner(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_COOKIE", "arena-auth-prod-v1.0=tok")
+    direct_markup = (
+        '<html><script>self.__next_f.push([1,"{\\"id\\":\\"'
+        "11111111-2222-3333-4444-555555555555"
+        '\\",\\"publicName\\":\\"gpt-test\\"}"])</script></html>'
+    ).encode("utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/config":
+            return httpx.Response(404, text="not found")
+        return httpx.Response(200, content=direct_markup, headers={"content-type": "text/html"})
+
+    real_from_args = auto_module._options_from_args
+    monkeypatch.setattr(
+        auto_module,
+        "_options_from_args",
+        lambda args: replace(
+            real_from_args(args), http_transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    assert main(["--models", "--no-browser-profiles"]) == 0
+    captured = capsys.readouterr()
+    assert "gpt-test" in captured.out
+    assert captured.err.count("[arena-api] session:") == 1
+
+
+def test_cli_explain_redacts_proxy_credentials(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert (
+        main(
+            [
+                "--explain",
+                "--no-browser-profiles",
+                "--proxy",
+                "http://alice:super-secret@127.0.0.1:2080",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "http://***@127.0.0.1:2080" in out
+    assert "super-secret" not in out
+    assert "alice" not in out
+
+
+
