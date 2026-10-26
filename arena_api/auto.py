@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import io
 import json
 import os
@@ -76,6 +75,43 @@ from typing import Any, Literal, TextIO
 from urllib.parse import urlparse
 
 import httpx
+
+from ._direct_page import (
+    _AUTH_REJECT_MARKERS,
+    _RetryInHeadedBrowser,
+    _arena_auth_jwt_expired,
+    _build_browser_fetch_stream_js,
+    _build_execute_recaptcha_v3_js,
+    _build_wait_supabase_refresh_js,
+    _click_challenge_checkbox,
+    _cookie_source_for_manager,
+    _default_recaptcha_site_key,
+    _detect_post_submit_challenge,
+    _direct_browser_profile_dir,
+    _gentle_page_warmup,
+    _is_eval_stream_url,
+    _reclick_send_button_if_unsent,
+    _reconstruct_supabase_cookie,
+    _replay_eval_with_v2_token,
+    _safe_bring_to_front,
+    _seed_direct_context_cookies,
+    _seedable_browser_cookies,
+    _submit_prompt_via_composer,
+    _token_solver,
+)
+from ._window_cloak import (
+    _OFFSCREEN_HEADFUL_SWITCHES,
+    _WindowsBrowserCloaker,
+    _hide_headed_page_window_cdp,
+    _is_missing_browser_error,
+    _is_missing_display_error,
+    _maybe_reset_headless_poisoned_cookies,
+    _prepare_profile_window_placement,
+    _recover_cdp_utf8_bytes,
+    _recover_cdp_utf8_text,
+    _sanitize_headless_page_cdp,
+    _windows_installed_channels,
+)
 
 from .auth.autosolve import auto_solve_challenge_on_page
 from .auth.browser import BrowserEnvironment, BrowserEnvironmentOptions, run_sync
@@ -1537,884 +1573,6 @@ def _merge_options(options: AutoOptions | None, overrides: Mapping[str, Any]) ->
     return replace(options, **dict(overrides))
 
 
-def _token_solver(solver: Any) -> Any:
-    """Unwrap the token-producing member of a composite solver.
-
-    ``resolve_solver`` returns a :class:`~arena_api.auth.captcha.CompositeSolver`
-    by default; the Direct Chat assertion can only come from the reCAPTCHA
-    bridge inside it, and unwrapping keeps the v3 pin below effective.
-    """
-    members = getattr(solver, "solvers", None)
-    if not members:
-        return solver
-    for member in members:
-        if isinstance(member, RecaptchaToolkitSolver):
-            return member
-    return solver
-
-
-ARENA_RECAPTCHA_SITE_KEY_ENV = "ARENA_RECAPTCHA_SITE_KEY"
-_DEFAULT_ARENA_RECAPTCHA_SITE_KEY = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0"
-
-
-def _default_recaptcha_site_key(page_url: str) -> str:
-    explicit = os.environ.get(ARENA_RECAPTCHA_SITE_KEY_ENV, "").strip()
-    if explicit:
-        return explicit
-    host = (urlparse(page_url).hostname or "").lower()
-    if host == "arena.ai" or host.endswith(".arena.ai"):
-        return _DEFAULT_ARENA_RECAPTCHA_SITE_KEY
-    return ""
-
-
-def _build_execute_recaptcha_v3_js(fallback_site_key: str) -> str:
-    encoded_fallback = json.dumps(fallback_site_key)
-    return f"""
-async () => {{
-    const fallbackKey = {encoded_fallback};
-    const findDomSiteKey = () => {{
-        for (const el of document.querySelectorAll("script[src*='recaptcha']")) {{
-            try {{
-                const u = new URL(el.src, location.href);
-                const k = u.searchParams.get("render");
-                if (k && k !== "explicit") return k;
-            }} catch (_) {{}}
-        }}
-        for (const el of document.querySelectorAll("iframe[src*='recaptcha']")) {{
-            try {{
-                const u = new URL(el.src, location.href);
-                const k = u.searchParams.get("k");
-                if (k) return k;
-            }} catch (_) {{}}
-        }}
-        const el = document.querySelector("[data-sitekey]");
-        if (el) {{
-            const k = el.getAttribute("data-sitekey");
-            if (k) return k;
-        }}
-        if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {{
-            const seen = new Set();
-            const stack = [window.___grecaptcha_cfg.clients];
-            while (stack.length) {{
-                const cur = stack.pop();
-                if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
-                seen.add(cur);
-                for (const v of Object.values(cur)) {{
-                    if (typeof v === "string" && /^6L[A-Za-z0-9_-]{{38}}$/.test(v)) {{
-                        return v;
-                    }}
-                    if (v && typeof v === "object") stack.push(v);
-                }}
-            }}
-        }}
-        return null;
-    }};
-
-    let siteKey = findDomSiteKey();
-    if (!siteKey) {{
-        const scripts = Array.from(
-            document.querySelectorAll("script[src*='/_next/static/chunks/']")
-        ).slice(0, 20);
-        for (const s of scripts) {{
-            try {{
-                const txt = await (await fetch(s.src, {{ cache: "force-cache" }})).text();
-                const m =
-                    txt.match(/(?:recaptcha|siteKey|SITE_KEY)[^"']{{0,80}}["'](6L[A-Za-z0-9_-]{{38}})["']/i) ||
-                    txt.match(/["'](6Le[A-Za-z0-9_-]{{37}})["']/);
-                if (m && m[1]) {{
-                    siteKey = m[1];
-                    break;
-                }}
-            }} catch (_) {{}}
-        }}
-    }}
-    if (!siteKey && fallbackKey) {{
-        siteKey = fallbackKey;
-    }}
-    if (!siteKey) return null;
-
-    const getExecutor = () => {{
-        if (window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === "function") {{
-            return window.grecaptcha.enterprise;
-        }}
-        if (window.grecaptcha && typeof window.grecaptcha.execute === "function") {{
-            return window.grecaptcha;
-        }}
-        return null;
-    }};
-
-    if (!getExecutor()) {{
-        const existing = document.querySelector("script[src*='recaptcha/enterprise.js'], script[src*='recaptcha/api.js']");
-        if (!existing && document.head) {{
-            const tag = document.createElement("script");
-            tag.src = "https://www.google.com/recaptcha/enterprise.js?render=" + encodeURIComponent(siteKey);
-            tag.async = true;
-            tag.defer = true;
-            document.head.appendChild(tag);
-        }}
-    }}
-
-    const deadline = Date.now() + 20000;
-    let g = getExecutor();
-    while (!g && Date.now() < deadline) {{
-        await new Promise((r) => setTimeout(r, 150));
-        g = getExecutor();
-    }}
-    if (!g) return null;
-
-    return await new Promise((resolve) => {{
-        const timer = setTimeout(() => resolve(null), 20000);
-        const run = () => {{
-            Promise.resolve(g.execute(siteKey, {{ action: "chat_submit" }}))
-                .then((tok) => {{ clearTimeout(timer); resolve(tok || null); }})
-                .catch(() => {{ clearTimeout(timer); resolve(null); }});
-        }};
-        if (typeof g.ready === "function") g.ready(run);
-        else run();
-    }});
-}}
-"""
-
-
-_BROWSER_BOUND_CF_COOKIES: frozenset[str] = frozenset(
-    {"cf_clearance", "__cf_bm", "_cfuvid"}
-)
-_AUTH_REJECT_MARKERS: tuple[str, ...] = (
-    "user not found",
-    "unauthorized",
-    "unauthenticated",
-    "not signed in",
-    "login required",
-    "invalid jwt",
-)
-
-
-def _cookie_source_for_manager(manager: Any) -> str | None:
-    if isinstance(manager, FirefoxSessionManager):
-        return "firefox"
-    if isinstance(getattr(manager, "fallback", None), FirefoxSessionManager):
-        return "firefox"
-    return None
-
-
-def _build_whatwg_win1252_inv() -> dict[int, int]:
-    inv: dict[int, int] = {}
-    for b in range(256):
-        if 0x80 <= b <= 0x9F:
-            try:
-                cp = ord(bytes((b,)).decode("cp1252"))
-            except UnicodeDecodeError:
-                cp = b
-        else:
-            cp = b
-        inv[cp] = b
-    return inv
-
-
-_WHATWG_WIN1252_INV: dict[int, int] = _build_whatwg_win1252_inv()
-
-
-def _recover_cdp_utf8_bytes(text: str, content_type: str = "") -> bytes:
-    """Recover raw UTF-8 wire bytes from Chromium CDP ``text/plain`` bodies.
-
-    When an HTTP response omits ``; charset=utf-8`` on ``text/plain`` (as
-    ``arena.ai``'s ``create-evaluation`` stream does), Blink's
-    ``TextResourceDecoder`` decodes the raw UTF-8 wire bytes via the WHATWG
-    ``windows-1252`` bijection before Playwright's driver re-encodes that
-    string as UTF-8. Inverting the 256-codepoint bijection restores the exact
-    original UTF-8 bytes whenever they form valid UTF-8.
-    """
-    if not text or text.isascii():
-        return text.encode("utf-8")
-    lowered_ct = content_type.lower()
-    if "utf-8" in lowered_ct or "utf8" in lowered_ct:
-        return text.encode("utf-8")
-    inv = _WHATWG_WIN1252_INV
-    try:
-        raw = bytes(inv[ord(ch)] for ch in text)
-    except KeyError:
-        return text.encode("utf-8")
-    try:
-        raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return text.encode("utf-8")
-    return raw
-
-
-def _recover_cdp_utf8_text(text: str, content_type: str = "") -> str:
-    if not text or text.isascii():
-        return text
-    return _recover_cdp_utf8_bytes(text, content_type).decode(
-        "utf-8", errors="replace"
-    )
-
-
-def _build_clean_ua_metadata(
-    clean_ua: str, product: str = "", channel: str | None = None
-) -> dict[str, Any] | None:
-    full_ver = ""
-    if "/" in product:
-        cand = product.split("/", 1)[1].strip()
-        if cand and cand[0].isdigit():
-            full_ver = cand
-    if not full_ver:
-        m = re.search(r"Chrome/([0-9]+(?:\.[0-9]+)*)", clean_ua)
-        if m:
-            full_ver = m.group(1)
-    if not full_ver:
-        return None
-    major = full_ver.split(".", 1)[0]
-    ch_lower = (channel or "").lower()
-    if "edg" in ch_lower or "Edg/" in clean_ua:
-        primary_brand = "Microsoft Edge"
-    elif ch_lower.startswith("chrome") and ch_lower != "chromium":
-        primary_brand = "Google Chrome"
-    else:
-        primary_brand = "Chromium"
-
-    brands = [
-        {"brand": "Not:A-Brand", "version": "99"},
-        {"brand": "Chromium", "version": major},
-    ]
-    full_list = [
-        {"brand": "Not:A-Brand", "version": "99.0.0.0"},
-        {"brand": "Chromium", "version": full_ver},
-    ]
-    if primary_brand != "Chromium":
-        brands.insert(1, {"brand": primary_brand, "version": major})
-        full_list.insert(1, {"brand": primary_brand, "version": full_ver})
-
-    if "Windows NT" in clean_ua:
-        plat, plat_ver = "Windows", "15.0.0"
-    elif "Macintosh" in clean_ua:
-        plat, plat_ver = "macOS", "14.5.0"
-    else:
-        plat, plat_ver = "Linux", "6.8.0"
-    arch = "arm" if ("aarch64" in clean_ua or "ARM64" in clean_ua) else "x86"
-
-    return {
-        "brands": brands,
-        "fullVersionList": full_list,
-        "platform": plat,
-        "platformVersion": plat_ver,
-        "architecture": arch,
-        "model": "",
-        "mobile": False,
-        "bitness": "64",
-        "wow64": False,
-    }
-
-
-async def _sanitize_headless_page_cdp(
-    context: Any, page: Any, *, channel: str | None = None
-) -> Any:
-    """Strip ``HeadlessChrome`` from UA and Client Hints via CDP on headless tabs."""
-    if context is None:
-        return None
-    new_cdp = getattr(context, "new_cdp_session", None)
-    if not callable(new_cdp):
-        return None
-    cdp: Any = None
-    try:
-        cdp = await new_cdp(page)
-        ver_info = await cdp.send("Browser.getVersion")
-        if not isinstance(ver_info, Mapping):
-            await cdp.detach()
-            return None
-        raw_ua = str(ver_info.get("userAgent") or "")
-        product = str(ver_info.get("product") or "")
-        if not raw_ua or "Headless" not in raw_ua:
-            await cdp.detach()
-            return None
-        clean_ua = (
-            raw_ua.replace("HeadlessChrome/", "Chrome/")
-            .replace("HeadlessEdg/", "Edg/")
-            .replace("Headless", "")
-        )
-        override_params: dict[str, Any] = {"userAgent": clean_ua}
-        ua_meta = _build_clean_ua_metadata(clean_ua, product, channel=channel)
-        if ua_meta is not None:
-            override_params["userAgentMetadata"] = ua_meta
-        await cdp.send("Emulation.setUserAgentOverride", override_params)
-        return cdp
-    except Exception:  # noqa: BLE001
-        if cdp is not None:
-            try:
-                await cdp.detach()
-            except Exception:  # noqa: BLE001
-                pass
-        return None
-
-
-_OFFSCREEN_HEADFUL_SWITCHES: tuple[str, ...] = (
-    "--window-position=-32000,-32000",
-    "--window-size=1480,960",
-    "--disable-features=CalculateNativeWinOcclusion",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-    "--disable-background-timer-throttling",
-)
-
-
-def _prepare_profile_window_placement(
-    profile_dir: str | Path | None, *, hidden: bool
-) -> None:
-    """Ensure saved Chromium ``window_placement`` matches ``hidden`` vs visible mode."""
-    if profile_dir is None:
-        return
-    try:
-        default_dir = Path(profile_dir).expanduser() / "Default"
-        default_dir.mkdir(parents=True, exist_ok=True)
-        prefs_file = default_dir / "Preferences"
-        prefs: dict[str, Any] = {}
-        if prefs_file.is_file():
-            try:
-                loaded = json.loads(prefs_file.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    prefs = loaded
-            except Exception:  # noqa: BLE001
-                return
-        browser_cfg = prefs.get("browser")
-        if not isinstance(browser_cfg, dict):
-            browser_cfg = {}
-            prefs["browser"] = browser_cfg
-        placement = browser_cfg.get("window_placement")
-        if not isinstance(placement, dict):
-            placement = {}
-        changed = False
-        if hidden:
-            target = {
-                "bottom": -31040,
-                "left": -32000,
-                "maximized": False,
-                "right": -30520,
-                "top": -32000,
-                "work_area_bottom": 1040,
-                "work_area_left": 0,
-                "work_area_right": 1920,
-                "work_area_top": 0,
-            }
-            if any(placement.get(k) != v for k, v in target.items()):
-                placement.update(target)
-                browser_cfg["window_placement"] = placement
-                changed = True
-        else:
-            left_val = placement.get("left")
-            if isinstance(left_val, (int, float)) and left_val <= -10000:
-                placement.update(
-                    {
-                        "bottom": 980,
-                        "left": 80,
-                        "maximized": False,
-                        "right": 1520,
-                        "top": 80,
-                    }
-                )
-                browser_cfg["window_placement"] = placement
-                changed = True
-        if changed:
-            prefs_file.write_text(
-                json.dumps(prefs, separators=(",", ":")), encoding="utf-8"
-            )
-    except Exception:  # noqa: BLE001
-        return
-
-
-async def _maybe_reset_headless_poisoned_cookies(
-    context: Any, profile_dir: str | Path | None
-) -> None:
-    """Clear stale headless-flagged ``_GRECAPTCHA`` once when migrating to cloaked headful."""
-    if context is None or profile_dir is None:
-        return
-    try:
-        marker = Path(profile_dir).expanduser() / ".headful_cloaked_v1"
-        if marker.exists():
-            return
-        clear_fn = getattr(context, "clear_cookies", None)
-        if callable(clear_fn):
-            await clear_fn(name=re.compile(r"^_GRECAPTCHA"))
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("1\n", encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        return
-
-
-async def _hide_headed_page_window_cdp(context: Any, page: Any) -> None:
-    """Move a headful browser window off-screen via CDP without minimizing or occluding."""
-    if context is None:
-        return
-    new_cdp = getattr(context, "new_cdp_session", None)
-    if not callable(new_cdp):
-        return
-    cdp: Any = None
-    try:
-        cdp = await new_cdp(page)
-        win_info = await cdp.send("Browser.getWindowForTarget")
-        if isinstance(win_info, Mapping) and win_info.get("windowId") is not None:
-            win_id = win_info["windowId"]
-            try:
-                await cdp.send(
-                    "Browser.setWindowBounds",
-                    {"windowId": win_id, "bounds": {"windowState": "normal"}},
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            await cdp.send(
-                "Browser.setWindowBounds",
-                {
-                    "windowId": win_id,
-                    "bounds": {
-                        "left": -32000,
-                        "top": -32000,
-                        "width": 1480,
-                        "height": 960,
-                    },
-                },
-            )
-    except Exception:  # noqa: BLE001
-        pass
-    finally:
-        if cdp is not None:
-            try:
-                await cdp.detach()
-            except Exception:  # noqa: BLE001
-                pass
-
-
-def _windows_descendant_pids(root_pid: int) -> set[int]:
-    """Return ``root_pid`` and all transitive child PIDs on Windows via Toolhelp32."""
-    if sys.platform != "win32":
-        return set()
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-        class PROCESSENTRY32W(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", wintypes.LONG),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260),
-            ]
-
-        CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
-        CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-        CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-
-        Process32FirstW = kernel32.Process32FirstW
-        Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-        Process32FirstW.restype = wintypes.BOOL
-
-        Process32NextW = kernel32.Process32NextW
-        Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-        Process32NextW.restype = wintypes.BOOL
-
-        CloseHandle = kernel32.CloseHandle
-        CloseHandle.argtypes = [wintypes.HANDLE]
-        CloseHandle.restype = wintypes.BOOL
-
-        snap = CreateToolhelp32Snapshot(0x00000002, 0)
-        invalid_handle = ctypes.c_void_p(-1).value
-        if not snap or snap == invalid_handle:
-            return {root_pid}
-        children_by_parent: dict[int, list[int]] = {}
-        try:
-            entry = PROCESSENTRY32W()
-            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-            ok = Process32FirstW(snap, ctypes.byref(entry))
-            while ok:
-                pid = int(entry.th32ProcessID)
-                ppid = int(entry.th32ParentProcessID)
-                children_by_parent.setdefault(ppid, []).append(pid)
-                ok = Process32NextW(snap, ctypes.byref(entry))
-        finally:
-            CloseHandle(snap)
-
-        descendants: set[int] = {root_pid}
-        stack = [root_pid]
-        while stack:
-            cur = stack.pop()
-            for child in children_by_parent.get(cur, ()):
-                if child not in descendants:
-                    descendants.add(child)
-                    stack.append(child)
-        return descendants
-    except Exception:  # noqa: BLE001
-        return {root_pid}
-
-
-class _WindowsBrowserCloaker:
-    """Cloak newly spawned Chromium windows on Windows (no taskbar/Alt-Tab/focus)."""
-
-    def __init__(self, *, enabled: bool = True) -> None:
-        self._enabled = bool(enabled) and sys.platform == "win32"
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._root_pid = os.getpid()
-        self._preexisting_hwnds: set[int] = set()
-        self._prior_fg_hwnd: int = 0
-
-    def start(self) -> None:
-        if not self._enabled:
-            return
-        self._preexisting_hwnds = self._enum_all_hwnds()
-        self._prior_fg_hwnd = self._get_foreground_hwnd()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="arena-win32-window-cloaker",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
-
-    @staticmethod
-    def _get_foreground_hwnd() -> int:
-        if sys.platform != "win32":
-            return 0
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            GetForegroundWindow = user32.GetForegroundWindow
-            GetForegroundWindow.argtypes = []
-            GetForegroundWindow.restype = wintypes.HWND
-            return int(GetForegroundWindow() or 0)
-        except Exception:  # noqa: BLE001
-            return 0
-
-    @staticmethod
-    def _enum_all_hwnds() -> set[int]:
-        if sys.platform != "win32":
-            return set()
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            WNDENUMPROC = ctypes.WINFUNCTYPE(
-                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
-            )
-            EnumWindows = user32.EnumWindows
-            EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
-            EnumWindows.restype = wintypes.BOOL
-
-            found: set[int] = set()
-
-            @WNDENUMPROC
-            def _cb(hwnd: Any, lparam: Any) -> bool:
-                if hwnd:
-                    found.add(int(hwnd))
-                return True
-
-            EnumWindows(_cb, 0)
-            return found
-        except Exception:  # noqa: BLE001
-            return set()
-
-    def _cloak_once(self) -> None:
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            WNDENUMPROC = ctypes.WINFUNCTYPE(
-                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
-            )
-            EnumWindows = user32.EnumWindows
-            EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
-            EnumWindows.restype = wintypes.BOOL
-
-            IsWindow = user32.IsWindow
-            IsWindow.argtypes = [wintypes.HWND]
-            IsWindow.restype = wintypes.BOOL
-
-            IsWindowVisible = user32.IsWindowVisible
-            IsWindowVisible.argtypes = [wintypes.HWND]
-            IsWindowVisible.restype = wintypes.BOOL
-
-            IsIconic = user32.IsIconic
-            IsIconic.argtypes = [wintypes.HWND]
-            IsIconic.restype = wintypes.BOOL
-
-            IsZoomed = user32.IsZoomed
-            IsZoomed.argtypes = [wintypes.HWND]
-            IsZoomed.restype = wintypes.BOOL
-
-            ShowWindow = user32.ShowWindow
-            ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-            ShowWindow.restype = wintypes.BOOL
-
-            GetClassNameW = user32.GetClassNameW
-            GetClassNameW.argtypes = [
-                wintypes.HWND,
-                wintypes.LPWSTR,
-                ctypes.c_int,
-            ]
-            GetClassNameW.restype = ctypes.c_int
-
-            GetWindowThreadProcessId = user32.GetWindowThreadProcessId
-            GetWindowThreadProcessId.argtypes = [
-                wintypes.HWND,
-                ctypes.POINTER(wintypes.DWORD),
-            ]
-            GetWindowThreadProcessId.restype = wintypes.DWORD
-
-            GetWindowRect = user32.GetWindowRect
-            GetWindowRect.argtypes = [
-                wintypes.HWND,
-                ctypes.POINTER(wintypes.RECT),
-            ]
-            GetWindowRect.restype = wintypes.BOOL
-
-            GetForegroundWindow = user32.GetForegroundWindow
-            GetForegroundWindow.argtypes = []
-            GetForegroundWindow.restype = wintypes.HWND
-
-            SetForegroundWindow = user32.SetForegroundWindow
-            SetForegroundWindow.argtypes = [wintypes.HWND]
-            SetForegroundWindow.restype = wintypes.BOOL
-
-            long_ptr_t: Any = ctypes.c_ssize_t
-            if hasattr(user32, "GetWindowLongPtrW") and hasattr(
-                user32, "SetWindowLongPtrW"
-            ):
-                GetWindowLongPtr = user32.GetWindowLongPtrW
-                SetWindowLongPtr = user32.SetWindowLongPtrW
-            else:
-                GetWindowLongPtr = user32.GetWindowLongW
-                SetWindowLongPtr = user32.SetWindowLongW
-                long_ptr_t = ctypes.c_long
-
-            GetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int]
-            GetWindowLongPtr.restype = long_ptr_t
-            SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr_t]
-            SetWindowLongPtr.restype = long_ptr_t
-
-            SetWindowPos = user32.SetWindowPos
-            SetWindowPos.argtypes = [
-                wintypes.HWND,
-                wintypes.HWND,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                wintypes.UINT,
-            ]
-            SetWindowPos.restype = wintypes.BOOL
-
-            GWL_EXSTYLE = -20
-            WS_EX_TOOLWINDOW = 0x00000080
-            WS_EX_APPWINDOW = 0x00040000
-            WS_EX_NOACTIVATE = 0x08000000
-            SW_SHOWNOACTIVATE = 4
-            SWP_NOSIZE = 0x0001
-            SWP_NOACTIVATE = 0x0010
-            SWP_FRAMECHANGED = 0x0020
-            SWP_NOOWNERZORDER = 0x0200
-            HWND_BOTTOM = wintypes.HWND(1)
-
-            descendants = _windows_descendant_pids(self._root_pid)
-            preexisting = self._preexisting_hwnds
-            prior_fg = self._prior_fg_hwnd
-
-            @WNDENUMPROC
-            def _cb(hwnd: Any, lparam: Any) -> bool:
-                try:
-                    hwnd_int = int(hwnd or 0)
-                    if not hwnd_int or hwnd_int in preexisting:
-                        return True
-                    if not IsWindowVisible(hwnd):
-                        return True
-                    cls_buf = ctypes.create_unicode_buffer(64)
-                    if GetClassNameW(hwnd, cls_buf, 64) <= 0:
-                        return True
-                    if not cls_buf.value.startswith("Chrome_WidgetWin_"):
-                        return True
-
-                    pid_val = wintypes.DWORD(0)
-                    GetWindowThreadProcessId(hwnd, ctypes.byref(pid_val))
-                    rect = wintypes.RECT()
-                    has_rect = bool(GetWindowRect(hwnd, ctypes.byref(rect)))
-                    born_offscreen = (
-                        has_rect
-                        and not IsIconic(hwnd)
-                        and rect.left <= -25000
-                        and rect.top <= -25000
-                    )
-                    if int(pid_val.value) not in descendants and not born_offscreen:
-                        return True
-
-                    cur_ex = int(GetWindowLongPtr(hwnd, GWL_EXSTYLE) or 0)
-                    desired_ex = (
-                        cur_ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-                    ) & ~WS_EX_APPWINDOW
-                    style_changed = desired_ex != cur_ex
-                    if style_changed:
-                        SetWindowLongPtr(hwnd, GWL_EXSTYLE, long_ptr_t(desired_ex))
-
-                    if IsZoomed(hwnd):
-                        ShowWindow(hwnd, SW_SHOWNOACTIVATE)
-                        style_changed = True
-
-                    if (
-                        style_changed
-                        or not has_rect
-                        or rect.left > -25000
-                        or rect.top > -25000
-                    ):
-                        SetWindowPos(
-                            hwnd,
-                            HWND_BOTTOM,
-                            -32000,
-                            -32000,
-                            0,
-                            0,
-                            SWP_NOSIZE
-                            | SWP_NOACTIVATE
-                            | SWP_NOOWNERZORDER
-                            | SWP_FRAMECHANGED,
-                        )
-
-                    if (
-                        prior_fg
-                        and prior_fg != hwnd_int
-                        and int(GetForegroundWindow() or 0) == hwnd_int
-                        and IsWindow(wintypes.HWND(prior_fg))
-                    ):
-                        SetForegroundWindow(wintypes.HWND(prior_fg))
-                except Exception:  # noqa: BLE001
-                    return True
-                return True
-
-            EnumWindows(_cb, 0)
-        except Exception:  # noqa: BLE001
-            return
-
-    def _run(self) -> None:
-        started = time.monotonic()
-        while not self._stop.is_set():
-            self._cloak_once()
-            interval = 0.008 if (time.monotonic() - started) < 3.0 else 0.08
-            self._stop.wait(interval)
-
-
-def _seedable_browser_cookies(
-    cookies: Mapping[str, str], *, cookie_source: str | None
-) -> dict[str, str]:
-    if cookie_source == "firefox":
-        return {
-            str(k): str(v)
-            for k, v in cookies.items()
-            if str(k) not in _BROWSER_BOUND_CF_COOKIES
-        }
-    return {str(k): str(v) for k, v in cookies.items()}
-
-
-def _reconstruct_supabase_cookie(cookies: Mapping[str, str]) -> str:
-    whole = cookies.get("arena-auth-prod-v1")
-    if isinstance(whole, str) and whole.strip():
-        return whole.strip()
-    parts: list[str] = []
-    index = 0
-    while True:
-        piece = cookies.get(f"arena-auth-prod-v1.{index}")
-        if not isinstance(piece, str) or not piece:
-            break
-        parts.append(piece)
-        index += 1
-    return "".join(parts)
-
-
-def _arena_auth_jwt_expired(
-    cookies: Mapping[str, str], *, leeway: float = 60.0
-) -> bool:
-    raw = _reconstruct_supabase_cookie(cookies)
-    if not raw.startswith("base64-"):
-        return False
-    encoded = raw[len("base64-") :]
-    if not encoded:
-        return False
-    padded = encoded + "=" * ((4 - (len(encoded) % 4)) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
-        payload = json.loads(decoded.decode("utf-8"))
-    except Exception:  # noqa: BLE001
-        return False
-    if not isinstance(payload, Mapping):
-        return False
-    expires_at = payload.get("expires_at")
-    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
-        return False
-    return float(expires_at) <= (time.time() + leeway)
-
-
-def _build_wait_supabase_refresh_js(stale_raw: str) -> str:
-    stale_literal = json.dumps(stale_raw)
-    return f"""
-async () => {{
-    const stale = {stale_literal};
-    const readJoined = () => {{
-        const map = new Map();
-        for (const entry of (document.cookie || "").split(";")) {{
-            const eq = entry.indexOf("=");
-            if (eq < 0) continue;
-            map.set(entry.slice(0, eq).trim(), entry.slice(eq + 1).trim());
-        }}
-        const whole = map.get("arena-auth-prod-v1");
-        if (whole) return whole;
-        let out = "";
-        for (let i = 0; map.has("arena-auth-prod-v1." + i); i += 1) {{
-            out += map.get("arena-auth-prod-v1." + i) || "";
-        }}
-        return out;
-    }};
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {{
-        const current = readJoined();
-        if (current && current !== stale) return true;
-        await new Promise((r) => setTimeout(r, 200));
-    }}
-    return false;
-}}
-"""
-
-
-def _windows_installed_channels() -> list[str]:
-    if sys.platform != "win32":
-        return []
-    roots = [
-        os.environ.get("ProgramFiles"),
-        os.environ.get("ProgramFiles(x86)"),
-        os.environ.get("LOCALAPPDATA"),
-    ]
-    probes = (
-        ("chrome", Path("Google") / "Chrome" / "Application" / "chrome.exe"),
-        ("msedge", Path("Microsoft") / "Edge" / "Application" / "msedge.exe"),
-    )
-    found: list[str] = []
-    for channel, rel in probes:
-        for root in roots:
-            if root and (Path(root) / rel).is_file():
-                found.append(channel)
-                break
-    return found
-
 
 def _candidate_browser_channels(explicit_channel: str | None) -> list[str | None]:
     if explicit_channel:
@@ -2428,407 +1586,6 @@ def _candidate_browser_channels(explicit_channel: str | None) -> list[str | None
     return candidates
 
 
-def _is_missing_browser_error(exc: BaseException) -> bool:
-    msg = str(exc)
-    return (
-        "Executable doesn't exist" in msg
-        or "is not found at" in msg
-        or "Chromium distribution" in msg
-    )
-
-
-def _build_browser_fetch_stream_js(
-    endpoint_path: str, serialized_body: str
-) -> str:
-    url_literal = json.dumps(endpoint_path)
-    body_literal = json.dumps(serialized_body)
-    return f"""
-async () => {{
-    const resp = await window.fetch({url_literal}, {{
-        method: "POST",
-        credentials: "include",
-        headers: {{
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream, text/plain, */*"
-        }},
-        body: {body_literal}
-    }});
-    const contentType = (resp.headers && resp.headers.get("content-type")) || "";
-    const cfMitigated = (resp.headers && resp.headers.get("cf-mitigated")) || "";
-    if (!resp.ok) {{
-        let errBody = "";
-        try {{ errBody = await resp.text(); }} catch (_) {{}}
-        return {{
-            ok: false,
-            status: resp.status,
-            body: errBody,
-            contentType: contentType,
-            cfMitigated: cfMitigated
-        }};
-    }}
-    if (typeof window.__arenaDirectMeta === "function") {{
-        await window.__arenaDirectMeta(contentType);
-    }}
-    if (!resp.body || typeof resp.body.getReader !== "function") {{
-        const full = await resp.text();
-        if (full && typeof window.__arenaDirectChunk === "function") {{
-            await window.__arenaDirectChunk(full);
-        }}
-        return {{ ok: true, status: resp.status, contentType: contentType }};
-    }}
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    while (true) {{
-        const {{ value, done }} = await reader.read();
-        if (done) break;
-        if (value && value.length) {{
-            const piece = decoder.decode(value, {{ stream: true }});
-            if (piece && typeof window.__arenaDirectChunk === "function") {{
-                await window.__arenaDirectChunk(piece);
-            }}
-        }}
-    }}
-    const tail = decoder.decode();
-    if (tail && typeof window.__arenaDirectChunk === "function") {{
-        await window.__arenaDirectChunk(tail);
-    }}
-    return {{ ok: true, status: resp.status, contentType: contentType }};
-}}
-"""
-
-
-_EVAL_STREAM_URL_MARKERS = (
-    "/nextjs-api/stream/create-evaluation",
-    "/nextjs-api/stream/post-to-evaluation/",
-    "/nextjs-api/stream/create-chat",
-)
-
-_PRESERVED_TRUST_COOKIE_PREFIXES = (
-    "_GRECAPTCHA",
-    "cf_clearance",
-    "__cf_bm",
-    "_cfuvid",
-    "NID",
-    "AEC",
-)
-
-
-def _is_eval_stream_url(raw_url: str) -> bool:
-    return any(marker in raw_url for marker in _EVAL_STREAM_URL_MARKERS)
-
-
-def _is_missing_display_error(exc: BaseException) -> bool:
-    lowered = str(exc).lower()
-    return any(
-        marker in lowered
-        for marker in (
-            "missing x server",
-            "cannot open display",
-            "$display",
-            "ozone_platform",
-            "headed browser without having a xserver",
-        )
-    )
-
-
-def _direct_browser_profile_dir(options: AutoOptions) -> Path:
-    base_state = (
-        Path(options.storage_path).expanduser()
-        if options.storage_path is not None
-        else Path(DEFAULT_STATE_PATH)
-    )
-    return base_state.parent / "direct_browser_profile"
-
-
-async def _seed_direct_context_cookies(
-    context: Any,
-    seed_cookies: Mapping[str, str],
-    base_url: str,
-) -> None:
-    if not seed_cookies or context is None:
-        return
-    add_cookies_fn = getattr(context, "add_cookies", None)
-    if not callable(add_cookies_fn):
-        return
-    preserved_existing: set[str] = set()
-    cookies_fn = getattr(context, "cookies", None)
-    if callable(cookies_fn):
-        try:
-            existing = await cookies_fn()
-        except Exception:  # noqa: BLE001
-            existing = None
-        if isinstance(existing, Sequence):
-            for item in existing:
-                if not isinstance(item, Mapping):
-                    continue
-                name = str(item.get("name") or "")
-                value = str(item.get("value") or "")
-                if value and name.startswith(_PRESERVED_TRUST_COOKIE_PREFIXES):
-                    preserved_existing.add(name)
-    payload = [
-        {
-            "name": str(name),
-            "value": str(value),
-            "url": base_url,
-        }
-        for name, value in seed_cookies.items()
-        if name not in preserved_existing
-    ]
-    if payload:
-        await add_cookies_fn(payload)
-
-
-def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
-    patch_literal = json.dumps(dict(patch_obj), separators=(",", ":"))
-    return f"""
-() => {{
-  const patch = {patch_literal};
-  const origFetch = window.fetch;
-  if (typeof origFetch !== "function" || window.__arenaPatchInstalled) return;
-  window.__arenaPatchInstalled = true;
-  window.fetch = function (input, init) {{
-    let urlStr = "";
-    try {{
-      urlStr = typeof input === "string" ? input : (input && input.url) || "";
-    }} catch (_) {{}}
-    if (
-      init &&
-      typeof init.body === "string" &&
-      (urlStr.indexOf("/nextjs-api/stream/create-evaluation") !== -1 ||
-        urlStr.indexOf("/nextjs-api/stream/post-to-evaluation/") !== -1 ||
-        urlStr.indexOf("/nextjs-api/stream/create-chat") !== -1)
-    ) {{
-      try {{
-        const parsed = JSON.parse(init.body);
-        if (parsed && typeof parsed === "object") {{
-          if (patch.modelAId) parsed.modelAId = patch.modelAId;
-          if (patch.generationConfig) parsed.generationConfig = patch.generationConfig;
-          const nextInit = Object.assign({{}}, init, {{ body: JSON.stringify(parsed) }});
-          return origFetch.call(this, input, nextInit);
-        }}
-      }} catch (_) {{}}
-    }}
-    return origFetch.apply(this, arguments);
-  }};
-}}
-""".strip()
-
-
-_FIND_COMPOSER_JS = """
-async () => {
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    for (const btn of document.querySelectorAll("button")) {
-      const label = ((btn.textContent || "") + " " + (btn.getAttribute("aria-label") || "")).trim().toLowerCase();
-      if (label === "accept cookies" || label === "accept all") {
-        try { btn.click(); } catch (_) {}
-      }
-    }
-    for (const old of document.querySelectorAll("[data-arena-composer]")) {
-      old.removeAttribute("data-arena-composer");
-    }
-    const candidates = Array.from(
-      document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"][contenteditable="true"]')
-    );
-    let best = null;
-    let bestScore = -1;
-    for (const el of candidates) {
-      const id = (el.id || "").toLowerCase();
-      const name = (el.getAttribute("name") || "").toLowerCase();
-      if (id.includes("recaptcha") || name.includes("recaptcha") || id.includes("turnstile")) {
-        continue;
-      }
-      if (el.disabled || el.readOnly || el.getAttribute("aria-hidden") === "true") {
-        continue;
-      }
-      const style = window.getComputedStyle(el);
-      if (!style || style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity || "1") === 0) {
-        continue;
-      }
-      const rect = el.getBoundingClientRect();
-      if (!rect || rect.width < 100 || rect.height < 18) {
-        continue;
-      }
-      const score = rect.width + (el.closest("form") ? 500 : 0) + (el.tagName === "TEXTAREA" ? 200 : 0);
-      if (score > bestScore) {
-        best = { el, rect };
-        bestScore = score;
-      }
-    }
-    if (best) {
-      best.el.setAttribute("data-arena-composer", "1");
-      return {
-        found: true,
-        tag: best.el.tagName.toLowerCase(),
-        x: Math.round(best.rect.left + best.rect.width / 2),
-        y: Math.round(best.rect.top + best.rect.height / 2)
-      };
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  return { found: false };
-}
-""".strip()
-
-_MARK_SEND_BUTTON_JS = """
-() => {
-  for (const old of document.querySelectorAll("[data-arena-send]")) {
-    old.removeAttribute("data-arena-send");
-  }
-  const composer = document.querySelector('[data-arena-composer="1"]') ||
-    document.querySelector('textarea:not([id*="recaptcha"]):not([name*="recaptcha"]), [contenteditable="true"]');
-  if (!composer) return { found: false };
-  const skipRe = /attach|upload|file|image|photo|plus|add|model|mode|search|web|globe|mic|voice|audio|new|clear|copy|history|menu|sidebar|close|cancel|stop/i;
-  const sendRe = /send|submit|ask|отправ/i;
-
-  let scope = composer.closest("form");
-  if (!scope) {
-    let cur = composer.parentElement;
-    for (let depth = 0; cur && depth < 5; depth += 1) {
-      if (cur.querySelectorAll("button").length > 0) {
-        scope = cur;
-      }
-      cur = cur.parentElement;
-    }
-  }
-  if (!scope) scope = document;
-
-  const buttons = Array.from(scope.querySelectorAll("button")).filter((btn) => {
-    if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return false;
-    const style = window.getComputedStyle(btn);
-    if (!style || style.display === "none" || style.visibility === "hidden") return false;
-    const rect = btn.getBoundingClientRect();
-    return rect && rect.width >= 16 && rect.height >= 16;
-  });
-
-  let confidence = "explicit";
-  let chosen = buttons.find((btn) => (btn.getAttribute("type") || "").toLowerCase() === "submit");
-  if (!chosen) {
-    chosen = buttons.find((btn) => {
-      const meta = [btn.getAttribute("aria-label"), btn.getAttribute("title"), btn.getAttribute("data-testid"), btn.textContent].filter(Boolean).join(" ");
-      return sendRe.test(meta);
-    });
-  }
-  if (!chosen && composer.closest("form")) {
-    const filtered = buttons.filter((btn) => {
-      const meta = [btn.getAttribute("aria-label"), btn.getAttribute("title"), btn.getAttribute("data-testid"), btn.textContent].filter(Boolean).join(" ");
-      return !skipRe.test(meta);
-    });
-    if (filtered.length > 0) {
-      chosen = filtered[filtered.length - 1];
-      confidence = "fallback";
-    }
-  }
-  if (!chosen) return { found: false };
-  chosen.setAttribute("data-arena-send", "1");
-  const rect = chosen.getBoundingClientRect();
-  return {
-    found: true,
-    confidence: confidence,
-    x: Math.round(rect.left + rect.width / 2),
-    y: Math.round(rect.top + rect.height / 2)
-  };
-}
-""".strip()
-
-_DETECT_POST_SUBMIT_CHALLENGE_JS = """
-() => {
-  const vw = Math.max(window.innerWidth || 0, 320);
-  const vh = Math.max(window.innerHeight || 0, 240);
-  function isFrameVisible(frame, minW, minH) {
-    const style = window.getComputedStyle(frame);
-    if (
-      !style ||
-      style.display === "none" ||
-      style.visibility === "hidden" ||
-      parseFloat(style.opacity || "1") <= 0.1
-    ) {
-      return null;
-    }
-    const rect = frame.getBoundingClientRect();
-    if (!rect || rect.width < minW || rect.height < minH) {
-      return null;
-    }
-    if (rect.bottom <= 16 || rect.right <= 16 || rect.top >= vh - 16 || rect.left >= vw - 16) {
-      return null;
-    }
-    return rect;
-  }
-
-  for (const frame of document.querySelectorAll('iframe[src*="recaptcha"][src*="bframe"]')) {
-    const rect = isFrameVisible(frame, 180, 180);
-    if (rect) {
-      return {
-        kind: "recaptcha_bframe",
-        x: Math.round(rect.left + rect.width / 2),
-        y: Math.round(rect.top + rect.height / 2),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height)
-      };
-    }
-  }
-
-  for (const frame of document.querySelectorAll('iframe[src*="recaptcha"][src*="anchor"]')) {
-    const src = String(frame.getAttribute("src") || "");
-    if (frame.closest(".grecaptcha-badge") || src.indexOf("size=invisible") !== -1) {
-      continue;
-    }
-    const rect = isFrameVisible(frame, 140, 45);
-    if (rect && rect.left >= -10 && rect.right <= vw + 24) {
-      return {
-        kind: "recaptcha_anchor",
-        x: Math.round(rect.left + 28),
-        y: Math.round(rect.top + Math.min(38, rect.height / 2)),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height)
-      };
-    }
-  }
-
-  for (const frame of document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]')) {
-    const rect = isFrameVisible(frame, 140, 40);
-    if (rect && rect.left >= -10) {
-      return {
-        kind: "turnstile",
-        x: Math.round(rect.left + 32),
-        y: Math.round(rect.top + rect.height / 2),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height)
-      };
-    }
-  }
-
-  for (const frame of document.querySelectorAll('iframe[src*="hcaptcha"]')) {
-    const rect = isFrameVisible(frame, 140, 45);
-    if (rect && rect.left >= -10) {
-      return {
-        kind: "hcaptcha",
-        x: Math.round(rect.left + 30),
-        y: Math.round(rect.top + rect.height / 2),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height)
-      };
-    }
-  }
-
-  return { kind: null };
-}
-""".strip()
-
-_COMPOSER_NONEMPTY_JS = (
-    "/* composer_nonempty */ () => { "
-    "const el = document.querySelector('[data-arena-composer=\"1\"]') || "
-    "document.querySelector('textarea:not([id*=\"recaptcha\"]):not([name*=\"recaptcha\"]), [contenteditable=\"true\"]'); "
-    "return !!(el && ((el.value || el.textContent || '').trim().length > 0)); }"
-)
-
-_CLEANUP_ARENA_DOM_MARKS_JS = (
-    "/* arena_cleanup_marks */ () => { "
-    "for (const el of document.querySelectorAll('[data-arena-composer],[data-arena-send]')) { "
-    "el.removeAttribute('data-arena-composer'); el.removeAttribute('data-arena-send'); } }"
-)
-
-
 def _can_auto_solve_bframe(solver: Any) -> bool:
     if not isinstance(solver, RecaptchaToolkitSolver):
         return False
@@ -2839,325 +1596,6 @@ def _can_auto_solve_bframe(solver: Any) -> bool:
     if solver.backend == "image":
         return False
     return True
-
-
-async def _detect_post_submit_challenge(page: Any) -> dict[str, Any]:
-    eval_fn = getattr(page, "evaluate", None)
-    if not callable(eval_fn):
-        return {"kind": None}
-    try:
-        raw = await eval_fn(_DETECT_POST_SUBMIT_CHALLENGE_JS)
-    except Exception:  # noqa: BLE001
-        return {"kind": None}
-    if isinstance(raw, bool):
-        return {"kind": "recaptcha_bframe" if raw else None}
-    if isinstance(raw, Mapping):
-        kind = raw.get("kind")
-        if kind == "recaptcha_anchor":
-            for frame in getattr(page, "frames", ()) or ():
-                f_url = str(getattr(frame, "url", "") or "")
-                if (
-                    "recaptcha" in f_url
-                    and "anchor" in f_url
-                    and "size=invisible" not in f_url
-                ):
-                    loc_fn = getattr(frame, "locator", None)
-                    if callable(loc_fn):
-                        try:
-                            if (
-                                await loc_fn(
-                                    '#recaptcha-anchor[aria-checked="true"]'
-                                ).count()
-                                > 0
-                            ):
-                                return {"kind": None}
-                        except Exception:  # noqa: BLE001
-                            pass
-        return dict(raw) if isinstance(kind, str) and kind else {"kind": None}
-    return {"kind": None}
-
-
-async def _safe_bring_to_front(page: Any) -> None:
-    bring_fn = getattr(page, "bring_to_front", None)
-    if callable(bring_fn):
-        try:
-            await bring_fn()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-async def _click_challenge_checkbox(page: Any, obs: Mapping[str, Any]) -> bool:
-    kind = str(obs.get("kind") or "")
-    if kind == "recaptcha_anchor":
-        for frame in getattr(page, "frames", ()) or ():
-            f_url = str(getattr(frame, "url", "") or "")
-            if (
-                "recaptcha" in f_url
-                and "anchor" in f_url
-                and "size=invisible" not in f_url
-            ):
-                loc_fn = getattr(frame, "locator", None)
-                if callable(loc_fn):
-                    try:
-                        checked = await loc_fn(
-                            '#recaptcha-anchor[aria-checked="true"]'
-                        ).count()
-                        if checked > 0:
-                            return False
-                    except Exception:  # noqa: BLE001
-                        pass
-
-    await _safe_bring_to_front(page)
-    wait_fn = getattr(page, "wait_for_timeout", None)
-    if callable(wait_fn):
-        await wait_fn(350)
-
-    x = float(obs.get("x") or 0)
-    y = float(obs.get("y") or 0)
-    mouse = getattr(page, "mouse", None)
-    if x > 0 and y > 0 and mouse is not None:
-        move_fn = getattr(mouse, "move", None)
-        click_fn = getattr(mouse, "click", None)
-        if callable(move_fn):
-            try:
-                await move_fn(max(20.0, x - 90.0), max(20.0, y - 50.0), steps=8)
-                await move_fn(x, y, steps=14)
-            except Exception:  # noqa: BLE001
-                pass
-        if callable(wait_fn):
-            await wait_fn(90)
-        if callable(click_fn):
-            try:
-                await click_fn(x, y, delay=70)
-                return True
-            except Exception:  # noqa: BLE001
-                pass
-
-    if kind == "recaptcha_anchor":
-        for frame in getattr(page, "frames", ()) or ():
-            f_url = str(getattr(frame, "url", "") or "")
-            if (
-                "recaptcha" in f_url
-                and "anchor" in f_url
-                and "size=invisible" not in f_url
-            ):
-                loc_fn = getattr(frame, "locator", None)
-                if callable(loc_fn):
-                    try:
-                        await loc_fn("#recaptcha-anchor").first.click()
-                        return True
-                    except Exception:  # noqa: BLE001
-                        pass
-    return False
-
-
-async def _gentle_page_warmup(page: Any) -> None:
-    mouse = getattr(page, "mouse", None)
-    move_fn = getattr(mouse, "move", None) if mouse is not None else None
-    wait_fn = getattr(page, "wait_for_timeout", None)
-    if callable(move_fn):
-        try:
-            await move_fn(280.0, 260.0, steps=6)
-            if callable(wait_fn):
-                await wait_fn(80)
-            await move_fn(460.0, 420.0, steps=8)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-async def _reclick_send_button_if_unsent(page: Any) -> bool:
-    eval_fn = getattr(page, "evaluate", None)
-    locator_fn = getattr(page, "locator", None)
-    if not (callable(eval_fn) and callable(locator_fn)):
-        return False
-    try:
-        has_text = bool(await eval_fn(_COMPOSER_NONEMPTY_JS))
-    except Exception:  # noqa: BLE001
-        return False
-    if not has_text:
-        return False
-    try:
-        btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
-    except Exception:  # noqa: BLE001
-        return False
-    if not (isinstance(btn_info, Mapping) and btn_info.get("found")):
-        return False
-    mouse = getattr(page, "mouse", None)
-    if mouse is not None and callable(getattr(mouse, "move", None)):
-        try:
-            await mouse.move(
-                float(btn_info.get("x") or 500),
-                float(btn_info.get("y") or 700),
-                steps=6,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-    try:
-        await locator_fn('[data-arena-send="1"]').first.click()
-    finally:
-        try:
-            await eval_fn(_CLEANUP_ARENA_DOM_MARKS_JS)
-        except Exception:  # noqa: BLE001
-            pass
-    return True
-
-
-async def _replay_eval_with_v2_token(
-    page: Any,
-    eval_url: str,
-    post_data: str,
-    v2_token: str,
-) -> bool:
-    eval_fn = getattr(page, "evaluate", None)
-    if not (callable(eval_fn) and eval_url and post_data and v2_token):
-        return False
-    try:
-        parsed = json.loads(post_data)
-    except Exception:  # noqa: BLE001
-        return False
-    if not isinstance(parsed, dict):
-        return False
-    parsed["recaptchaV2Token"] = v2_token
-    url_literal = json.dumps(eval_url)
-    body_literal = json.dumps(json.dumps(parsed, separators=(",", ":")))
-    script = f"""
-    /* arena_replay_v2 */ () => {{
-      window.fetch({url_literal}, {{
-        method: "POST",
-        credentials: "include",
-        headers: {{
-          "Content-Type": "application/json",
-          "Accept": "text/event-stream, text/plain, */*"
-        }},
-        body: {body_literal}
-      }}).catch(() => {{}});
-      return true;
-    }}
-    """
-    try:
-        return bool(await eval_fn(script))
-    except Exception:  # noqa: BLE001
-        return False
-
-
-async def _submit_prompt_via_composer(
-    page: Any,
-    prompt: str,
-    *,
-    model_id_override: str | None = None,
-    generation_params: Mapping[str, Any] | None = None,
-    has_submitted: Callable[[], bool] | None = None,
-    install_legacy_tap_flags: bool = False,
-) -> bool:
-    locator_fn = getattr(page, "locator", None)
-    eval_fn = getattr(page, "evaluate", None)
-    if not (callable(locator_fn) and callable(eval_fn)):
-        return False
-
-    patch_obj: dict[str, Any] = {}
-    if model_id_override:
-        patch_obj["modelAId"] = model_id_override
-    if generation_params:
-        patch_obj["generationConfig"] = dict(generation_params)
-    if patch_obj:
-        await eval_fn(_build_main_frame_body_patch_js(patch_obj))
-    if install_legacy_tap_flags:
-        patch_literal = json.dumps(patch_obj) if patch_obj else "null"
-        await eval_fn(
-            f"() => {{ window.__arenaBodyPatch = {patch_literal}; window.__arenaTapArmed = true; }}"
-        )
-
-    info = await eval_fn(_FIND_COMPOSER_JS)
-    if not isinstance(info, Mapping) or not info.get("found"):
-        return False
-
-    mouse = getattr(page, "mouse", None)
-    if mouse is not None and callable(getattr(mouse, "move", None)):
-        cx = float(info.get("x") or 400)
-        cy = float(info.get("y") or 700)
-        try:
-            await mouse.move(max(40.0, cx - 120.0), max(40.0, cy - 80.0), steps=5)
-            await mouse.move(cx, cy, steps=8)
-        except Exception:  # noqa: BLE001
-            pass
-
-    composer = locator_fn('[data-arena-composer="1"]').first
-    await composer.click()
-
-    keyboard = getattr(page, "keyboard", None)
-    single_line = "\n" not in prompt and "\r" not in prompt
-    if (
-        single_line
-        and len(prompt) <= 160
-        and keyboard is not None
-        and callable(getattr(keyboard, "type", None))
-    ):
-        await keyboard.type(prompt, delay=12)
-        try:
-            non_empty = await eval_fn(_COMPOSER_NONEMPTY_JS)
-        except Exception:  # noqa: BLE001
-            non_empty = True
-        if not non_empty:
-            await composer.fill(prompt)
-    else:
-        first_line = prompt.splitlines()[0][:24] if prompt else ""
-        if (
-            first_line
-            and keyboard is not None
-            and callable(getattr(keyboard, "type", None))
-        ):
-            await keyboard.type(first_line, delay=12)
-        await composer.fill(prompt)
-
-    wait_fn = getattr(page, "wait_for_timeout", None)
-    if callable(wait_fn):
-        await wait_fn(150)
-
-    btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
-    try:
-        if isinstance(btn_info, Mapping) and btn_info.get("found"):
-            if mouse is not None and callable(getattr(mouse, "move", None)):
-                try:
-                    await mouse.move(
-                        float(btn_info.get("x") or 500),
-                        float(btn_info.get("y") or 700),
-                        steps=6,
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-            send_btn = locator_fn('[data-arena-send="1"]').first
-            await send_btn.click()
-            # Only press Enter as a fallback when no explicit submit/Send button
-            # matched and no evaluation request or challenge has started yet;
-            # pressing Enter on top of an explicit Send click fires a duplicate
-            # submission while grecaptcha.enterprise.execute() is still running.
-            if btn_info.get("confidence") == "fallback":
-                if callable(wait_fn):
-                    await wait_fn(900)
-                already_started = bool(has_submitted and has_submitted())
-                if not already_started:
-                    challenge = await _detect_post_submit_challenge(page)
-                    already_started = challenge.get("kind") is not None
-                if not already_started:
-                    try:
-                        still_has_text = bool(await eval_fn(_COMPOSER_NONEMPTY_JS))
-                    except Exception:  # noqa: BLE001
-                        still_has_text = False
-                    if still_has_text:
-                        await composer.press("Enter")
-        else:
-            await composer.press("Enter")
-    finally:
-        try:
-            await eval_fn(_CLEANUP_ARENA_DOM_MARKS_JS)
-        except Exception:  # noqa: BLE001
-            pass
-    return True
-
-
-class _RetryInHeadedBrowser(Exception):
-    """Internal signal to retry a Direct Chat browser request in headed mode."""
-
 
 class DirectVerificationToken:
     """Callable producing a fresh reCAPTCHA v3 assertion for Direct Chat.
@@ -3378,6 +1816,78 @@ class DirectVerificationToken:
             )
         _raise_for_status(status, body, headers)
 
+    async def _launch_verification_environment(
+        self,
+        *,
+        headless: bool,
+        cloaked_headful: bool,
+        resolved_proxy: str | None,
+        user_data_dir: str | Path | None,
+    ) -> tuple[Any, str | None]:
+        channels = _candidate_browser_channels(self.options.channel)
+        environment: Any = None
+        selected_channel: str | None = None
+        last_missing_exc: BaseException | None = None
+        ignored_default_args = (
+            (*AUTOMATION_DEFAULT_ARGS_TO_DROP, "--hide-scrollbars")
+            if headless
+            else AUTOMATION_DEFAULT_ARGS_TO_DROP
+        )
+        launch_args: tuple[str, ...]
+        if headless:
+            launch_args = (AUTOMATION_BLINK_SWITCH, "--window-size=1480,960")
+        elif cloaked_headful:
+            launch_args = (AUTOMATION_BLINK_SWITCH, *_OFFSCREEN_HEADFUL_SWITCHES)
+        else:
+            launch_args = (AUTOMATION_BLINK_SWITCH,)
+
+        for channel in channels:
+            env_kwargs: dict[str, Any] = {
+                "headless": headless,
+                "locale": None,
+                "timezone_id": None,
+                "artifacts_dir": self.options.artifacts_dir,
+                "install_determinism_script": False,
+                "reduced_motion": "no-preference",
+                "color_scheme": "no-preference",
+                "ignore_default_args": ignored_default_args,
+                "launch_args": launch_args,
+                "extra_init_scripts": (HIDE_WEBDRIVER_SCRIPT,),
+            }
+            if user_data_dir is not None:
+                env_kwargs["user_data_dir"] = user_data_dir
+            if channel is not None:
+                env_kwargs["channel"] = channel
+            if resolved_proxy:
+                env_kwargs["proxy"] = resolved_proxy
+            env_options = BrowserEnvironmentOptions.with_captcha_solving(
+                self.solver, **env_kwargs
+            )
+            candidate_env = BrowserEnvironment(env_options)
+            try:
+                environment = await candidate_env.__aenter__()
+                selected_channel = channel
+                break
+            except Exception as exc:  # noqa: BLE001
+                if _is_missing_browser_error(exc):
+                    last_missing_exc = exc
+                    continue
+                raise
+
+        if environment is None:
+            detail = (
+                str(last_missing_exc).splitlines()[0]
+                if last_missing_exc
+                else "no browser executable found"
+            )
+            raise AuthenticationError(
+                f"Direct Chat verification browser could not be started: {detail} "
+                "Install Chromium (`python -m playwright install chromium`) or "
+                "use your installed browser with `--channel msedge` / "
+                "`--channel chrome`."
+            ) from last_missing_exc
+        return environment, selected_channel
+
     @asynccontextmanager
     async def _attempt_browser_evaluation(
         self,
@@ -3404,70 +1914,17 @@ class DirectVerificationToken:
         if user_data_dir is not None and not headless:
             _prepare_profile_window_placement(user_data_dir, hidden=cloaked_headful)
 
-        channels = _candidate_browser_channels(self.options.channel)
-        environment: Any = None
-        selected_channel: str | None = None
-        last_missing_exc: BaseException | None = None
-        ignored_default_args = (
-            (*AUTOMATION_DEFAULT_ARGS_TO_DROP, "--hide-scrollbars")
-            if headless
-            else AUTOMATION_DEFAULT_ARGS_TO_DROP
-        )
-        launch_args: tuple[str, ...]
-        if headless:
-            launch_args = (AUTOMATION_BLINK_SWITCH, "--window-size=1480,960")
-        elif cloaked_headful:
-            launch_args = (AUTOMATION_BLINK_SWITCH, *_OFFSCREEN_HEADFUL_SWITCHES)
-        else:
-            launch_args = (AUTOMATION_BLINK_SWITCH,)
-
         win_cloaker = _WindowsBrowserCloaker(enabled=cloaked_headful)
         win_cloaker.start()
         try:
-            for channel in channels:
-                env_kwargs: dict[str, Any] = {
-                    "headless": headless,
-                    "locale": None,
-                    "timezone_id": None,
-                    "artifacts_dir": self.options.artifacts_dir,
-                    "install_determinism_script": False,
-                    "reduced_motion": "no-preference",
-                    "color_scheme": "no-preference",
-                    "ignore_default_args": ignored_default_args,
-                    "launch_args": launch_args,
-                    "extra_init_scripts": (HIDE_WEBDRIVER_SCRIPT,),
-                }
-                if user_data_dir is not None:
-                    env_kwargs["user_data_dir"] = user_data_dir
-                if channel is not None:
-                    env_kwargs["channel"] = channel
-                if resolved_proxy:
-                    env_kwargs["proxy"] = resolved_proxy
-                env_options = BrowserEnvironmentOptions.with_captcha_solving(
-                    self.solver, **env_kwargs
+            environment, selected_channel = (
+                await self._launch_verification_environment(
+                    headless=headless,
+                    cloaked_headful=cloaked_headful,
+                    resolved_proxy=resolved_proxy,
+                    user_data_dir=user_data_dir,
                 )
-                candidate_env = BrowserEnvironment(env_options)
-                try:
-                    environment = await candidate_env.__aenter__()
-                    selected_channel = channel
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    if _is_missing_browser_error(exc):
-                        last_missing_exc = exc
-                        continue
-                    raise
-            if environment is None:
-                detail = (
-                    str(last_missing_exc).splitlines()[0]
-                    if last_missing_exc
-                    else "no browser executable found"
-                )
-                raise AuthenticationError(
-                    f"Direct Chat verification browser could not be started: {detail} "
-                    "Install Chromium (`python -m playwright install chromium`) or "
-                    "use your installed browser with `--channel msedge` / "
-                    "`--channel chrome`."
-                ) from last_missing_exc
+            )
         except BaseException:
             win_cloaker.stop()
             raise
@@ -3651,7 +2108,7 @@ class DirectVerificationToken:
                         while time.monotonic() < wait_deadline:
                             obs_cf = await _detect_post_submit_challenge(page)
                             if obs_cf.get("kind") == "turnstile":
-                                await _click_challenge_checkbox(page, obs_cf)
+                                await _click_challenge_checkbox(page, obs_cf, bring_to_front=window_visible)
                             await wait_for_timeout(600)
                             try:
                                 html = await page_content_fn()
@@ -3796,7 +2253,7 @@ class DirectVerificationToken:
                             and obs_kind not in clicked_checkbox_kinds
                         ):
                             clicked_checkbox_kinds.add(obs_kind)
-                            await _click_challenge_checkbox(page, obs)
+                            await _click_challenge_checkbox(page, obs, bring_to_front=window_visible)
                             if callable(wait_for_timeout):
                                 await wait_for_timeout(700)
                             obs = await _detect_post_submit_challenge(page)
