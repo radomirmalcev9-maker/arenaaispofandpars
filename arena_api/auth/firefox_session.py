@@ -1135,6 +1135,10 @@ class FirefoxSessionManager:
         self._profile_path: Path | None = None
         # profile -> number of matching cookies, filled by profile discovery.
         self._profile_counts: dict[Path, int] = {}
+        # (domains, on-disk store signature) -> records of the last read, so
+        # a client that re-checks the session before every request does not
+        # re-open the cookie store while nothing on disk changed.
+        self._records_cache: tuple[tuple[Any, ...], list[dict[str, Any]]] | None = None
 
     # ------------------------------------------------------------------ #
     # Profile and database discovery
@@ -1466,6 +1470,10 @@ class FirefoxSessionManager:
         targets = (
             _normalize_domains(domains) if domains is not None else self.domains
         )
+        store_sig = self._store_signature(targets)
+        cached = self._records_cache
+        if store_sig is not None and cached is not None and cached[0] == store_sig:
+            return [dict(record) for record in cached[1]]
         warnings: list[str] = []
         if self._rookiepy_is_reading_the_selected_profile():
             records = self._rookiepy_records(targets, warnings)
@@ -1482,7 +1490,42 @@ class FirefoxSessionManager:
                     "; ".join(failures + warnings)
                     or "the Firefox cookie store could not be read"
                 )
+        if store_sig is not None:
+            self._records_cache = (store_sig, [dict(record) for record in records])
         return records
+
+    def _store_signature(self, targets: tuple[str, ...]) -> tuple[Any, ...] | None:
+        """Cheap stat-only fingerprint of every file a cookie read depends on.
+
+        ``None`` disables caching (profile unresolved or a file unreadable).
+        Firefox bumps the mtime of ``cookies.sqlite``/``-wal`` on every write
+        and replaces ``recovery.jsonlz4`` atomically, so a stale hit would need
+        a write that changed neither size nor mtime within the same ns tick.
+        """
+        try:
+            if self.cookie_database is not None:
+                database = Path(self.cookie_database)
+            else:
+                database = self.profile_path() / "cookies.sqlite"
+        except (FirefoxSessionError, OSError):
+            return None
+        profile = database.parent
+        parts: list[Any] = [targets, str(database)]
+        try:
+            for candidate in (
+                database,
+                database.with_name(database.name + "-wal"),
+                *(profile / relpath for relpath in _SESSIONSTORE_FILES),
+            ):
+                try:
+                    st = candidate.stat()
+                except FileNotFoundError:
+                    parts.append(None)
+                    continue
+                parts.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            return None
+        return tuple(parts)
 
     def _rookiepy_module(self) -> Any | None:
         """Import rookiepy lazily so the module stays an optional dependency."""

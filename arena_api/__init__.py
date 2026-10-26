@@ -18,97 +18,225 @@ lifecycle management and a challenge *detector*); see
 ``arena_api.auth.environment`` and ``arena_api.auth.challenge``.
 """
 
-from .auth import (
-    BrowserEnvironment,
-    BrowserEnvironmentOptions,
-    BrowserSessionManager,
-    CaptchaAttempt,
-    CaptchaSolver,
-    ChallengeHandler,
-    ChallengeKind,
-    ChallengeObservation,
-    ChallengeWaitSolver,
-    CompositeSolver,
-    DeterminismOptions,
-    FirefoxSessionError,
-    FirefoxSessionManager,
-    collect_firefox_report,
-    firefox_profiles_roots,
-    format_firefox_report,
-    FormLoginFlow,
-    KinematicMouse,
-    KinematicMouseSync,
-    LoginResult,
-    RecaptchaToolkitSolver,
-    SessionManager,
-    SessionValidation,
-    TrajectoryPlanner,
-    alogin_and_save,
-    build_init_script,
-    inspect_page,
-    inspect_response,
-    login_and_save,
-)
-from .client import ArenaClient, AsyncArenaClient, resolve_impersonation
-from .direct import (
-    AsyncDirectArenaClient,
-    AsyncDirectChatSession,
-    DirectArenaClient,
-    DirectChatSession,
-)
-from .exceptions import (
-    ArenaError,
-    AuthenticationError,
-    CaptchaSolveError,
-    ChallengeRequiredError,
-    ClientClosedError,
-    ModelUnavailableError,
-    ProtocolError,
-    QueueTimeoutError,
-    RateLimitError,
-)
-from .models import (
-    BattleResponse,
-    BattleStreamChunk,
-    GenerationConfig,
-    Message,
-    ModelInfo,
-    QueueEndpoint,
-    StreamChunk,
-)
-from .session import AsyncChatSession, ChatSession
-from .transport import (
-    IMPERSONATE_EXTRA,
-    ArenaTransport,
-    AsyncArenaTransport,
-    SSEParser,
-    impersonation_available,
-    normalize_cookies,
-    parse_cookie_header,
+from __future__ import annotations
+
+import importlib
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .auth import (
+        BrowserEnvironment,
+        BrowserEnvironmentOptions,
+        BrowserSessionManager,
+        CaptchaAttempt,
+        CaptchaSolver,
+        ChallengeHandler,
+        ChallengeKind,
+        ChallengeObservation,
+        ChallengeWaitSolver,
+        CompositeSolver,
+        DeterminismOptions,
+        FirefoxSessionError,
+        FirefoxSessionManager,
+        FormLoginFlow,
+        KinematicMouse,
+        KinematicMouseSync,
+        LoginResult,
+        RecaptchaToolkitSolver,
+        SessionManager,
+        SessionValidation,
+        TrajectoryPlanner,
+        alogin_and_save,
+        build_init_script,
+        collect_firefox_report,
+        firefox_profiles_roots,
+        format_firefox_report,
+        inspect_page,
+        inspect_response,
+        login_and_save,
+    )
+    from .auto import (
+        AutoOptions,
+        AutoSessionManager,
+        DirectVerificationToken,
+        DiscoveredSession,
+        LoginOutcome,
+        ProbeResult,
+        auto_async_client,
+        auto_async_direct_client,
+        auto_client,
+        auto_direct_client,
+        discover_session,
+        explain_impersonation,
+        impersonation_profile,
+        interactive_login,
+        profile_for_source,
+    )
+    from .client import (
+        ArenaClient,
+        ArenaClient as Client,
+        AsyncArenaClient,
+        AsyncArenaClient as AsyncClient,
+        resolve_impersonation,
+    )
+    from .direct import (
+        AsyncDirectArenaClient,
+        AsyncDirectChatSession,
+        DirectArenaClient,
+        DirectChatSession,
+    )
+    from .exceptions import (
+        ArenaError,
+        AuthenticationError,
+        CaptchaSolveError,
+        ChallengeRequiredError,
+        ClientClosedError,
+        ModelUnavailableError,
+        ProtocolError,
+        QueueTimeoutError,
+        RateLimitError,
+    )
+    from .models import (
+        BattleResponse,
+        BattleStreamChunk,
+        GenerationConfig,
+        Message,
+        ModelInfo,
+        QueueEndpoint,
+        StreamChunk,
+    )
+    from .session import AsyncChatSession, ChatSession
+    from .transport import (
+        IMPERSONATE_EXTRA,
+        ArenaTransport,
+        AsyncArenaTransport,
+        SSEParser,
+        impersonation_available,
+        normalize_cookies,
+        parse_cookie_header,
+    )
+
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    # .auth
+    "BrowserEnvironment": (".auth", "BrowserEnvironment"),
+    "BrowserEnvironmentOptions": (".auth", "BrowserEnvironmentOptions"),
+    "BrowserSessionManager": (".auth", "BrowserSessionManager"),
+    "CaptchaAttempt": (".auth", "CaptchaAttempt"),
+    "CaptchaSolver": (".auth", "CaptchaSolver"),
+    "ChallengeHandler": (".auth", "ChallengeHandler"),
+    "ChallengeKind": (".auth", "ChallengeKind"),
+    "ChallengeObservation": (".auth", "ChallengeObservation"),
+    "ChallengeWaitSolver": (".auth", "ChallengeWaitSolver"),
+    "CompositeSolver": (".auth", "CompositeSolver"),
+    "DeterminismOptions": (".auth", "DeterminismOptions"),
+    "FirefoxSessionError": (".auth", "FirefoxSessionError"),
+    "FirefoxSessionManager": (".auth", "FirefoxSessionManager"),
+    "FormLoginFlow": (".auth", "FormLoginFlow"),
+    "KinematicMouse": (".auth", "KinematicMouse"),
+    "KinematicMouseSync": (".auth", "KinematicMouseSync"),
+    "LoginResult": (".auth", "LoginResult"),
+    "RecaptchaToolkitSolver": (".auth", "RecaptchaToolkitSolver"),
+    "SessionManager": (".auth", "SessionManager"),
+    "SessionValidation": (".auth", "SessionValidation"),
+    "TrajectoryPlanner": (".auth", "TrajectoryPlanner"),
+    "alogin_and_save": (".auth", "alogin_and_save"),
+    "build_init_script": (".auth", "build_init_script"),
+    "collect_firefox_report": (".auth", "collect_firefox_report"),
+    "firefox_profiles_roots": (".auth", "firefox_profiles_roots"),
+    "format_firefox_report": (".auth", "format_firefox_report"),
+    "inspect_page": (".auth", "inspect_page"),
+    "inspect_response": (".auth", "inspect_response"),
+    "login_and_save": (".auth", "login_and_save"),
+    # .client
+    "ArenaClient": (".client", "ArenaClient"),
+    "AsyncArenaClient": (".client", "AsyncArenaClient"),
+    "Client": (".client", "ArenaClient"),
+    "AsyncClient": (".client", "AsyncArenaClient"),
+    "resolve_impersonation": (".client", "resolve_impersonation"),
+    # .direct
+    "AsyncDirectArenaClient": (".direct", "AsyncDirectArenaClient"),
+    "AsyncDirectChatSession": (".direct", "AsyncDirectChatSession"),
+    "DirectArenaClient": (".direct", "DirectArenaClient"),
+    "DirectChatSession": (".direct", "DirectChatSession"),
+    # .exceptions
+    "ArenaError": (".exceptions", "ArenaError"),
+    "AuthenticationError": (".exceptions", "AuthenticationError"),
+    "CaptchaSolveError": (".exceptions", "CaptchaSolveError"),
+    "ChallengeRequiredError": (".exceptions", "ChallengeRequiredError"),
+    "ClientClosedError": (".exceptions", "ClientClosedError"),
+    "ModelUnavailableError": (".exceptions", "ModelUnavailableError"),
+    "ProtocolError": (".exceptions", "ProtocolError"),
+    "QueueTimeoutError": (".exceptions", "QueueTimeoutError"),
+    "RateLimitError": (".exceptions", "RateLimitError"),
+    # .models
+    "BattleResponse": (".models", "BattleResponse"),
+    "BattleStreamChunk": (".models", "BattleStreamChunk"),
+    "GenerationConfig": (".models", "GenerationConfig"),
+    "Message": (".models", "Message"),
+    "ModelInfo": (".models", "ModelInfo"),
+    "QueueEndpoint": (".models", "QueueEndpoint"),
+    "StreamChunk": (".models", "StreamChunk"),
+    # .session
+    "AsyncChatSession": (".session", "AsyncChatSession"),
+    "ChatSession": (".session", "ChatSession"),
+    # .transport
+    "IMPERSONATE_EXTRA": (".transport", "IMPERSONATE_EXTRA"),
+    "ArenaTransport": (".transport", "ArenaTransport"),
+    "AsyncArenaTransport": (".transport", "AsyncArenaTransport"),
+    "SSEParser": (".transport", "SSEParser"),
+    "impersonation_available": (".transport", "impersonation_available"),
+    "normalize_cookies": (".transport", "normalize_cookies"),
+    "parse_cookie_header": (".transport", "parse_cookie_header"),
+    # .auto
+    "AutoOptions": (".auto", "AutoOptions"),
+    "AutoSessionManager": (".auto", "AutoSessionManager"),
+    "DirectVerificationToken": (".auto", "DirectVerificationToken"),
+    "DiscoveredSession": (".auto", "DiscoveredSession"),
+    "LoginOutcome": (".auto", "LoginOutcome"),
+    "ProbeResult": (".auto", "ProbeResult"),
+    "auto_async_client": (".auto", "auto_async_client"),
+    "auto_async_direct_client": (".auto", "auto_async_direct_client"),
+    "auto_client": (".auto", "auto_client"),
+    "auto_direct_client": (".auto", "auto_direct_client"),
+    "discover_session": (".auto", "discover_session"),
+    "explain_impersonation": (".auto", "explain_impersonation"),
+    "impersonation_profile": (".auto", "impersonation_profile"),
+    "interactive_login": (".auto", "interactive_login"),
+    "profile_for_source": (".auto", "profile_for_source"),
+}
+
+_SUBMODULES: frozenset[str] = frozenset(
+    {
+        "auth",
+        "auto",
+        "client",
+        "direct",
+        "exceptions",
+        "models",
+        "session",
+        "transport",
+    }
 )
 
-# Imported last: the bootstrap facade builds on the clients above.
-from .auto import (  # noqa: E402
-    AutoOptions,
-    AutoSessionManager,
-    DirectVerificationToken,
-    DiscoveredSession,
-    LoginOutcome,
-    ProbeResult,
-    auto_async_client,
-    auto_async_direct_client,
-    auto_client,
-    auto_direct_client,
-    discover_session,
-    explain_impersonation,
-    impersonation_profile,
-    interactive_login,
-    profile_for_source,
-)
 
-# Short aliases for applications that do not need to distinguish the backend.
-Client = ArenaClient
-AsyncClient = AsyncArenaClient
+def __getattr__(name: str) -> Any:
+    target = _LAZY_EXPORTS.get(name)
+    if target is not None:
+        mod_name, attr_name = target
+        module = importlib.import_module(mod_name, __name__)
+        value = getattr(module, attr_name)
+        globals()[name] = value
+        return value
+    if name in _SUBMODULES:
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
+
 
 __all__ = [
     "ArenaClient",

@@ -11,6 +11,7 @@ wins -- without disturbing the older preference order when nothing has content.
 from __future__ import annotations
 
 import io
+import os
 import json
 import sqlite3
 import struct
@@ -608,3 +609,41 @@ def test_sessionstore_recovery_jsonlz4_and_backup_are_merged(tmp_path) -> None:
         "arena_build_bucket": "bucket-a",
     }
 
+
+
+def test_session_records_are_cached_until_the_store_changes_on_disk(tmp_path) -> None:
+    """Back-to-back reads reuse the last result; any on-disk write invalidates it."""
+    root = make_tree(tmp_path)
+    profile = make_profile(
+        root / "Profiles" / "aaa.default-release",
+        [("arena-auth-prod-v1.0", "first", ".arena.ai", FUTURE * 1_000)],
+    )
+    manager = FirefoxSessionManager(
+        profiles_root=root, interactive=False, max_cookie_attempts=1
+    )
+    manager._rookiepy_module = lambda: None
+    sqlite_reads = 0
+    real_sqlite_records = manager._sqlite_records
+
+    def counting_sqlite_records(targets, failures):
+        nonlocal sqlite_reads
+        sqlite_reads += 1
+        return real_sqlite_records(targets, failures)
+
+    manager._sqlite_records = counting_sqlite_records  # type: ignore[method-assign]
+
+    assert manager.load_cookies()["arena-auth-prod-v1.0"] == "first"
+    assert manager.load_cookies()["arena-auth-prod-v1.0"] == "first"
+    assert manager.cookie_records()[0]["value"] == "first"
+    assert sqlite_reads == 1
+
+    database = profile / "cookies.sqlite"
+    conn = sqlite3.connect(database)
+    conn.execute("UPDATE moz_cookies SET value = 'second'")
+    conn.commit()
+    conn.close()
+    stat = database.stat()
+    os.utime(database, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+    assert manager.load_cookies()["arena-auth-prod-v1.0"] == "second"
+    assert sqlite_reads == 2
