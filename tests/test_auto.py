@@ -2607,12 +2607,20 @@ def test_direct_verification_token_forwards_proxy_channel_cookies_and_fast_js(
 
         async def evaluate(self, script: str):
             assert "chat_submit" in script
+            assert "recaptcha/enterprise.js?render=" in script
+            assert "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0" in script
             return "fast-v3-assertion"
+
+    class FakeHandler:
+        def __init__(self) -> None:
+            self.solve_on_detection = True
 
     class CapturingEnv:
         def __init__(self, options) -> None:
             seen_env_options.append(options)
             self.page = JsPage()
+            self.challenge_handler = FakeHandler()
+            self.solve_flag_at_new_page: bool | None = None
 
         async def __aenter__(self):
             return self
@@ -2621,9 +2629,15 @@ def test_direct_verification_token_forwards_proxy_channel_cookies_and_fast_js(
             return None
 
         async def new_page(self):
+            self.solve_flag_at_new_page = self.challenge_handler.solve_on_detection
             return self.page
 
-    monkeypatch.setattr(auto_module, "BrowserEnvironment", CapturingEnv)
+    envs: list[CapturingEnv] = []
+    monkeypatch.setattr(
+        auto_module,
+        "BrowserEnvironment",
+        lambda options: envs.append(CapturingEnv(options)) or envs[-1],
+    )
     monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
     solver = RecaptchaToolkitSolver()
     monkeypatch.setattr(
@@ -2648,6 +2662,8 @@ def test_direct_verification_token_forwards_proxy_channel_cookies_and_fast_js(
     env_opt = seen_env_options[0]
     assert env_opt.proxy == "http://127.0.0.1:10809"
     assert env_opt.channel == "msedge"
+    assert env_opt.install_determinism_script is False
+    assert envs[0].solve_flag_at_new_page is False
     assert added_cookies == [
         [
             {"name": "cf_clearance", "value": "cf1", "url": "https://arena.ai"},

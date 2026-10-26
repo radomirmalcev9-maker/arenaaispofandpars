@@ -329,3 +329,51 @@ def test_resolve_model_prefers_ranked_chat_uuid_over_webdev_twin() -> None:
         assert client.complete("Hi", model="gemini-2.5-flash") == "ok"
     assert chosen_ids == [chat_uuid]
 
+
+def test_direct_multi_turn_uses_post_to_evaluation_and_sends_origin_referer() -> None:
+    paths: list[str] = []
+    ids: list[str] = []
+    headers_seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/text/direct":
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/html"},
+                content=PAGE.encode(),
+            )
+        paths.append(request.url.path)
+        payload = json.loads(request.content)
+        ids.append(payload["id"])
+        headers_seen.append(
+            (request.headers.get("origin", ""), request.headers.get("referer", ""))
+        )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=b'a0:"ok"\nad:{"finishReason":"stop"}\n',
+        )
+
+    with DirectArenaClient(
+        base_url="https://arena.test",
+        verification_token="tok",
+        http_transport=httpx.MockTransport(handler),
+    ) as client:
+        assert client.complete("One", model="Model A") == "ok"
+        assert client.complete("Two", model="Model A") == "ok"
+        assert ids[0] != ids[1]
+
+        chat = client.chat(model="Model A")
+        assert chat.send_message("Turn 1") == "ok"
+        assert chat.send_message("Turn 2") == "ok"
+
+    assert paths[2] == "/nextjs-api/stream/create-evaluation"
+    assert paths[3] == f"/nextjs-api/stream/post-to-evaluation/{chat.conversation_id}"
+    assert headers_seen[0] == (
+        "https://arena.test",
+        "https://arena.test/text/direct?model_a=max",
+    )
+
+
