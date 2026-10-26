@@ -30,6 +30,7 @@ for curl_cffi's domain-aware cookie jar.
 from __future__ import annotations
 
 import configparser
+import json
 import locale
 import math
 import os
@@ -238,14 +239,51 @@ def _looks_locked(error: BaseException) -> bool:
     return any(marker in text for marker in _LOCK_MARKERS)
 
 
+#: Mozilla LZ4 header on ``recovery.jsonlz4`` / ``sessionstore.jsonlz4``.
+_MOZLZ4_MAGIC = b"mozLz40\x00"
+#: Guard against a corrupt header claiming gigabytes of uncompressed JSON.
+_MAX_SESSIONSTORE_BYTES = 64 * 1024 * 1024
+#: ``SessionCookies.sys.mjs`` uses ``Number.MAX_SAFE_INTEGER`` for "session".
+_SESSIONSTORE_MAX_EXPIRY = (1 << 53) - 1
+#: Session-cookie stores inside a Firefox profile, live backup first.
+_SESSIONSTORE_FILES: tuple[str, ...] = (
+    "sessionstore-backups/recovery.jsonlz4",
+    "sessionstore-backups/recovery.baklz4",
+    "sessionstore.jsonlz4",
+    "sessionstore.js",
+)
+
+# Disjoint epoch unit cutoffs: seconds (< 3e11 covers 1970..9999), milliseconds
+# (< 3e14 covers 1979..9999, used by Firefox schema >= 16), microseconds
+# (< 3e17 covers 1979..9999, older/exported formats), nanoseconds (>= 3e17).
+_SECONDS_UPPER_BOUND = 3e11
+_MILLISECONDS_UPPER_BOUND = 3e14
+_MICROSECONDS_UPPER_BOUND = 3e17
+
+
+def _domain_matches(host: str, targets: Sequence[str]) -> bool:
+    """Whether ``host`` belongs to one of ``targets`` (exact or subdomain)."""
+    candidate = str(host).strip().lstrip(".").lower()
+    if not candidate:
+        return False
+    for target in targets:
+        wanted = str(target).strip().lstrip(".").lower()
+        if wanted and (candidate == wanted or candidate.endswith("." + wanted)):
+            return True
+    return False
+
+
 def _expiry_seconds(expires: Any) -> float | None:
     """Normalize a cookie expiry to epoch **seconds**; ``None`` = session cookie.
 
-    Firefox stores ``moz_cookies.expiry`` in seconds, but older profile
-    formats (and some exports) carry microseconds, and ``rookiepy`` hands back
-    seconds as a float. Mixing the units up silently makes an expiring cookie
-    look immortal or an immortal one look long expired, so every value goes
-    through here exactly once.
+    Modern Firefox (cookie schema >= 16, Firefox 136+) stores
+    ``moz_cookies.expiry`` in **milliseconds** (~1.8e12 today), earlier schemas
+    stored **seconds** (~1.8e9), and some older profile exports carry
+    **microseconds** (~1.8e15) or **nanoseconds** (~1.8e18). ``rookiepy`` passes
+    ``moz_cookies.expiry`` through unchanged, so it hands back milliseconds on
+    current Firefox too. Mixing the units up silently makes every live cookie
+    look expired in January 1970 (dividing ms by 1e6) or immortal, so every
+    value goes through here exactly once.
     """
     if expires is None or isinstance(expires, bool):
         return None
@@ -267,11 +305,14 @@ def _expiry_seconds(expires: Any) -> float | None:
             return parsed.timestamp()
     else:
         return None
-    if number <= 0:
+    if not math.isfinite(number) or number <= 0:
         return None
-    # Microseconds since epoch (~1.7e15 today) rather than seconds (~1.7e9).
-    if number > 1e12:
-        number /= 1_000_000
+    if number >= _MICROSECONDS_UPPER_BOUND:
+        number /= 1_000_000_000.0
+    elif number >= _MILLISECONDS_UPPER_BOUND:
+        number /= 1_000_000.0
+    elif number >= _SECONDS_UPPER_BOUND:
+        number /= 1_000.0
     return number
 
 
@@ -281,17 +322,207 @@ def _cookie_expired(expires: Any) -> bool:
     return moment is not None and moment < time.time()
 
 
-def _normalize_rookiepy_records(records: Any) -> list[dict[str, Any]]:
+def _decompress_mozlz4(data: bytes) -> bytes:
+    """Decompress a Mozilla ``mozLz40\\0`` file (stdlib-only raw LZ4 block).
+
+    Firefox writes session cookies (cookies without ``Expires``/``Max-Age``) to
+    ``sessionstore-backups/recovery.jsonlz4`` rather than ``cookies.sqlite``.
+    The format is an 8-byte ``mozLz40\\0`` magic, a 4-byte little-endian
+    uncompressed byte length, and a single raw LZ4 block.
+    """
+    if len(data) < 12 or data[:8] != _MOZLZ4_MAGIC:
+        raise ValueError("not a mozLz40 container")
+    expected = int.from_bytes(data[8:12], "little")
+    if expected > _MAX_SESSIONSTORE_BYTES:
+        raise ValueError(f"mozLz40 payload too large ({expected} bytes)")
+    if expected == 0:
+        return b""
+    src = memoryview(data)[12:]
+    pos = 0
+    end = len(src)
+    out = bytearray()
+    while pos < end:
+        token = src[pos]
+        pos += 1
+        lit_len = token >> 4
+        if lit_len == 15:
+            while True:
+                if pos >= end:
+                    raise ValueError("truncated mozLz40 literal length")
+                extra = src[pos]
+                pos += 1
+                lit_len += extra
+                if extra != 255:
+                    break
+        if pos + lit_len > end or len(out) + lit_len > expected:
+            raise ValueError("mozLz40 literal overruns block")
+        if lit_len:
+            out.extend(src[pos : pos + lit_len])
+            pos += lit_len
+        if pos >= end:
+            break
+        if pos + 2 > end:
+            raise ValueError("truncated mozLz40 match offset")
+        offset = src[pos] | (src[pos + 1] << 8)
+        pos += 2
+        if offset == 0 or offset > len(out):
+            raise ValueError("invalid mozLz40 match offset")
+        match_len = token & 0x0F
+        if match_len == 15:
+            while True:
+                if pos >= end:
+                    raise ValueError("truncated mozLz40 match length")
+                extra = src[pos]
+                pos += 1
+                match_len += extra
+                if extra != 255:
+                    break
+        match_len += 4
+        if len(out) + match_len > expected:
+            raise ValueError("mozLz40 match overruns expected size")
+        start = len(out) - offset
+        if offset >= match_len:
+            out.extend(out[start : start + match_len])
+        else:
+            chunk = bytes(out[start:])
+            repeats, remainder = divmod(match_len, offset)
+            if repeats:
+                out.extend(chunk * repeats)
+            if remainder:
+                out.extend(chunk[:remainder])
+    if len(out) != expected:
+        raise ValueError(
+            f"mozLz40 decompressed size mismatch ({len(out)} != {expected})"
+        )
+    return bytes(out)
+
+
+def _format_origin_attributes(value: Any) -> str:
+    """Turn Firefox ``originAttributes`` (str or JSON dict) into a short tag."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        parts = [
+            f"{key}={val}"
+            for key, val in sorted(value.items())
+            if val not in ("", 0, False, None)
+        ]
+        return "^" + "&".join(parts) if parts else ""
+    return ""
+
+
+def _sessionstore_cookie_rows(
+    profile: Path,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Read session cookies from ``recovery.jsonlz4`` / ``sessionstore.*``.
+
+    Returns ``(relative_source_name, rows)``. Firefox replaces
+    ``recovery.jsonlz4`` atomically while running, and writes
+    ``sessionstore.jsonlz4`` on clean exit; ``recovery.baklz4`` covers a
+    truncated file on filesystems without atomic rename.
+    """
+    existing: list[tuple[float, int, str, Path]] = []
+    for index, relpath in enumerate(_SESSIONSTORE_FILES):
+        candidate = profile / relpath
+        try:
+            if candidate.is_file():
+                existing.append(
+                    (candidate.stat().st_mtime, -index, relpath, candidate)
+                )
+        except OSError:
+            continue
+    existing.sort(reverse=True)
+
+    payload: Any = None
+    chosen: str | None = None
+    for _, _, relpath, candidate in existing:
+        try:
+            raw = candidate.read_bytes()
+            if raw.startswith(_MOZLZ4_MAGIC):
+                text = _decompress_mozlz4(raw).decode("utf-8", errors="replace")
+            else:
+                text = raw.decode("utf-8", errors="replace")
+            parsed = json.loads(text)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, Mapping):
+            payload = parsed
+            chosen = relpath
+            break
+
+    if payload is None:
+        return None, []
+
+    raw_entries: list[Mapping[str, Any]] = []
+    top_cookies = payload.get("cookies")
+    if isinstance(top_cookies, list):
+        raw_entries.extend(
+            item for item in top_cookies if isinstance(item, Mapping)
+        )
+    windows = payload.get("windows")
+    if isinstance(windows, list):
+        for window in windows:
+            if not isinstance(window, Mapping):
+                continue
+            win_cookies = window.get("cookies")
+            if isinstance(win_cookies, list):
+                raw_entries.extend(
+                    item for item in win_cookies if isinstance(item, Mapping)
+                )
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for entry in raw_entries:
+        host = str(entry.get("host") or "")
+        name = str(entry.get("name") or "")
+        value = entry.get("value")
+        if not host or not name or not isinstance(value, str):
+            continue
+        path = str(entry.get("path") or "/")
+        container = _format_origin_attributes(entry.get("originAttributes"))
+        key = (host, name, path, container)
+        if key in seen:
+            continue
+        seen.add(key)
+        raw_expiry = entry.get("expiry", 0)
+        if isinstance(raw_expiry, (int, float)) and raw_expiry >= _SESSIONSTORE_MAX_EXPIRY:
+            raw_expiry = 0
+        same_site = entry.get("sameSite", 0)
+        rows.append(
+            {
+                "host": host,
+                "name": name,
+                "value": value,
+                "path": path,
+                "expiry": raw_expiry,
+                "isSecure": bool(entry.get("secure", False)),
+                "isHttpOnly": bool(
+                    entry.get("httponly", entry.get("httpOnly", False))
+                ),
+                "sameSite": same_site if isinstance(same_site, int) else 0,
+                "originAttributes": container,
+            }
+        )
+    return chosen, rows
+
+
+def _normalize_rookiepy_records(
+    records: Any, domains: Sequence[str] | None = None
+) -> list[dict[str, Any]]:
     """Validate rookiepy's cookie list and drop unusable/expired entries."""
     normalized: list[dict[str, Any]] = []
     if not isinstance(records, (list, tuple)):
         return normalized
+    targets = _normalize_domains(domains) if domains is not None else None
     for record in records:
         if not isinstance(record, Mapping):
             continue
         name = record.get("name")
         value = record.get("value")
         if not isinstance(name, str) or not name or not isinstance(value, str):
+            continue
+        domain = str(record.get("domain") or "")
+        if targets is not None and domain and not _domain_matches(domain, targets):
             continue
         if _cookie_expired(record.get("expires")):
             continue
@@ -300,7 +531,7 @@ def _normalize_rookiepy_records(records: Any) -> list[dict[str, Any]]:
             {
                 "name": name,
                 "value": value,
-                "domain": str(record.get("domain") or ""),
+                "domain": domain,
                 "path": str(record.get("path") or "/"),
                 "expires": int(moment) if moment is not None else 0,
                 "secure": bool(record.get("secure")),
@@ -324,9 +555,12 @@ def cookies_from_rookiepy(records: Any) -> dict[str, str]:
 
 
 def _query_cookie_snapshot(
-    snapshot: Path, domains: Sequence[str]
+    snapshot: Path,
+    domains: Sequence[str],
+    sessionstore_rows: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
     connection = sqlite3.connect(str(snapshot))
     try:
         connection.row_factory = sqlite3.Row
@@ -348,15 +582,44 @@ def _query_cookie_snapshot(
                 moment = _expiry_seconds(row["expiry"])
                 if moment is not None and moment < now:
                     continue
+                host = str(row["host"])
+                path = str(row["path"])
+                seen_keys.add((host, str(name), path))
                 records.append(
                     {
                         "name": name,
                         "value": value,
-                        "domain": row["host"],
-                        "path": row["path"],
+                        "domain": host,
+                        "path": path,
                         "expires": int(moment) if moment is not None else 0,
                         "secure": bool(row["isSecure"]),
                         "http_only": bool(row["isHttpOnly"]),
+                    }
+                )
+            for item in sessionstore_rows:
+                host = str(item.get("host") or "")
+                if not _domain_matches(host, (domain,)):
+                    continue
+                name = str(item.get("name") or "")
+                value = item.get("value")
+                if not name or not isinstance(value, str):
+                    continue
+                path = str(item.get("path") or "/")
+                if (host, name, path) in seen_keys:
+                    continue
+                moment = _expiry_seconds(item.get("expiry"))
+                if moment is not None and moment < now:
+                    continue
+                seen_keys.add((host, name, path))
+                records.append(
+                    {
+                        "name": name,
+                        "value": value,
+                        "domain": host,
+                        "path": path,
+                        "expires": int(moment) if moment is not None else 0,
+                        "secure": bool(item.get("isSecure")),
+                        "http_only": bool(item.get("isHttpOnly")),
                     }
                 )
     finally:
@@ -364,19 +627,60 @@ def _query_cookie_snapshot(
     return records
 
 
+def _sessionstore_records_only(
+    sessionstore_rows: Sequence[Mapping[str, Any]], domains: Sequence[str]
+) -> list[dict[str, Any]]:
+    """Filter sessionstore cookie rows when ``cookies.sqlite`` is absent."""
+    records: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    now = time.time()
+    for domain in domains:
+        for item in sessionstore_rows:
+            host = str(item.get("host") or "")
+            if not _domain_matches(host, (domain,)):
+                continue
+            name = str(item.get("name") or "")
+            value = item.get("value")
+            if not name or not isinstance(value, str):
+                continue
+            path = str(item.get("path") or "/")
+            if (host, name, path) in seen_keys:
+                continue
+            moment = _expiry_seconds(item.get("expiry"))
+            if moment is not None and moment < now:
+                continue
+            seen_keys.add((host, name, path))
+            records.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": host,
+                    "path": path,
+                    "expires": int(moment) if moment is not None else 0,
+                    "secure": bool(item.get("isSecure")),
+                    "http_only": bool(item.get("isHttpOnly")),
+                }
+            )
+    return records
+
+
 def read_firefox_cookie_records(
     database: Path, domains: Sequence[str]
 ) -> list[dict[str, Any]]:
-    """Read full cookie records from a Firefox ``cookies.sqlite`` safely.
+    """Read full cookie records from a Firefox profile's ``cookies.sqlite``.
 
-    Firefox keeps the database in WAL mode and may hold it open while running.
-    The database and its ``-wal``/``-shm`` sidecars are copied to a private
-    temporary directory first, so SQLite reads a consistent snapshot without
-    contending for locks with a running browser. Cookie values in
-    ``cookies.sqlite`` are stored in plain text; no key material is needed.
+    Firefox keeps the database in WAL mode and may hold it open while running,
+    and keeps session cookies (those without ``Expires``/``Max-Age``) in
+    ``sessionstore-backups/recovery.jsonlz4`` instead of SQLite. The database
+    and its ``-wal``/``-shm`` sidecars are copied to a private temporary
+    directory first, so SQLite replays any uncheckpointed WAL writes without
+    contending for locks with a running browser, and sessionstore cookies from
+    the same profile directory are merged in. Cookie values are stored in plain
+    text; no key material is needed.
     """
     database = Path(database)
     targets = _normalize_domains(domains)
+    _, sessionstore_rows = _sessionstore_cookie_rows(database.parent)
     with tempfile.TemporaryDirectory(prefix="arena-api-firefox-") as temporary:
         snapshot = Path(temporary) / database.name
         shutil.copy2(database, snapshot)
@@ -386,7 +690,7 @@ def read_firefox_cookie_records(
                 shutil.copy2(
                     sidecar, snapshot.with_name(snapshot.name + suffix)
                 )
-        return _query_cookie_snapshot(snapshot, targets)
+        return _query_cookie_snapshot(snapshot, targets, sessionstore_rows)
 
 
 def read_firefox_cookies(database: Path, domains: Sequence[str]) -> dict[str, str]:
@@ -666,8 +970,19 @@ class FirefoxSessionManager:
             )
         return ordered
 
+    def _default_profile_candidates(self) -> list[Path]:
+        """Installation-ranked profiles across searched roots (ignoring ``profile_name``)."""
+        ordered: list[Path] = []
+        for root in self.profiles_roots():
+            if not root.is_dir():
+                continue
+            for candidate in self._root_candidates(root):
+                if candidate not in ordered:
+                    ordered.append(candidate)
+        return ordered
+
     def profile_cookie_count(self, profile: Path) -> int:
-        """Matching cookies stored by one profile (0 when unreadable/absent).
+        """Matching cookie names stored by one profile (0 when unreadable/absent).
 
         Permission to fail quietly is deliberate: this runs during discovery,
         where a locked or half-written database of *one* profile must not stop
@@ -680,9 +995,17 @@ class FirefoxSessionManager:
         count = 0
         if database.is_file():
             try:
-                count = len(read_firefox_cookie_records(database, self.domains))
+                count = len(read_firefox_cookies(database, self.domains))
             except (sqlite3.DatabaseError, OSError, ValueError):
                 count = 0
+        else:
+            _, session_rows = _sessionstore_cookie_rows(profile)
+            if session_rows:
+                count = len(
+                    _records_to_cookies(
+                        _sessionstore_records_only(session_rows, self.domains)
+                    )
+                )
         self._profile_counts[profile] = count
         return count
 
@@ -766,26 +1089,81 @@ class FirefoxSessionManager:
             grouped.setdefault(host, {})[record["name"]] = record["value"]
         return grouped
 
-    def _rookiepy_is_reading_the_selected_profile(self) -> bool:
-        """Whether ``rookiepy`` would open the very profile that was selected.
+    def _uses_injected_rookiepy(self) -> bool:
+        """Whether a test double was attached directly to this manager."""
+        return "_rookiepy_module" in self.__dict__
 
-        ``rookiepy.firefox()`` always opens the installation's *default*
-        profile. When discovery picked a different one -- a work profile, a
-        second ``about:profiles`` entry, a leftover install -- asking rookiepy
-        returns that other profile's cookies, which is worse than not asking:
-        the values look real and are simply the wrong session. In that case the
-        snapshot reader is used instead, because it reads the profile that was
-        chosen.
+    def _is_platform_root(self, root: Path) -> bool:
+        """Whether ``root`` is one of the standard OS locations rookiepy reads."""
+        platform_roots = (
+            default_profiles_root(),
+            *(Path(item).expanduser() for item in _platform_profile_roots()),
+        )
+        try:
+            target = root.expanduser().resolve()
+        except OSError:
+            target = root.expanduser()
+        for candidate in platform_roots:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = candidate
+            if target == resolved:
+                return True
+        return False
+
+    def _rookiepy_is_reading_the_selected_profile(self) -> bool:
+        """Whether ``rookiepy`` would open the exact profile and state we want.
+
+        ``rookiepy.firefox()`` has three hard limitations:
+
+        1. It ignores ``--profile-root`` / ``ARENA_FIREFOX_ROOT`` and searches
+           only the platform default directories.
+        2. It always opens the installation's *default* profile. When discovery
+           or ``--profile`` picked another one -- a work profile, a second
+           ``about:profiles`` entry, a leftover install -- asking rookiepy
+           returns that other profile's cookies.
+        3. It opens ``cookies.sqlite?mode=ro&immutable=1``, which causes SQLite
+           to ignore ``cookies.sqlite-wal``. While Firefox is running and has
+           uncheckpointed WAL writes (a fresh sign-in or page refresh), rookiepy
+           reads stale pre-WAL rows.
+
+        Whenever any of those applies, our snapshot + sessionstore reader is
+        used directly so the chosen profile and its live WAL are read.
         """
         if self.cookie_database is not None:
             return False
+        injected = self._uses_injected_rookiepy()
+        if (
+            not injected
+            and self.profiles_root is not None
+            and not self._is_platform_root(self.profiles_root)
+        ):
+            return False
         try:
-            candidates = self.profile_candidates()
+            default_candidates = self._default_profile_candidates()
             selected = self.profile_path()
         except (FirefoxSessionError, OSError):
+            if self.profiles_root is not None or self.profile_name is not None:
+                return False
             # Nothing to compare against: let rookiepy have its usual turn.
             return True
-        return bool(candidates) and selected == candidates[0]
+        if not default_candidates:
+            return False
+        try:
+            same_profile = selected.resolve() == default_candidates[0].resolve()
+        except OSError:
+            same_profile = selected == default_candidates[0]
+        if not same_profile:
+            return False
+        if not injected:
+            wal = selected / "cookies.sqlite-wal"
+            try:
+                if wal.is_file() and wal.stat().st_size > 0:
+                    return False
+            except OSError:
+                pass
+        return True
 
     def _session_records(
         self, domains: Sequence[str] | None = None
@@ -833,15 +1211,16 @@ class FirefoxSessionManager:
             try:
                 records = rookiepy.firefox(domains=list(domains))
             except Exception as exc:  # rookiepy surfaces plain runtime errors
+                headline = (str(exc).strip().splitlines() or [str(exc)])[0]
                 if _looks_locked(exc) and attempt + 1 < self.max_cookie_attempts:
                     warnings.append(
-                        f"rookiepy hit a locked cookie store ({exc}); retrying"
+                        f"rookiepy hit a locked cookie store ({headline}); retrying"
                     )
                     time.sleep(self.lock_retry_delay * (attempt + 1))
                     continue
-                warnings.append(f"rookiepy failed: {type(exc).__name__}: {exc}")
+                warnings.append(f"rookiepy failed: {type(exc).__name__}: {headline}")
                 return None
-            normalized = _normalize_rookiepy_records(records)
+            normalized = _normalize_rookiepy_records(records, domains=domains)
             if normalized:
                 return normalized
             warnings.append(
@@ -856,6 +1235,15 @@ class FirefoxSessionManager:
         try:
             database = self.cookie_database_path()
         except FirefoxSessionError as exc:
+            if self.cookie_database is None:
+                try:
+                    profile = self.profile_path()
+                except FirefoxSessionError:
+                    profile = None
+                if profile is not None:
+                    _, session_rows = _sessionstore_cookie_rows(profile)
+                    if session_rows:
+                        return _sessionstore_records_only(session_rows, domains)
             warnings.append(str(exc))
             return None
         last_error: Exception | None = None

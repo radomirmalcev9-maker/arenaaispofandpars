@@ -459,7 +459,10 @@ def test_flat_records_survives_an_unexpected_shape() -> None:
     assert _flat_records(None) == {}
 
 
-def test_discovery_reports_every_source_it_considered(tmp_path) -> None:
+def test_discovery_reports_every_source_it_considered(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(auto_module, "_rookiepy_module", lambda: None)
     options = isolated_options(
         tmp_path, use_browser_profiles=True, profiles_root=make_firefox_profile(tmp_path)
     )
@@ -471,6 +474,9 @@ def test_discovery_reports_every_source_it_considered(tmp_path) -> None:
     assert "default-release" in joined
     assert "other browsers" in joined
     assert "rookiepy not installed" in joined
+
+    monkeypatch.setattr(auto_module, "_rookiepy_module", lambda: object())
+    assert "rookiepy available" in "\n".join(explain_sources(options))
 
 
 def test_discovery_reports_a_firefox_profile_it_cannot_use(tmp_path) -> None:

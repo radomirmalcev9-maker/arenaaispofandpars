@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
 import time
 from pathlib import Path
 
@@ -240,3 +241,105 @@ def test_a_cookie_fingerprint_describes_instead_of_revealing() -> None:
     assert "sha256=deadbeef" in described
     assert described.startswith("*")
     assert fingerprint.as_dict()["expires"].endswith("Z")
+
+
+def _mozlz4_literal(raw: bytes) -> bytes:
+    out = bytearray(b"mozLz40\x00" + struct.pack("<I", len(raw)))
+    if len(raw) < 15:
+        out.append(len(raw) << 4)
+    else:
+        out.append(15 << 4)
+        rem = len(raw) - 15
+        while rem >= 255:
+            out.append(255)
+            rem -= 255
+        out.append(rem)
+    out.extend(raw)
+    return bytes(out)
+
+
+def test_modern_firefox_millisecond_expiry_and_sessionstore_agree(
+    root: Path, monkeypatch
+) -> None:
+    """Reproduces the Firefox 136+ WAL + recovery.jsonlz4 --diagnose report.
+
+    12 persistent cookies with millisecond ``moz_cookies.expiry`` plus 3
+    session cookies in ``recovery.jsonlz4`` used to be reported as ``0 matching
+    (12 expired skipped)`` alongside a contradictory ``3 name(s)`` and a fake
+    ``! session read successfully`` warning.
+    """
+    monkeypatch.setattr(firefox_module, "default_profiles_root", lambda: root)
+    monkeypatch.setattr(firefox_module, "_platform_profile_roots", lambda: ())
+    (root / "profiles.ini").write_text(
+        "[Install4F96]\nDefault=Profiles/ixikld92.default-release\n",
+        encoding="utf-8",
+    )
+    future_ms = FUTURE * 1_000
+    persistent_names = [
+        "arena-auth-prod-v1.0",
+        "arena-auth-prod-v1.1",
+        "cf_clearance",
+        "__cf_bm",
+        "_cfuvid",
+        "arena_ab_seed",
+        "arena_theme",
+        "arena_consent",
+        "arena_locale",
+        "arena_tz",
+        "lm_session",
+        "lm_pref",
+    ]
+    profile = make_profile(
+        root / "Profiles" / "ixikld92.default-release",
+        [
+            (name, f"{SECRET}-{index}", ".arena.ai", future_ms)
+            for index, name in enumerate(persistent_names)
+        ],
+    )
+    assert len(persistent_names) == 12
+    backups = profile / "sessionstore-backups"
+    backups.mkdir()
+    session_cookies = {
+        "cookies": [
+            {"host": "arena.ai", "name": "_vcrr_ec68a2456e920849", "value": SECRET + "-vc", "path": "/"},
+            {"host": "arena.ai", "name": "arena_build_bucket", "value": SECRET + "-bb", "path": "/"},
+            {"host": "arena.ai", "name": "user_country_code", "value": "SE", "path": "/"},
+        ]
+    }
+    (backups / "recovery.jsonlz4").write_bytes(
+        _mozlz4_literal(json.dumps(session_cookies).encode("utf-8"))
+    )
+
+    report = collect_firefox_report(profile_name=str(profile))
+    rendered = "\n".join(format_firefox_report(report))
+    assert SECRET not in rendered
+    assert SECRET not in report_as_json(report)
+    assert report["profiles"][0]["matching"] == 15
+    assert report["profiles"][0]["expired_matching"] == 0
+    assert report["profiles"][0]["sessionstore"]["matching"] == 3
+    assert report["cookies"]["count"] == 15
+    assert "holds the session" in report["selected"]["reason"]
+    assert report["warnings"] == []
+    assert "none -- the session was found and read" in rendered
+    assert "session read successfully" not in rendered
+
+
+def test_far_future_expiry_formats_without_platform_gmtime_limits() -> None:
+    """Windows ``fromtimestamp`` fails past year 3000; pure-Python UTC must not."""
+    fingerprint = CookieFingerprint(
+        host=".arena.ai",
+        name="session",
+        path="/",
+        expires=253_402_300_799,
+        secure=True,
+        http_only=True,
+        same_site="lax",
+        container="",
+        value_length=8,
+        value_sha256="12345678",
+        shape="short",
+        looks_like_auth=True,
+    )
+    assert fingerprint.as_dict()["expires"] == "9999-12-31T23:59:59Z"
+    assert "expiry=9999-12-31" in fingerprint.describe()
+

@@ -11,7 +11,9 @@ wins -- without disturbing the older preference order when nothing has content.
 from __future__ import annotations
 
 import io
+import json
 import sqlite3
+import struct
 import time
 from pathlib import Path
 
@@ -22,6 +24,8 @@ from arena_api.auth.firefox_session import (
     FIREFOX_ROOT_ENV,
     FirefoxSessionError,
     FirefoxSessionManager,
+    _decompress_mozlz4,
+    _normalize_rookiepy_records,
     firefox_profiles_roots,
 )
 
@@ -354,3 +358,253 @@ def test_expired_cookies_do_not_make_a_profile_the_source(tmp_path) -> None:
     manager = FirefoxSessionManager(profiles_root=root, interactive=False)
     manager._rookiepy_module = lambda: None
     assert manager.profile_path() == live
+
+
+def test_millisecond_expiry_in_modern_firefox_is_understood(tmp_path) -> None:
+    """Firefox 136+ (schema >= 16) stores ``moz_cookies.expiry`` in milliseconds.
+
+    Dividing milliseconds (~1.8e12) by 1_000_000 instead of 1_000 turns every
+    live cookie into January 1970 (~1.8e6 s), making both SQLite and rookiepy
+    drop the entire session as expired.
+    """
+    root = make_tree(tmp_path)
+    make_profile(
+        root / "Profiles" / "aaa.default-release",
+        [
+            ("arena-auth-prod-v1.0", "live-ms", ".arena.ai", FUTURE * 1_000),
+            ("expired-ms", "dead-ms", ".arena.ai", PAST * 1_000),
+            ("immortal-s", "year-9999", ".arena.ai", 253_402_300_799),
+            ("nano", "live-ns", ".arena.ai", FUTURE * 1_000_000_000),
+        ],
+    )
+    manager = FirefoxSessionManager(
+        profiles_root=root, interactive=False, max_cookie_attempts=1
+    )
+    manager._rookiepy_module = lambda: None
+    assert manager.profile_cookie_count(manager.profile_path()) == 3
+    assert manager.load_cookies() == {
+        "arena-auth-prod-v1.0": "live-ms",
+        "immortal-s": "year-9999",
+        "nano": "live-ns",
+    }
+    records = {record["name"]: record for record in manager.cookie_records()}
+    assert records["arena-auth-prod-v1.0"]["expires"] == pytest.approx(FUTURE, abs=2)
+    assert records["immortal-s"]["expires"] == 253_402_300_799
+    assert records["nano"]["expires"] == pytest.approx(FUTURE, abs=2)
+
+    # rookiepy hands back moz_cookies.expiry untouched (milliseconds on FF 136+).
+    from_rk = _normalize_rookiepy_records(
+        [
+            {
+                "name": "arena-auth-prod-v1.0",
+                "value": "via-rk",
+                "domain": ".arena.ai",
+                "expires": FUTURE * 1_000,
+            },
+            {
+                "name": "stale",
+                "value": "dead",
+                "domain": ".arena.ai",
+                "expires": PAST * 1_000,
+            },
+            {
+                "name": "spoof",
+                "value": "bad",
+                "domain": "notarena.ai",
+                "expires": FUTURE * 1_000,
+            },
+        ],
+        domains=("arena.ai",),
+    )
+    assert [item["name"] for item in from_rk] == ["arena-auth-prod-v1.0"]
+    assert from_rk[0]["expires"] == pytest.approx(FUTURE, abs=2)
+
+
+# --------------------------------------------------------------------------- #
+# rookiepy profile pinning & live WAL protection
+# --------------------------------------------------------------------------- #
+
+
+def test_explicit_non_default_profile_bypasses_rookiepy(tmp_path) -> None:
+    """``--profile bbb.work`` must not let rookiepy read ``aaa.default-release``."""
+    root = make_tree(tmp_path)
+    make_profile(
+        root / "Profiles" / "aaa.default-release",
+        [("session", "wrong-default", ".arena.ai", FUTURE * 1_000)],
+    )
+    make_profile(
+        root / "Profiles" / "bbb.work",
+        [("session", "wanted-work", ".arena.ai", FUTURE * 1_000)],
+    )
+    (root / "profiles.ini").write_text(
+        "[Install4F96]\nDefault=Profiles/aaa.default-release\n", encoding="utf-8"
+    )
+    calls: list[list[str]] = []
+
+    def firefox(domains):
+        calls.append(list(domains))
+        return [{"name": "session", "value": "wrong-default", "domain": ".arena.ai"}]
+
+    manager = FirefoxSessionManager(
+        profiles_root=root,
+        profile_name="bbb.work",
+        interactive=False,
+        max_cookie_attempts=1,
+    )
+    manager._rookiepy_module = lambda: type("M", (), {"firefox": staticmethod(firefox)})()
+    assert manager.load_cookies() == {"session": "wanted-work"}
+    assert calls == []
+
+
+def test_uncheckpointed_wal_bypasses_real_rookiepy(tmp_path, monkeypatch) -> None:
+    """``rookiepy`` opens SQLite with ``immutable=1``, which ignores ``-wal``."""
+    root = make_tree(tmp_path)
+    profile = root / "Profiles" / "aaa.default-release"
+    profile.mkdir(parents=True)
+    (root / "profiles.ini").write_text(
+        "[Install4F96]\nDefault=Profiles/aaa.default-release\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(firefox_module, "default_profiles_root", lambda: root)
+    monkeypatch.setattr(firefox_module, "_platform_profile_roots", lambda: ())
+
+    conn = sqlite3.connect(profile / "cookies.sqlite")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(SCHEMA)
+    conn.execute(
+        "INSERT INTO moz_cookies (name, value, host, expiry, lastAccessed, creationTime, isSecure, isHttpOnly)"
+        " VALUES ('old', 'stale', '.arena.ai', ?, 0, 0, 1, 1)",
+        (FUTURE * 1_000,),
+    )
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    # Keep connection open so the fresh sign-in lives only in cookies.sqlite-wal.
+    conn.execute(
+        "INSERT INTO moz_cookies (name, value, host, expiry, lastAccessed, creationTime, isSecure, isHttpOnly)"
+        " VALUES ('arena-auth-prod-v1.0', 'fresh-in-wal', '.arena.ai', ?, 0, 0, 1, 1)",
+        (FUTURE * 1_000,),
+    )
+    conn.commit()
+    try:
+        assert (profile / "cookies.sqlite-wal").stat().st_size > 0
+        manager = FirefoxSessionManager(interactive=False, max_cookie_attempts=1)
+        assert not manager._rookiepy_is_reading_the_selected_profile()
+        cookies = manager.load_cookies()
+        assert cookies["arena-auth-prod-v1.0"] == "fresh-in-wal"
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Session cookies in recovery.jsonlz4 / sessionstore
+# --------------------------------------------------------------------------- #
+
+
+def _mozlz4_compress(raw: bytes) -> bytes:
+    """Minimal LZ4 block encoder (literals + matches) for testing mozLz40."""
+    n = len(raw)
+    out = bytearray(b"mozLz40\x00" + struct.pack("<I", n))
+    pos = 0
+    anchor = 0
+    seen: dict[bytes, int] = {}
+    while pos + 4 <= n - 5:
+        key = raw[pos : pos + 4]
+        prev = seen.get(key)
+        seen[key] = pos
+        if prev is not None and 0 < pos - prev <= 65535:
+            mlen = 4
+            while pos + mlen < n - 5 and raw[prev + mlen] == raw[pos + mlen]:
+                mlen += 1
+            lit = raw[anchor:pos]
+            llen = len(lit)
+            m_extra = mlen - 4
+            out.append((min(llen, 15) << 4) | min(m_extra, 15))
+            if llen >= 15:
+                rem = llen - 15
+                while rem >= 255:
+                    out.append(255)
+                    rem -= 255
+                out.append(rem)
+            out.extend(lit)
+            out.extend(struct.pack("<H", pos - prev))
+            if m_extra >= 15:
+                rem = m_extra - 15
+                while rem >= 255:
+                    out.append(255)
+                    rem -= 255
+                out.append(rem)
+            pos += mlen
+            anchor = pos
+        else:
+            pos += 1
+    lit = raw[anchor:]
+    llen = len(lit)
+    out.append(min(llen, 15) << 4)
+    if llen >= 15:
+        rem = llen - 15
+        while rem >= 255:
+            out.append(255)
+            rem -= 255
+        out.append(rem)
+    out.extend(lit)
+    return bytes(out)
+
+
+def test_mozlz4_decompresses_overlapping_and_rejects_corrupt_blocks() -> None:
+    payload = (b'{"cookies": [' + b'"repeated-value-1234567890", ' * 30 + b"]}")
+    compressed = _mozlz4_compress(payload)
+    assert len(compressed) < len(payload)
+    assert _decompress_mozlz4(compressed) == payload
+
+    with pytest.raises(ValueError):
+        _decompress_mozlz4(b"not-mozlz4")
+    with pytest.raises(ValueError):
+        _decompress_mozlz4(b"mozLz40\x00" + struct.pack("<I", 10) + b"\x10a")
+
+
+def test_sessionstore_recovery_jsonlz4_and_backup_are_merged(tmp_path) -> None:
+    root = make_tree(tmp_path)
+    profile = make_profile(
+        root / "Profiles" / "aaa.default-release",
+        [("arena-auth-prod-v1.0", "persistent", ".arena.ai", FUTURE * 1_000)],
+    )
+    backups = profile / "sessionstore-backups"
+    backups.mkdir()
+    # Corrupt primary recovery.jsonlz4 falls back cleanly to recovery.baklz4.
+    (backups / "recovery.jsonlz4").write_bytes(b"mozLz40\x00corrupt")
+    session_payload = {
+        "cookies": [
+            {
+                "host": "arena.ai",
+                "name": "_vcrr_ec68a2456e920849",
+                "value": "vercel-route",
+                "path": "/",
+            },
+            {
+                "host": "arena.ai",
+                "name": "arena_build_bucket",
+                "value": "bucket-a",
+                "path": "/",
+            },
+            {
+                "host": "other.example",
+                "name": "ignored",
+                "value": "x",
+                "path": "/",
+            },
+        ]
+    }
+    (backups / "recovery.baklz4").write_bytes(
+        _mozlz4_compress(json.dumps(session_payload).encode("utf-8"))
+    )
+
+    manager = FirefoxSessionManager(
+        profiles_root=root, interactive=False, max_cookie_attempts=1
+    )
+    manager._rookiepy_module = lambda: None
+    assert manager.profile_cookie_count(profile) == 3
+    assert manager.load_cookies() == {
+        "arena-auth-prod-v1.0": "persistent",
+        "_vcrr_ec68a2456e920849": "vercel-route",
+        "arena_build_bucket": "bucket-a",
+    }
+
