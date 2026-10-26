@@ -3656,7 +3656,8 @@ def test_seed_direct_context_cookies_preserves_existing_trust_cookies() -> None:
 def test_live_browser_runs_invisible_by_default_and_honours_show_browser(
     tmp_path, monkeypatch
 ) -> None:
-    seen_calls: list[tuple[bool, bool, object]] = []
+    seen_calls: list[tuple[bool, bool, bool, object]] = []
+    fail_display = False
 
     monkeypatch.setattr(
         auto_module, "BrowserEnvironment", auto_module._DEFAULT_BROWSER_ENVIRONMENT
@@ -3678,22 +3679,16 @@ def test_live_browser_runs_invisible_by_default_and_honours_show_browser(
         generation_params=None,
         follow_up=False,
         user_data_dir=None,
+        hide_window=False,
     ):
-        seen_calls.append((headless, allow_headed_retry, user_data_dir))
-        if not headless:
+        seen_calls.append((headless, hide_window, allow_headed_retry, user_data_dir))
+        if not headless and fail_display:
             raise RuntimeError("Missing X server or $DISPLAY")
 
         async def _chunks():
             yield b'a0:"ok"\nad:{"finishReason":"stop"}\n'
 
         yield ("text/plain", _chunks())
-
-    # 1) Default (show_browser=False): runs 100% invisibly (headless=True, allow_headed_retry=False).
-    tok_invisible = DirectVerificationToken(
-        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
-        solver=RecaptchaToolkitSolver(),
-    )
-    monkeypatch.setattr(tok_invisible, "_attempt_browser_evaluation", fake_attempt)
 
     async def _run(tok: DirectVerificationToken) -> bytes:
         out = bytearray()
@@ -3706,12 +3701,28 @@ def test_live_browser_runs_invisible_by_default_and_honours_show_browser(
                 out.extend(part)
         return bytes(out)
 
+    # 1) Default (show_browser=False) on desktop: cloaked headful (headless=False, hide_window=True).
+    tok_invisible = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=RecaptchaToolkitSolver(),
+    )
+    monkeypatch.setattr(tok_invisible, "_attempt_browser_evaluation", fake_attempt)
     assert b'a0:"ok"' in asyncio.run(_run(tok_invisible))
     expected_profile = auto_module._direct_browser_profile_dir(tok_invisible.options)
-    assert seen_calls == [(True, False, expected_profile)]
+    assert seen_calls == [(False, True, False, expected_profile)]
 
-    # 2) Explicit --show-browser (show_browser=True): tries headed first, falls back to headless if no display.
+    # 2) Default (show_browser=False) on display-less server: falls back cleanly to headless=True.
     seen_calls.clear()
+    fail_display = True
+    assert b'a0:"ok"' in asyncio.run(_run(tok_invisible))
+    assert seen_calls == [
+        (False, True, False, expected_profile),
+        (True, False, False, expected_profile),
+    ]
+
+    # 3) Explicit --show-browser (show_browser=True): hide_window=False.
+    seen_calls.clear()
+    fail_display = False
     tok_visible = DirectVerificationToken(
         isolated_options(
             tmp_path,
@@ -3723,10 +3734,7 @@ def test_live_browser_runs_invisible_by_default_and_honours_show_browser(
     )
     monkeypatch.setattr(tok_visible, "_attempt_browser_evaluation", fake_attempt)
     assert b'a0:"ok"' in asyncio.run(_run(tok_visible))
-    assert seen_calls == [
-        (False, False, expected_profile),
-        (True, False, expected_profile),
-    ]
+    assert seen_calls == [(False, False, False, expected_profile)]
 
 
 def test_post_submit_bframe_autosolves_without_playwright_recaptcha_or_ffmpeg_and_replays_v2_token(
@@ -4142,6 +4150,79 @@ def test_headless_cdp_sanitizes_headless_chrome_ua_and_client_hints() -> None:
     assert meta["platform"] == "Windows"
     assert any(b["brand"] == "Microsoft Edge" for b in meta["brands"])
     assert all("Headless" not in b["brand"] for b in meta["brands"])
+
+
+def test_cloaked_headful_profile_placement_and_cookie_reset(tmp_path) -> None:
+    profile_dir = tmp_path / "direct_browser_profile"
+    auto_module._prepare_profile_window_placement(profile_dir, hidden=True)
+    prefs_path = profile_dir / "Default" / "Preferences"
+    prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+    assert prefs["browser"]["window_placement"]["left"] == -32000
+    assert prefs["browser"]["window_placement"]["maximized"] is False
+
+    auto_module._prepare_profile_window_placement(profile_dir, hidden=False)
+    prefs_visible = json.loads(prefs_path.read_text(encoding="utf-8"))
+    assert prefs_visible["browser"]["window_placement"]["left"] == 80
+
+    cleared_patterns: list[object] = []
+
+    class FakeContext:
+        async def clear_cookies(self, *, name=None, domain=None, path=None):
+            cleared_patterns.append(name)
+
+    asyncio.run(
+        auto_module._maybe_reset_headless_poisoned_cookies(FakeContext(), profile_dir)
+    )
+    assert len(cleared_patterns) == 1
+    assert (profile_dir / ".headful_cloaked_v1").is_file()
+    # Second call is a no-op once migrated:
+    asyncio.run(
+        auto_module._maybe_reset_headless_poisoned_cookies(FakeContext(), profile_dir)
+    )
+    assert len(cleared_patterns) == 1
+
+
+def test_hide_headed_page_window_cdp_moves_bounds_offscreen() -> None:
+    sent: list[tuple[str, object]] = []
+    detached: list[bool] = []
+
+    class FakeCDPSession:
+        async def send(self, method: str, params: object = None):
+            sent.append((method, params))
+            if method == "Browser.getWindowForTarget":
+                return {"windowId": 42}
+            return {}
+
+        async def detach(self) -> None:
+            detached.append(True)
+
+    class FakeContext:
+        async def new_cdp_session(self, page):
+            return FakeCDPSession()
+
+    asyncio.run(auto_module._hide_headed_page_window_cdp(FakeContext(), object()))
+    assert detached == [True]
+    bounds_calls = [p for m, p in sent if m == "Browser.setWindowBounds"]
+    assert any(
+        isinstance(c, dict)
+        and isinstance(c.get("bounds"), dict)
+        and c["bounds"].get("left") == -32000
+        for c in bounds_calls
+    )
+
+
+def test_windows_descendant_pids_and_cloaker_smoke() -> None:
+    pids = auto_module._windows_descendant_pids(os.getpid())
+    if sys.platform == "win32":
+        assert os.getpid() in pids
+    else:
+        assert pids == set()
+
+    cloaker = auto_module._WindowsBrowserCloaker(enabled=True)
+    cloaker.start()
+    cloaker._cloak_once()
+    cloaker.stop()
+
 
 
 

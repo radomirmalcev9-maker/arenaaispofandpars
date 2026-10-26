@@ -1846,6 +1846,474 @@ async def _sanitize_headless_page_cdp(
         return None
 
 
+_OFFSCREEN_HEADFUL_SWITCHES: tuple[str, ...] = (
+    "--window-position=-32000,-32000",
+    "--window-size=1480,960",
+    "--disable-features=CalculateNativeWinOcclusion",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+)
+
+
+def _prepare_profile_window_placement(
+    profile_dir: str | Path | None, *, hidden: bool
+) -> None:
+    """Ensure saved Chromium ``window_placement`` matches ``hidden`` vs visible mode."""
+    if profile_dir is None:
+        return
+    try:
+        default_dir = Path(profile_dir).expanduser() / "Default"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        prefs_file = default_dir / "Preferences"
+        prefs: dict[str, Any] = {}
+        if prefs_file.is_file():
+            try:
+                loaded = json.loads(prefs_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    prefs = loaded
+            except Exception:  # noqa: BLE001
+                return
+        browser_cfg = prefs.get("browser")
+        if not isinstance(browser_cfg, dict):
+            browser_cfg = {}
+            prefs["browser"] = browser_cfg
+        placement = browser_cfg.get("window_placement")
+        if not isinstance(placement, dict):
+            placement = {}
+        changed = False
+        if hidden:
+            target = {
+                "bottom": -31040,
+                "left": -32000,
+                "maximized": False,
+                "right": -30520,
+                "top": -32000,
+                "work_area_bottom": 1040,
+                "work_area_left": 0,
+                "work_area_right": 1920,
+                "work_area_top": 0,
+            }
+            if any(placement.get(k) != v for k, v in target.items()):
+                placement.update(target)
+                browser_cfg["window_placement"] = placement
+                changed = True
+        else:
+            left_val = placement.get("left")
+            if isinstance(left_val, (int, float)) and left_val <= -10000:
+                placement.update(
+                    {
+                        "bottom": 980,
+                        "left": 80,
+                        "maximized": False,
+                        "right": 1520,
+                        "top": 80,
+                    }
+                )
+                browser_cfg["window_placement"] = placement
+                changed = True
+        if changed:
+            prefs_file.write_text(
+                json.dumps(prefs, separators=(",", ":")), encoding="utf-8"
+            )
+    except Exception:  # noqa: BLE001
+        return
+
+
+async def _maybe_reset_headless_poisoned_cookies(
+    context: Any, profile_dir: str | Path | None
+) -> None:
+    """Clear stale headless-flagged ``_GRECAPTCHA`` once when migrating to cloaked headful."""
+    if context is None or profile_dir is None:
+        return
+    try:
+        marker = Path(profile_dir).expanduser() / ".headful_cloaked_v1"
+        if marker.exists():
+            return
+        clear_fn = getattr(context, "clear_cookies", None)
+        if callable(clear_fn):
+            await clear_fn(name=re.compile(r"^_GRECAPTCHA"))
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("1\n", encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return
+
+
+async def _hide_headed_page_window_cdp(context: Any, page: Any) -> None:
+    """Move a headful browser window off-screen via CDP without minimizing or occluding."""
+    if context is None:
+        return
+    new_cdp = getattr(context, "new_cdp_session", None)
+    if not callable(new_cdp):
+        return
+    cdp: Any = None
+    try:
+        cdp = await new_cdp(page)
+        win_info = await cdp.send("Browser.getWindowForTarget")
+        if isinstance(win_info, Mapping) and win_info.get("windowId") is not None:
+            win_id = win_info["windowId"]
+            try:
+                await cdp.send(
+                    "Browser.setWindowBounds",
+                    {"windowId": win_id, "bounds": {"windowState": "normal"}},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            await cdp.send(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": win_id,
+                    "bounds": {
+                        "left": -32000,
+                        "top": -32000,
+                        "width": 1480,
+                        "height": 960,
+                    },
+                },
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _windows_descendant_pids(root_pid: int) -> set[int]:
+    """Return ``root_pid`` and all transitive child PIDs on Windows via Toolhelp32."""
+    if sys.platform != "win32":
+        return set()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
+        CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+
+        Process32FirstW = kernel32.Process32FirstW
+        Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        Process32FirstW.restype = wintypes.BOOL
+
+        Process32NextW = kernel32.Process32NextW
+        Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        Process32NextW.restype = wintypes.BOOL
+
+        CloseHandle = kernel32.CloseHandle
+        CloseHandle.argtypes = [wintypes.HANDLE]
+        CloseHandle.restype = wintypes.BOOL
+
+        snap = CreateToolhelp32Snapshot(0x00000002, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not snap or snap == invalid_handle:
+            return {root_pid}
+        children_by_parent: dict[int, list[int]] = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                pid = int(entry.th32ProcessID)
+                ppid = int(entry.th32ParentProcessID)
+                children_by_parent.setdefault(ppid, []).append(pid)
+                ok = Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            CloseHandle(snap)
+
+        descendants: set[int] = {root_pid}
+        stack = [root_pid]
+        while stack:
+            cur = stack.pop()
+            for child in children_by_parent.get(cur, ()):
+                if child not in descendants:
+                    descendants.add(child)
+                    stack.append(child)
+        return descendants
+    except Exception:  # noqa: BLE001
+        return {root_pid}
+
+
+class _WindowsBrowserCloaker:
+    """Cloak newly spawned Chromium windows on Windows (no taskbar/Alt-Tab/focus)."""
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self._enabled = bool(enabled) and sys.platform == "win32"
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._root_pid = os.getpid()
+        self._preexisting_hwnds: set[int] = set()
+        self._prior_fg_hwnd: int = 0
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        self._preexisting_hwnds = self._enum_all_hwnds()
+        self._prior_fg_hwnd = self._get_foreground_hwnd()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="arena-win32-window-cloaker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    @staticmethod
+    def _get_foreground_hwnd() -> int:
+        if sys.platform != "win32":
+            return 0
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            GetForegroundWindow = user32.GetForegroundWindow
+            GetForegroundWindow.argtypes = []
+            GetForegroundWindow.restype = wintypes.HWND
+            return int(GetForegroundWindow() or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    @staticmethod
+    def _enum_all_hwnds() -> set[int]:
+        if sys.platform != "win32":
+            return set()
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            WNDENUMPROC = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+            )
+            EnumWindows = user32.EnumWindows
+            EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+            EnumWindows.restype = wintypes.BOOL
+
+            found: set[int] = set()
+
+            @WNDENUMPROC
+            def _cb(hwnd: Any, lparam: Any) -> bool:
+                if hwnd:
+                    found.add(int(hwnd))
+                return True
+
+            EnumWindows(_cb, 0)
+            return found
+        except Exception:  # noqa: BLE001
+            return set()
+
+    def _cloak_once(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            WNDENUMPROC = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+            )
+            EnumWindows = user32.EnumWindows
+            EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+            EnumWindows.restype = wintypes.BOOL
+
+            IsWindow = user32.IsWindow
+            IsWindow.argtypes = [wintypes.HWND]
+            IsWindow.restype = wintypes.BOOL
+
+            IsWindowVisible = user32.IsWindowVisible
+            IsWindowVisible.argtypes = [wintypes.HWND]
+            IsWindowVisible.restype = wintypes.BOOL
+
+            IsIconic = user32.IsIconic
+            IsIconic.argtypes = [wintypes.HWND]
+            IsIconic.restype = wintypes.BOOL
+
+            IsZoomed = user32.IsZoomed
+            IsZoomed.argtypes = [wintypes.HWND]
+            IsZoomed.restype = wintypes.BOOL
+
+            ShowWindow = user32.ShowWindow
+            ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            ShowWindow.restype = wintypes.BOOL
+
+            GetClassNameW = user32.GetClassNameW
+            GetClassNameW.argtypes = [
+                wintypes.HWND,
+                wintypes.LPWSTR,
+                ctypes.c_int,
+            ]
+            GetClassNameW.restype = ctypes.c_int
+
+            GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+            GetWindowThreadProcessId.argtypes = [
+                wintypes.HWND,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            GetWindowThreadProcessId.restype = wintypes.DWORD
+
+            GetWindowRect = user32.GetWindowRect
+            GetWindowRect.argtypes = [
+                wintypes.HWND,
+                ctypes.POINTER(wintypes.RECT),
+            ]
+            GetWindowRect.restype = wintypes.BOOL
+
+            GetForegroundWindow = user32.GetForegroundWindow
+            GetForegroundWindow.argtypes = []
+            GetForegroundWindow.restype = wintypes.HWND
+
+            SetForegroundWindow = user32.SetForegroundWindow
+            SetForegroundWindow.argtypes = [wintypes.HWND]
+            SetForegroundWindow.restype = wintypes.BOOL
+
+            long_ptr_t: Any = ctypes.c_ssize_t
+            if hasattr(user32, "GetWindowLongPtrW") and hasattr(
+                user32, "SetWindowLongPtrW"
+            ):
+                GetWindowLongPtr = user32.GetWindowLongPtrW
+                SetWindowLongPtr = user32.SetWindowLongPtrW
+            else:
+                GetWindowLongPtr = user32.GetWindowLongW
+                SetWindowLongPtr = user32.SetWindowLongW
+                long_ptr_t = ctypes.c_long
+
+            GetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int]
+            GetWindowLongPtr.restype = long_ptr_t
+            SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr_t]
+            SetWindowLongPtr.restype = long_ptr_t
+
+            SetWindowPos = user32.SetWindowPos
+            SetWindowPos.argtypes = [
+                wintypes.HWND,
+                wintypes.HWND,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            SetWindowPos.restype = wintypes.BOOL
+
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_NOACTIVATE = 0x08000000
+            SW_SHOWNOACTIVATE = 4
+            SWP_NOSIZE = 0x0001
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            SWP_NOOWNERZORDER = 0x0200
+            HWND_BOTTOM = wintypes.HWND(1)
+
+            descendants = _windows_descendant_pids(self._root_pid)
+            preexisting = self._preexisting_hwnds
+            prior_fg = self._prior_fg_hwnd
+
+            @WNDENUMPROC
+            def _cb(hwnd: Any, lparam: Any) -> bool:
+                try:
+                    hwnd_int = int(hwnd or 0)
+                    if not hwnd_int or hwnd_int in preexisting:
+                        return True
+                    if not IsWindowVisible(hwnd):
+                        return True
+                    cls_buf = ctypes.create_unicode_buffer(64)
+                    if GetClassNameW(hwnd, cls_buf, 64) <= 0:
+                        return True
+                    if not cls_buf.value.startswith("Chrome_WidgetWin_"):
+                        return True
+
+                    pid_val = wintypes.DWORD(0)
+                    GetWindowThreadProcessId(hwnd, ctypes.byref(pid_val))
+                    rect = wintypes.RECT()
+                    has_rect = bool(GetWindowRect(hwnd, ctypes.byref(rect)))
+                    born_offscreen = (
+                        has_rect
+                        and not IsIconic(hwnd)
+                        and rect.left <= -25000
+                        and rect.top <= -25000
+                    )
+                    if int(pid_val.value) not in descendants and not born_offscreen:
+                        return True
+
+                    cur_ex = int(GetWindowLongPtr(hwnd, GWL_EXSTYLE) or 0)
+                    desired_ex = (
+                        cur_ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+                    ) & ~WS_EX_APPWINDOW
+                    style_changed = desired_ex != cur_ex
+                    if style_changed:
+                        SetWindowLongPtr(hwnd, GWL_EXSTYLE, long_ptr_t(desired_ex))
+
+                    if IsZoomed(hwnd):
+                        ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+                        style_changed = True
+
+                    if (
+                        style_changed
+                        or not has_rect
+                        or rect.left > -25000
+                        or rect.top > -25000
+                    ):
+                        SetWindowPos(
+                            hwnd,
+                            HWND_BOTTOM,
+                            -32000,
+                            -32000,
+                            0,
+                            0,
+                            SWP_NOSIZE
+                            | SWP_NOACTIVATE
+                            | SWP_NOOWNERZORDER
+                            | SWP_FRAMECHANGED,
+                        )
+
+                    if (
+                        prior_fg
+                        and prior_fg != hwnd_int
+                        and int(GetForegroundWindow() or 0) == hwnd_int
+                        and IsWindow(wintypes.HWND(prior_fg))
+                    ):
+                        SetForegroundWindow(wintypes.HWND(prior_fg))
+                except Exception:  # noqa: BLE001
+                    return True
+                return True
+
+            EnumWindows(_cb, 0)
+        except Exception:  # noqa: BLE001
+            return
+
+    def _run(self) -> None:
+        started = time.monotonic()
+        while not self._stop.is_set():
+            self._cloak_once()
+            interval = 0.008 if (time.monotonic() - started) < 3.0 else 0.08
+            self._stop.wait(interval)
+
+
 def _seedable_browser_cookies(
     cookies: Mapping[str, str], *, cookie_source: str | None
 ) -> dict[str, str]:
@@ -2924,12 +3392,18 @@ class DirectVerificationToken:
         generation_params: Mapping[str, Any] | None = None,
         follow_up: bool = False,
         user_data_dir: str | Path | None = None,
+        hide_window: bool = False,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
         resolved_proxy = resolve_proxy_url(
             self.options.base_url,
             self.options.proxy,
             fallback_proxy=_firefox_fallback_proxy(self.options),
         )
+        cloaked_headful = (not headless) and bool(hide_window)
+        window_visible = (not headless) and (not hide_window)
+        if user_data_dir is not None and not headless:
+            _prepare_profile_window_placement(user_data_dir, hidden=cloaked_headful)
+
         channels = _candidate_browser_channels(self.options.channel)
         environment: Any = None
         selected_channel: str | None = None
@@ -2939,55 +3413,64 @@ class DirectVerificationToken:
             if headless
             else AUTOMATION_DEFAULT_ARGS_TO_DROP
         )
-        launch_args: tuple[str, ...] = (
-            (AUTOMATION_BLINK_SWITCH, "--window-size=1280,800")
-            if headless
-            else (AUTOMATION_BLINK_SWITCH,)
-        )
-        for channel in channels:
-            env_kwargs: dict[str, Any] = {
-                "headless": headless,
-                "locale": None,
-                "timezone_id": None,
-                "artifacts_dir": self.options.artifacts_dir,
-                "install_determinism_script": False,
-                "reduced_motion": "no-preference",
-                "color_scheme": "no-preference",
-                "ignore_default_args": ignored_default_args,
-                "launch_args": launch_args,
-                "extra_init_scripts": (HIDE_WEBDRIVER_SCRIPT,),
-            }
-            if user_data_dir is not None:
-                env_kwargs["user_data_dir"] = user_data_dir
-            if channel is not None:
-                env_kwargs["channel"] = channel
-            if resolved_proxy:
-                env_kwargs["proxy"] = resolved_proxy
-            env_options = BrowserEnvironmentOptions.with_captcha_solving(
-                self.solver, **env_kwargs
-            )
-            candidate_env = BrowserEnvironment(env_options)
-            try:
-                environment = await candidate_env.__aenter__()
-                selected_channel = channel
-                break
-            except Exception as exc:  # noqa: BLE001
-                if _is_missing_browser_error(exc):
-                    last_missing_exc = exc
-                    continue
-                raise
-        if environment is None:
-            detail = (
-                str(last_missing_exc).splitlines()[0]
-                if last_missing_exc
-                else "no browser executable found"
-            )
-            raise AuthenticationError(
-                f"Direct Chat verification browser could not be started: {detail} "
-                "Install Chromium (`python -m playwright install chromium`) or "
-                "use your installed browser with `--channel msedge` / "
-                "`--channel chrome`."
-            ) from last_missing_exc
+        launch_args: tuple[str, ...]
+        if headless:
+            launch_args = (AUTOMATION_BLINK_SWITCH, "--window-size=1480,960")
+        elif cloaked_headful:
+            launch_args = (AUTOMATION_BLINK_SWITCH, *_OFFSCREEN_HEADFUL_SWITCHES)
+        else:
+            launch_args = (AUTOMATION_BLINK_SWITCH,)
+
+        win_cloaker = _WindowsBrowserCloaker(enabled=cloaked_headful)
+        win_cloaker.start()
+        try:
+            for channel in channels:
+                env_kwargs: dict[str, Any] = {
+                    "headless": headless,
+                    "locale": None,
+                    "timezone_id": None,
+                    "artifacts_dir": self.options.artifacts_dir,
+                    "install_determinism_script": False,
+                    "reduced_motion": "no-preference",
+                    "color_scheme": "no-preference",
+                    "ignore_default_args": ignored_default_args,
+                    "launch_args": launch_args,
+                    "extra_init_scripts": (HIDE_WEBDRIVER_SCRIPT,),
+                }
+                if user_data_dir is not None:
+                    env_kwargs["user_data_dir"] = user_data_dir
+                if channel is not None:
+                    env_kwargs["channel"] = channel
+                if resolved_proxy:
+                    env_kwargs["proxy"] = resolved_proxy
+                env_options = BrowserEnvironmentOptions.with_captcha_solving(
+                    self.solver, **env_kwargs
+                )
+                candidate_env = BrowserEnvironment(env_options)
+                try:
+                    environment = await candidate_env.__aenter__()
+                    selected_channel = channel
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if _is_missing_browser_error(exc):
+                        last_missing_exc = exc
+                        continue
+                    raise
+            if environment is None:
+                detail = (
+                    str(last_missing_exc).splitlines()[0]
+                    if last_missing_exc
+                    else "no browser executable found"
+                )
+                raise AuthenticationError(
+                    f"Direct Chat verification browser could not be started: {detail} "
+                    "Install Chromium (`python -m playwright install chromium`) or "
+                    "use your installed browser with `--channel msedge` / "
+                    "`--channel chrome`."
+                ) from last_missing_exc
+        except BaseException:
+            win_cloaker.stop()
+            raise
 
         registered_listeners: list[tuple[str, Callable[..., Any]]] = []
         response_tasks: set[asyncio.Task[None]] = set()
@@ -3002,6 +3485,11 @@ class DirectVerificationToken:
             if headless:
                 ua_cdp_session = await _sanitize_headless_page_cdp(
                     context, page, channel=selected_channel
+                )
+            elif cloaked_headful:
+                await _hide_headed_page_window_cdp(context, page)
+                await _maybe_reset_headless_poisoned_cookies(
+                    context, user_data_dir
                 )
             raw_cookies = self._current_cookies()
             seed_cookies = _seedable_browser_cookies(
@@ -3154,9 +3642,11 @@ class DirectVerificationToken:
                             "Cloudflare challenge in headless mode"
                         )
                     if callable(wait_for_timeout):
-                        if not headless:
+                        if window_visible:
                             await _safe_bring_to_front(page)
-                        cf_budget = 25.0 if headless else max(timeout, 120.0)
+                        cf_budget = (
+                            max(timeout, 120.0) if window_visible else 25.0
+                        )
                         wait_deadline = time.monotonic() + cf_budget
                         while time.monotonic() < wait_deadline:
                             obs_cf = await _detect_post_submit_challenge(page)
@@ -3262,7 +3752,10 @@ class DirectVerificationToken:
                         raise _RetryInHeadedBrowser(f"HTTP {status}")
                     if (
                         used_composer
-                        and (not headless or self.options.solve_captchas is not False)
+                        and (
+                            window_visible
+                            or self.options.solve_captchas is not False
+                        )
                         and status in (403, 429, 503)
                         and (
                             _is_verification_rejection(err_body)
@@ -3277,13 +3770,13 @@ class DirectVerificationToken:
                         )
 
                 if used_composer and (
-                    not headless or self.options.solve_captchas is not False
+                    window_visible or self.options.solve_captchas is not False
                 ):
                     obs = await _detect_post_submit_challenge(page)
                     obs_kind = obs.get("kind")
                     if isinstance(obs_kind, str) and obs_kind:
                         if not challenge_active:
-                            if not headless:
+                            if window_visible:
                                 interactive_budget = max(timeout, 300.0)
                                 deadline = max(
                                     deadline,
@@ -3346,7 +3839,7 @@ class DirectVerificationToken:
                             obs_kind = obs.get("kind")
 
                         if isinstance(obs_kind, str) and obs_kind:
-                            if headless:
+                            if not window_visible:
                                 bframe_exhausted = obs_kind == "recaptcha_bframe" and (
                                     auto_solve_attempts >= 2
                                     or (
@@ -3508,6 +4001,7 @@ class DirectVerificationToken:
                     if updated:
                         self._refreshed_cookies = updated
         finally:
+            win_cloaker.stop()
             if ua_cdp_session is not None:
                 detach_fn = getattr(ua_cdp_session, "detach", None)
                 if callable(detach_fn):
@@ -3549,25 +4043,26 @@ class DirectVerificationToken:
             _direct_browser_profile_dir(self.options) if is_live_browser else None
         )
         if is_live_browser:
-            if self.options.show_browser:
-                try:
-                    async with self._attempt_browser_evaluation(
-                        endpoint_path,
-                        body_factory,
-                        headless=False,
-                        allow_headed_retry=False,
-                        timeout=timeout,
-                        prompt=prompt,
-                        model_id_override=model_id_override,
-                        generation_params=generation_params,
-                        follow_up=follow_up,
-                        user_data_dir=profile_dir,
-                    ) as outcome:
-                        yield outcome
-                        return
-                except Exception as exc:  # noqa: BLE001
-                    if not _is_missing_display_error(exc):
-                        raise
+            hide_live_window = not bool(self.options.show_browser)
+            try:
+                async with self._attempt_browser_evaluation(
+                    endpoint_path,
+                    body_factory,
+                    headless=False,
+                    allow_headed_retry=False,
+                    timeout=timeout,
+                    prompt=prompt,
+                    model_id_override=model_id_override,
+                    generation_params=generation_params,
+                    follow_up=follow_up,
+                    user_data_dir=profile_dir,
+                    hide_window=hide_live_window,
+                ) as outcome:
+                    yield outcome
+                    return
+            except Exception as exc:  # noqa: BLE001
+                if not _is_missing_display_error(exc):
+                    raise
             async with self._attempt_browser_evaluation(
                 endpoint_path,
                 body_factory,
@@ -3579,6 +4074,7 @@ class DirectVerificationToken:
                 generation_params=generation_params,
                 follow_up=follow_up,
                 user_data_dir=profile_dir,
+                hide_window=False,
             ) as outcome:
                 yield outcome
             return
