@@ -41,6 +41,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import zlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -349,10 +350,30 @@ def _decompress_mozlz4(data: bytes) -> bytes:
         raise ValueError(f"mozLz40 payload too large ({expected} bytes)")
     if expected == 0:
         return b""
-    src = memoryview(data)[12:]
-    pos = 0
+    try:
+        import lz4.block
+    except ImportError:
+        pass
+    else:
+        try:
+            raw_out = bytes(
+                lz4.block.decompress(
+                    memoryview(data)[12:], uncompressed_size=expected
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"invalid mozLz40 block: {exc}") from exc
+        if len(raw_out) != expected:
+            raise ValueError(
+                f"mozLz40 decompressed size mismatch ({len(raw_out)} != {expected})"
+            )
+        return raw_out
+
+    src = data
+    pos = 12
     end = len(src)
-    out = bytearray()
+    out = bytearray(expected)
+    out_pos = 0
     while pos < end:
         token = src[pos]
         pos += 1
@@ -366,18 +387,19 @@ def _decompress_mozlz4(data: bytes) -> bytes:
                 lit_len += extra
                 if extra != 255:
                     break
-        if pos + lit_len > end or len(out) + lit_len > expected:
+        if pos + lit_len > end or out_pos + lit_len > expected:
             raise ValueError("mozLz40 literal overruns block")
         if lit_len:
-            out.extend(src[pos : pos + lit_len])
+            out[out_pos : out_pos + lit_len] = src[pos : pos + lit_len]
             pos += lit_len
+            out_pos += lit_len
         if pos >= end:
             break
         if pos + 2 > end:
             raise ValueError("truncated mozLz40 match offset")
         offset = src[pos] | (src[pos + 1] << 8)
         pos += 2
-        if offset == 0 or offset > len(out):
+        if offset == 0 or offset > out_pos:
             raise ValueError("invalid mozLz40 match offset")
         match_len = token & 0x0F
         if match_len == 15:
@@ -390,21 +412,24 @@ def _decompress_mozlz4(data: bytes) -> bytes:
                 if extra != 255:
                     break
         match_len += 4
-        if len(out) + match_len > expected:
+        if out_pos + match_len > expected:
             raise ValueError("mozLz40 match overruns expected size")
-        start = len(out) - offset
+        start = out_pos - offset
         if offset >= match_len:
-            out.extend(out[start : start + match_len])
+            out[out_pos : out_pos + match_len] = out[start : start + match_len]
         else:
-            chunk = bytes(out[start:])
+            chunk = bytes(out[start:out_pos])
             repeats, remainder = divmod(match_len, offset)
-            if repeats:
-                out.extend(chunk * repeats)
-            if remainder:
-                out.extend(chunk[:remainder])
-    if len(out) != expected:
+            expanded = (
+                chunk * repeats + chunk[:remainder]
+                if remainder
+                else chunk * repeats
+            )
+            out[out_pos : out_pos + match_len] = expanded
+        out_pos += match_len
+    if out_pos != expected:
         raise ValueError(
-            f"mozLz40 decompressed size mismatch ({len(out)} != {expected})"
+            f"mozLz40 decompressed size mismatch ({out_pos} != {expected})"
         )
     return bytes(out)
 
@@ -421,6 +446,12 @@ def _format_origin_attributes(value: Any) -> str:
         ]
         return "^" + "&".join(parts) if parts else ""
     return ""
+
+
+_SESSIONSTORE_CACHE_MAX = 16
+_SESSIONSTORE_CACHE: dict[
+    tuple[str, int, int], tuple[str, list[dict[str, Any]]]
+] = {}
 
 
 def _sessionstore_cookie_rows(
@@ -447,19 +478,29 @@ def _sessionstore_cookie_rows(
 
     payload: Any = None
     chosen: str | None = None
+    cache_key: tuple[str, int, int] | None = None
     for _, _, relpath, candidate in existing:
         try:
             raw = candidate.read_bytes()
+        except OSError:
+            continue
+        candidate_key = (str(candidate), len(raw), zlib.crc32(raw))
+        cached_hit = _SESSIONSTORE_CACHE.get(candidate_key)
+        if cached_hit is not None:
+            cached_relpath, cached_rows = cached_hit
+            return cached_relpath, [dict(r) for r in cached_rows]
+        try:
             if raw.startswith(_MOZLZ4_MAGIC):
                 text = _decompress_mozlz4(raw).decode("utf-8", errors="replace")
             else:
                 text = raw.decode("utf-8", errors="replace")
             parsed = json.loads(text)
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (ValueError, json.JSONDecodeError):
             continue
         if isinstance(parsed, Mapping):
             payload = parsed
             chosen = relpath
+            cache_key = candidate_key
             break
 
     if payload is None:
@@ -515,6 +556,10 @@ def _sessionstore_cookie_rows(
                 "originAttributes": container,
             }
         )
+    if chosen is not None and cache_key is not None:
+        if len(_SESSIONSTORE_CACHE) >= _SESSIONSTORE_CACHE_MAX:
+            _SESSIONSTORE_CACHE.pop(next(iter(_SESSIONSTORE_CACHE)))
+        _SESSIONSTORE_CACHE[cache_key] = (chosen, [dict(r) for r in rows])
     return chosen, rows
 
 
@@ -566,17 +611,58 @@ def cookies_from_rookiepy(records: Any) -> dict[str, str]:
     return _records_to_cookies(_normalize_rookiepy_records(records))
 
 
-def _query_cookie_snapshot(
-    snapshot: Path,
-    domains: Sequence[str],
-    sessionstore_rows: Sequence[Mapping[str, Any]] = (),
-) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    seen_keys: set[tuple[str, str, str]] = set()
+_SQLITE_CACHE_MAX = 16
+_SQLITE_SNAPSHOT_CACHE: dict[
+    tuple[Any, ...], dict[str, list[dict[str, Any]]]
+] = {}
+
+
+def _sqlite_file_signature(database: Path) -> tuple[Any, ...] | None:
+    try:
+        st = database.stat()
+        with database.open("rb") as fh:
+            header = fh.read(100)
+            body_crc = (
+                zlib.crc32(fh.read())
+                if st.st_size <= 4 * 1024 * 1024
+                else 0
+            )
+    except OSError:
+        return None
+    if not header.startswith(b"SQLite format 3\x00"):
+        return None
+    wal_sig: tuple[Any, ...] = ()
+    wal_path = database.with_name(database.name + "-wal")
+    try:
+        if wal_path.is_file():
+            wst = wal_path.stat()
+            with wal_path.open("rb") as wfh:
+                if wst.st_size <= 4 * 1024 * 1024:
+                    wal_crc = zlib.crc32(wfh.read())
+                else:
+                    wal_head = wfh.read(64)
+                    wfh.seek(max(0, wst.st_size - 4096))
+                    wal_crc = zlib.crc32(wal_head + wfh.read(4096))
+            wal_sig = (wst.st_mtime_ns, wst.st_size, wal_crc)
+    except OSError:
+        return None
+    return (
+        str(database),
+        st.st_mtime_ns,
+        st.st_size,
+        zlib.crc32(header),
+        body_crc,
+        wal_sig,
+    )
+
+
+def _fetch_sqlite_domain_rows(
+    snapshot: Path, domains: Sequence[str]
+) -> dict[str, list[dict[str, Any]]]:
+    by_domain: dict[str, list[dict[str, Any]]] = {}
     connection = sqlite3.connect(str(snapshot))
     try:
         connection.row_factory = sqlite3.Row
-        now = time.time()
         for domain in domains:
             rows = connection.execute(
                 _COOKIE_RECORD_QUERY,
@@ -586,57 +672,93 @@ def _query_cookie_snapshot(
                     "subdomain": f"%.{domain}",
                 },
             ).fetchall()
+            extracted: list[dict[str, Any]] = []
             for row in rows:
                 name = row["name"]
                 value = row["value"]
                 if not name or value is None:
                     continue
-                moment = _expiry_seconds(row["expiry"])
-                if moment is not None and moment < now:
-                    continue
-                host = str(row["host"])
-                path = str(row["path"])
-                seen_keys.add((host, str(name), path))
-                records.append(
+                extracted.append(
                     {
-                        "name": name,
-                        "value": value,
-                        "domain": host,
-                        "path": path,
-                        "expires": int(moment) if moment is not None else 0,
-                        "secure": bool(row["isSecure"]),
-                        "http_only": bool(row["isHttpOnly"]),
+                        "name": str(name),
+                        "value": str(value),
+                        "host": str(row["host"]),
+                        "path": str(row["path"]),
+                        "expiry": row["expiry"],
+                        "isSecure": bool(row["isSecure"]),
+                        "isHttpOnly": bool(row["isHttpOnly"]),
                     }
                 )
-            for item in sessionstore_rows:
-                host = str(item.get("host") or "")
-                if not _domain_matches(host, (domain,)):
-                    continue
-                name = str(item.get("name") or "")
-                value = item.get("value")
-                if not name or not isinstance(value, str):
-                    continue
-                path = str(item.get("path") or "/")
-                if (host, name, path) in seen_keys:
-                    continue
-                moment = _expiry_seconds(item.get("expiry"))
-                if moment is not None and moment < now:
-                    continue
-                seen_keys.add((host, name, path))
-                records.append(
-                    {
-                        "name": name,
-                        "value": value,
-                        "domain": host,
-                        "path": path,
-                        "expires": int(moment) if moment is not None else 0,
-                        "secure": bool(item.get("isSecure")),
-                        "http_only": bool(item.get("isHttpOnly")),
-                    }
-                )
+            by_domain[domain] = extracted
     finally:
         connection.close()
+    return by_domain
+
+
+def _merge_domain_rows(
+    by_domain: Mapping[str, Sequence[Mapping[str, Any]]],
+    domains: Sequence[str],
+    sessionstore_rows: Sequence[Mapping[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    now = time.time()
+    for domain in domains:
+        for row in by_domain.get(domain, ()):
+            moment = _expiry_seconds(row["expiry"])
+            if moment is not None and moment < now:
+                continue
+            host = str(row["host"])
+            name = str(row["name"])
+            path = str(row["path"])
+            seen_keys.add((host, name, path))
+            records.append(
+                {
+                    "name": name,
+                    "value": str(row["value"]),
+                    "domain": host,
+                    "path": path,
+                    "expires": int(moment) if moment is not None else 0,
+                    "secure": bool(row["isSecure"]),
+                    "http_only": bool(row["isHttpOnly"]),
+                }
+            )
+        for item in sessionstore_rows:
+            host = str(item.get("host") or "")
+            if not _domain_matches(host, (domain,)):
+                continue
+            name = str(item.get("name") or "")
+            value = item.get("value")
+            if not name or not isinstance(value, str):
+                continue
+            path = str(item.get("path") or "/")
+            if (host, name, path) in seen_keys:
+                continue
+            moment = _expiry_seconds(item.get("expiry"))
+            if moment is not None and moment < now:
+                continue
+            seen_keys.add((host, name, path))
+            records.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": host,
+                    "path": path,
+                    "expires": int(moment) if moment is not None else 0,
+                    "secure": bool(item.get("isSecure")),
+                    "http_only": bool(item.get("isHttpOnly")),
+                }
+            )
     return records
+
+
+def _query_cookie_snapshot(
+    snapshot: Path,
+    domains: Sequence[str],
+    sessionstore_rows: Sequence[Mapping[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    by_domain = _fetch_sqlite_domain_rows(snapshot, domains)
+    return _merge_domain_rows(by_domain, domains, sessionstore_rows)
 
 
 def _sessionstore_records_only(
@@ -693,6 +815,15 @@ def read_firefox_cookie_records(
     database = Path(database)
     targets = _normalize_domains(domains)
     _, sessionstore_rows = _sessionstore_cookie_rows(database.parent)
+    sig = _sqlite_file_signature(database)
+    cache_key = (*sig, tuple(targets)) if sig is not None else None
+    if cache_key is not None:
+        cached_by_domain = _SQLITE_SNAPSHOT_CACHE.get(cache_key)
+        if cached_by_domain is not None:
+            return _merge_domain_rows(
+                cached_by_domain, targets, sessionstore_rows
+            )
+
     with tempfile.TemporaryDirectory(prefix="arena-api-firefox-") as temporary:
         snapshot = Path(temporary) / database.name
         shutil.copy2(database, snapshot)
@@ -702,7 +833,12 @@ def read_firefox_cookie_records(
                 shutil.copy2(
                     sidecar, snapshot.with_name(snapshot.name + suffix)
                 )
-        return _query_cookie_snapshot(snapshot, targets, sessionstore_rows)
+        by_domain = _fetch_sqlite_domain_rows(snapshot, targets)
+    if cache_key is not None:
+        if len(_SQLITE_SNAPSHOT_CACHE) >= _SQLITE_CACHE_MAX:
+            _SQLITE_SNAPSHOT_CACHE.pop(next(iter(_SQLITE_SNAPSHOT_CACHE)))
+        _SQLITE_SNAPSHOT_CACHE[cache_key] = by_domain
+    return _merge_domain_rows(by_domain, targets, sessionstore_rows)
 
 
 def read_firefox_cookies(database: Path, domains: Sequence[str]) -> dict[str, str]:

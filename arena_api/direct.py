@@ -832,10 +832,13 @@ class DirectArenaClient(_DirectMixin):
         deadline = time.monotonic() + generation.queue_timeout
         if use_browser:
             browser_runner: Any = self.verification_token
+            cached_default_id: str | None = explicit_model_id
+            if cached_default_id is None and self._models is not None:
+                cached_default_id = self._resolve_model(None, self._models)
 
             def _fallback_body(tok: str) -> dict[str, Any]:
-                resolved_id = explicit_model_id or self._resolve_model(
-                    None, self.get_models()
+                resolved_id = (
+                    cached_default_id or "00000000-0000-0000-0000-000000000000"
                 )
                 return self._request_body(
                     prompt, resolved_id, tok, chat_id, generation
@@ -929,7 +932,7 @@ class DirectArenaClient(_DirectMixin):
     def chat(
         self,
         *,
-        model: str,
+        model: str | None = None,
         config: GenerationConfig | None = None,
     ) -> DirectChatSession:
         return DirectChatSession(self, model=model, config=config)
@@ -950,7 +953,7 @@ class DirectChatSession:
         self,
         client: DirectArenaClient,
         *,
-        model: str,
+        model: str | None = None,
         config: GenerationConfig | None = None,
         history: Sequence[Message] | None = None,
     ) -> None:
@@ -1237,7 +1240,7 @@ class AsyncDirectArenaClient(_DirectMixin):
     def chat(
         self,
         *,
-        model: str,
+        model: str | None = None,
         config: GenerationConfig | None = None,
     ) -> AsyncDirectChatSession:
         return AsyncDirectChatSession(self, model=model, config=config)
@@ -1250,7 +1253,7 @@ class AsyncDirectChatSession:
         self,
         client: AsyncDirectArenaClient,
         *,
-        model: str,
+        model: str | None = None,
         config: GenerationConfig | None = None,
         history: Sequence[Message] | None = None,
     ) -> None:

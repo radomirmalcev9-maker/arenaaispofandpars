@@ -11,9 +11,11 @@ launches a browser.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -27,7 +29,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from arena_api import ArenaClient, AsyncArenaClient
+from arena_api import ArenaClient, AsyncArenaClient, StreamChunk
 from arena_api.auth.challenge import ChallengeKind, ChallengeObservation, ChallengeSignal
 from arena_api.auth.captcha import (
     CaptchaAttempt,
@@ -4226,8 +4228,705 @@ def test_windows_descendant_pids_and_cloaker_smoke() -> None:
     cloaker.stop()
 
 
+def test_cdp_stream_resource_content_delivers_first_token_before_response_finishes(
+    tmp_path, monkeypatch
+) -> None:
+    """CDP Network.streamResourceContent yields chunks immediately without waiting for resp.text()."""
+    full_wire = (
+        'a0:"При"\n'
+        'a0:"вет, "\n'
+        'a0:"мир! 🚀"\n'
+        'ad:{"finishReason":"stop"}\n'
+    ).encode("utf-8")
+    # Split right across multi-byte UTF-8 Cyrillic and 4-byte emoji sequences:
+    buffered_slice = full_wire[:7]
+    live_slice_1 = full_wire[7:24]
+    live_slice_2 = full_wire[24:41]
+    live_slice_3 = full_wire[41:]
+    resp_text_awaited = False
+
+    class FakeCDPSession:
+        def __init__(self) -> None:
+            self._handlers: dict[str, list[object]] = {}
+            self.detached = False
+
+        def on(self, event: str, cb: object) -> None:
+            self._handlers.setdefault(event, []).append(cb)
+
+        def remove_listener(self, event: str, cb: object) -> None:
+            cbs = self._handlers.get(event, [])
+            if cb in cbs:
+                cbs.remove(cb)
+
+        def emit(self, event: str, params: dict[str, object]) -> None:
+            for cb in list(self._handlers.get(event, ())):
+                assert callable(cb)
+                cb(params)
+
+        async def send(self, method: str, params: object = None):
+            if method == "Network.enable":
+                return {}
+            if method == "Network.streamResourceContent":
+                assert isinstance(params, dict) and params["requestId"] == "req-1"
+                return {
+                    "bufferedData": base64.b64encode(buffered_slice).decode("ascii")
+                }
+            return {}
+
+        async def detach(self) -> None:
+            self.detached = True
+
+    cdp = FakeCDPSession()
+
+    class SlowResponse:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.status = 200
+            self.headers = {"content-type": "text/plain"}
+            self.request = type("R", (), {"method": "POST"})()
+
+        async def text(self) -> str:
+            nonlocal resp_text_awaited
+            resp_text_awaited = True
+            await asyncio.sleep(2.0)
+            return full_wire.decode("utf-8")
+
+    class FakeLocator:
+        def __init__(self, selector: str, page: "StreamPage") -> None:
+            self._selector = selector
+            self._page = page
+
+        @property
+        def first(self) -> "FakeLocator":
+            return self
+
+        async def click(self) -> None:
+            if "data-arena-send" in self._selector:
+                asyncio.create_task(self._page._simulate_network_stream())
+
+        async def fill(self, value: str) -> None:
+            return None
+
+        async def press(self, key: str) -> None:
+            return None
+
+    class StreamPage:
+        def __init__(self) -> None:
+            self._listeners: dict[str, list[object]] = {}
+            self.keyboard = type("K", (), {"type": self._type})()
+            self.mouse = type("M", (), {"move": self._move})()
+            self.context = type(
+                "C",
+                (),
+                {
+                    "new_cdp_session": self._new_cdp,
+                    "add_cookies": self._noop,
+                    "cookies": self._cookies,
+                },
+            )()
+
+        async def _type(self, text: str, delay: int = 0) -> None:
+            return None
+
+        async def _move(self, x: float, y: float, steps: int = 1) -> None:
+            return None
+
+        async def _new_cdp(self, page: object) -> FakeCDPSession:
+            return cdp
+
+        async def _noop(self, *a: object, **kw: object) -> None:
+            return None
+
+        async def _cookies(self, urls: object = None) -> list[object]:
+            return []
+
+        def on(self, event: str, cb: object) -> None:
+            self._listeners.setdefault(event, []).append(cb)
+
+        def remove_listener(self, event: str, cb: object) -> None:
+            cbs = self._listeners.get(event, [])
+            if cb in cbs:
+                cbs.remove(cb)
+
+        def _emit(self, event: str, obj: object) -> None:
+            for cb in list(self._listeners.get(event, ())):
+                assert callable(cb)
+                cb(obj)
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector, self)
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def title(self) -> str:
+            return "Arena AI"
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def content(self) -> str:
+            raise AssertionError("page.content() should be skipped when title is Arena")
+
+        async def evaluate(self, script: str) -> object:
+            if "arena_cleanup_marks" in script:
+                return None
+            if "composer_nonempty" in script:
+                return True
+            if "data-arena-composer" in script and "data-arena-send" not in script:
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {"found": True, "confidence": "explicit", "x": 650, "y": 700}
+            if "recaptcha_anchor" in script:
+                return {"kind": None}
+            return None
+
+        async def _simulate_network_stream(self) -> None:
+            url = "https://arena.ai/nextjs-api/stream/create-evaluation"
+            req_stub = type("Req", (), {"method": "POST", "url": url, "post_data": "{}"})()
+            self._emit("request", req_stub)
+            cdp.emit(
+                "Network.requestWillBeSent",
+                {"requestId": "req-1", "request": {"method": "POST", "url": url}},
+            )
+            cdp.emit(
+                "Network.responseReceived",
+                {
+                    "requestId": "req-1",
+                    "response": {
+                        "status": 200,
+                        "headers": {"Content-Type": "text/plain"},
+                    },
+                },
+            )
+            self._emit("response", SlowResponse(url))
+            await asyncio.sleep(0.01)
+            cdp.emit(
+                "Network.dataReceived",
+                {
+                    "requestId": "req-1",
+                    "data": base64.b64encode(live_slice_1).decode("ascii"),
+                },
+            )
+            await asyncio.sleep(0.20)
+            cdp.emit(
+                "Network.dataReceived",
+                {
+                    "requestId": "req-1",
+                    "data": base64.b64encode(live_slice_2).decode("ascii"),
+                },
+            )
+            await asyncio.sleep(0.20)
+            cdp.emit(
+                "Network.dataReceived",
+                {
+                    "requestId": "req-1",
+                    "data": base64.b64encode(live_slice_3).decode("ascii"),
+                },
+            )
+            cdp.emit("Network.loadingFinished", {"requestId": "req-1"})
+
+    class FakeEnv:
+        def __init__(self, options: object) -> None:
+            self.challenge_handler = type("H", (), {"solve_on_detection": True})()
+
+        async def __aenter__(self) -> "FakeEnv":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def new_page(self) -> StreamPage:
+            return StreamPage()
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=False),
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+    )
+    client = auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        cookies={"arena-auth-prod-v1.0": "jwt"},
+        verification_token=tok,
+    )
+    t0 = time.perf_counter()
+    chunk_times: list[tuple[float, str]] = []
+    try:
+        for ch in client.stream("Привет!"):
+            if ch.delta:
+                chunk_times.append((time.perf_counter() - t0, ch.delta))
+    finally:
+        client.close()
+
+    assert not resp_text_awaited
+    assert "".join(delta for _, delta in chunk_times) == "Привет, мир! 🚀"
+    # First token ("Привет, ") arrived well before the final 400ms stream ended!
+    assert chunk_times[0][0] < 0.20
+    assert chunk_times[-1][0] >= 0.35
 
 
+def test_cdp_stream_pump_handles_pre_arm_Macrotask_race_and_arm_failure_fallback() -> None:
+    """Data & loadingFinished arriving before streamResourceContent resumes are preserved in order."""
+    from arena_api._direct_page import _CdpEvalStreamPump
+
+    class RaceCDP:
+        def __init__(self, *, fail_arm: bool = False) -> None:
+            self.fail_arm = fail_arm
+            self._handlers: dict[str, list[object]] = {}
+
+        def on(self, ev: str, cb: object) -> None:
+            self._handlers.setdefault(ev, []).append(cb)
+
+        def remove_listener(self, ev: str, cb: object) -> None:
+            return None
+
+        def emit(self, ev: str, payload: dict[str, object]) -> None:
+            for cb in list(self._handlers.get(ev, ())):
+                assert callable(cb)
+                cb(payload)
+
+        async def send(self, method: str, params: object = None):
+            if method == "Network.enable":
+                return {}
+            if method == "Network.streamResourceContent":
+                if self.fail_arm:
+                    raise RuntimeError("No resource with given identifier")
+                # Fire dataReceived AND loadingFinished synchronously BEFORE send() returns!
+                self.emit(
+                    "Network.dataReceived",
+                    {
+                        "requestId": "r1",
+                        "data": base64.b64encode(b"part2-").decode("ascii"),
+                    },
+                )
+                self.emit("Network.loadingFinished", {"requestId": "r1"})
+                return {"bufferedData": base64.b64encode(b"part1-").decode("ascii")}
+            return {}
+
+        async def detach(self) -> None:
+            return None
+
+    async def _exercise() -> None:
+        cdp_ok = RaceCDP(fail_arm=False)
+        ctx_ok = type("C", (), {"new_cdp_session": lambda _s, _p: asyncio.sleep(0, cdp_ok)})()
+        pump = await _CdpEvalStreamPump.attach(ctx_ok, object())
+        assert pump is not None
+        q: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        pump.bind_queue(q)
+        url = "https://arena.ai/nextjs-api/stream/create-evaluation"
+        cdp_ok.emit(
+            "Network.requestWillBeSent",
+            {"requestId": "r1", "request": {"method": "POST", "url": url}},
+        )
+        cdp_ok.emit(
+            "Network.responseReceived",
+            {
+                "requestId": "r1",
+                "response": {"status": 200, "headers": {"content-type": "text/plain"}},
+            },
+        )
+        done_fut = await pump.await_claim_for_2xx()
+        assert done_fut is not None
+        await done_fut
+        items: list[tuple[str, object]] = []
+        while not q.empty():
+            items.append(q.get_nowait())
+        assert items == [
+            ("meta", "text/plain"),
+            ("chunk", b"part1-"),
+            ("chunk", b"part2-"),
+            ("eof", None),
+        ]
+        await pump.aclose()
+
+        # Fallback path when streamResourceContent fails:
+        cdp_fail = RaceCDP(fail_arm=True)
+        ctx_fail = type(
+            "C", (), {"new_cdp_session": lambda _s, _p: asyncio.sleep(0, cdp_fail)}
+        )()
+        pump_fail = await _CdpEvalStreamPump.attach(ctx_fail, object())
+        assert pump_fail is not None
+        q2: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        pump_fail.bind_queue(q2)
+        cdp_fail.emit(
+            "Network.requestWillBeSent",
+            {"requestId": "r1", "request": {"method": "POST", "url": url}},
+        )
+        cdp_fail.emit(
+            "Network.responseReceived",
+            {"requestId": "r1", "response": {"status": 200, "headers": {}}},
+        )
+        assert await pump_fail.await_claim_for_2xx() is None
+        assert q2.empty()
+        await pump_fail.aclose()
+
+    asyncio.run(_exercise())
 
 
+def test_warm_browser_keep_alive_reuses_environment_and_follow_up_skips_goto(
+    tmp_path, monkeypatch
+) -> None:
+    """keep_browser_alive=True reuses 1 browser across prompts and skips goto on follow-up turns."""
+    env_enters = 0
+    env_exits = 0
+    goto_urls: list[str] = []
+    submitted_prompts: list[str] = []
 
+    class FakeResponse:
+        def __init__(self, url: str, text_body: str) -> None:
+            self.url = url
+            self.status = 200
+            self.headers = {"content-type": "text/plain; charset=utf-8"}
+            self.request = type("R", (), {"method": "POST"})()
+            self._body = text_body
+
+        async def text(self) -> str:
+            return self._body
+
+    class FakeLocator:
+        def __init__(self, selector: str, page: "WarmPage") -> None:
+            self._selector = selector
+            self._page = page
+
+        @property
+        def first(self) -> "FakeLocator":
+            return self
+
+        async def click(self) -> None:
+            if "data-arena-send" in self._selector:
+                self._page._emit_reply()
+
+        async def fill(self, value: str) -> None:
+            self._page._last_prompt = value
+
+        async def press(self, key: str) -> None:
+            return None
+
+    class WarmPage:
+        def __init__(self) -> None:
+            self._listeners: dict[str, list[object]] = {}
+            self._last_prompt = ""
+            self.keyboard = type("K", (), {"type": self._type})()
+            self.mouse = type("M", (), {"move": self._move})()
+            self.context = type(
+                "C", (), {"add_cookies": self._noop, "cookies": self._cookies}
+            )()
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def _type(self, text: str, delay: int = 0) -> None:
+            self._last_prompt = text
+
+        async def _move(self, x: float, y: float, steps: int = 1) -> None:
+            return None
+
+        async def _noop(self, *a: object, **kw: object) -> None:
+            return None
+
+        async def _cookies(self, urls: object = None) -> list[object]:
+            return []
+
+        def on(self, event: str, cb: object) -> None:
+            self._listeners.setdefault(event, []).append(cb)
+
+        def remove_listener(self, event: str, cb: object) -> None:
+            cbs = self._listeners.get(event, [])
+            if cb in cbs:
+                cbs.remove(cb)
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector, self)
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            goto_urls.append(url)
+
+        async def title(self) -> str:
+            return "Arena"
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def evaluate(self, script: str) -> object:
+            if "arena_cleanup_marks" in script:
+                return None
+            if "composer_nonempty" in script:
+                return True
+            if "data-arena-composer" in script and "data-arena-send" not in script:
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {"found": True, "confidence": "explicit", "x": 650, "y": 700}
+            if "recaptcha_anchor" in script:
+                return {"kind": None}
+            return None
+
+        def _emit_reply(self) -> None:
+            submitted_prompts.append(self._last_prompt)
+            turn_n = len(submitted_prompts)
+            url = (
+                f"https://arena.ai/nextjs-api/stream/post-to-evaluation/conv-{turn_n}"
+                if turn_n == 4
+                else "https://arena.ai/nextjs-api/stream/create-evaluation"
+            )
+            req = type("Req", (), {"method": "POST", "url": url, "post_data": "{}"})()
+            for cb in list(self._listeners.get("request", ())):
+                assert callable(cb)
+                cb(req)
+            body = f'a0:"Ответ #{turn_n}"\nad:{{"finishReason":"stop"}}\n'
+            resp = FakeResponse(url, body)
+            for cb in list(self._listeners.get("response", ())):
+                assert callable(cb)
+                cb(resp)
+
+    class WarmEnv:
+        def __init__(self, options: object) -> None:
+            self.challenge_handler = type("H", (), {"solve_on_detection": True})()
+            self._page = WarmPage()
+
+        async def __aenter__(self) -> "WarmEnv":
+            nonlocal env_enters
+            env_enters += 1
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            nonlocal env_exits
+            env_exits += 1
+
+        async def new_page(self) -> WarmPage:
+            return self._page
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", WarmEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=False),
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+        keep_browser_alive=True,
+    )
+    with auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        cookies={"arena-auth-prod-v1.0": "jwt"},
+        verification_token=tok,
+    ) as client:
+        assert client.complete("Вопрос 1") == "Ответ #1"
+        assert env_enters == 1 and env_exits == 0
+        assert len(goto_urls) == 1
+
+        assert client.complete("Вопрос 2 — длинный текст свыше тридцати двух символов для быстрой вставки!") == "Ответ #2"
+        assert env_enters == 1 and env_exits == 0
+        assert len(goto_urls) == 2
+
+        conv = client.chat()
+        assert conv.send_message("Старт диалога") == "Ответ #3"
+        assert len(goto_urls) == 3
+        # Follow-up in the open conversation skips page.goto completely!
+        assert conv.send_message("Продолжение") == "Ответ #4"
+        assert len(goto_urls) == 3
+        assert env_enters == 1 and env_exits == 0
+
+    assert env_exits == 1
+    assert tok._warm_state is None
+    assert tok._bg_thread is None
+
+
+def test_warm_browser_self_heals_if_cached_page_crashed(
+    tmp_path, monkeypatch
+) -> None:
+    """A crashed warm browser is transparently discarded and relaunched once."""
+    launches = 0
+
+    class CrashablePage:
+        def __init__(self, env_id: int) -> None:
+            self.env_id = env_id
+            self.crashed = False
+            self._exposed: dict[str, object] = {}
+            self.context = type("C", (), {"add_cookies": self._noop, "cookies": self._cookies})()
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def _noop(self, *a: object, **kw: object) -> None:
+            return None
+
+        async def _cookies(self, urls: object = None) -> list[object]:
+            return []
+
+        async def expose_function(self, name: str, fn: object) -> None:
+            self._exposed[name] = fn
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            if self.crashed:
+                raise RuntimeError("Target page, context or browser has been closed")
+
+        async def title(self) -> str:
+            return "Arena"
+
+        async def evaluate(self, script: str) -> object:
+            if "chat_submit" in script:
+                return f"tok-{self.env_id}"
+            if "window.fetch" in script:
+                meta_fn = self._exposed["__arenaDirectMeta"]
+                chunk_fn = self._exposed["__arenaDirectChunk"]
+                assert callable(meta_fn) and callable(chunk_fn)
+                meta_fn("text/event-stream")
+                chunk_fn(f'a0:"ok-{self.env_id}"\nad:{{"finishReason":"stop"}}\n')
+                return {"ok": True, "status": 200, "contentType": "text/event-stream"}
+            return None
+
+    pages: list[CrashablePage] = []
+
+    class Env:
+        def __init__(self, options: object) -> None:
+            nonlocal launches
+            launches += 1
+            self.page = CrashablePage(launches)
+            pages.append(self.page)
+            self.challenge_handler = type("H", (), {"solve_on_detection": True})()
+
+        async def __aenter__(self) -> "Env":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def new_page(self) -> CrashablePage:
+            return self.page
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", Env)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=False),
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+        keep_browser_alive=True,
+    )
+    with auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        cookies={"arena-auth-prod-v1.0": "jwt"},
+        verification_token=tok,
+    ) as client:
+        assert client.complete("One") == "ok-1"
+        assert launches == 1
+        # Simulate unexpected renderer crash while idle:
+        pages[0].crashed = True
+        assert client.complete("Two") == "ok-2"
+        assert launches == 2
+
+
+def test_cli_prompt_on_arena_ai_skips_gradio_config_probes(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """`python -m arena_api --prompt ...` on arena.ai skips dead /config HTTP probes."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_COOKIE", "arena-auth-prod-v1.0=jwt")
+    monkeypatch.delenv("ARENA_VERIFICATION_TOKEN", raising=False)
+
+    probe_calls: list[str] = []
+    real_probe = auto_module.probe
+
+    def spy_probe(client, path="/config"):
+        probe_calls.append(path)
+        return real_probe(client, path)
+
+    class FakeDirectClient:
+        def __enter__(self) -> "FakeDirectClient":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def stream(self, prompt: str, *, model: str | None = None):
+            assert model is None
+            yield StreamChunk(
+                text=f"fast:{prompt}",
+                delta=f"fast:{prompt}",
+                event="message",
+                finished=True,
+            )
+
+    direct_calls: list[AutoOptions] = []
+
+    def fake_auto_direct_client(options=None, *, verification_token=None, **kw):
+        assert verification_token == "auto"
+        assert options is not None and options.verify is False
+        direct_calls.append(options)
+        return FakeDirectClient()
+
+    monkeypatch.setattr(auto_module, "auto_direct_client", fake_auto_direct_client)
+    assert main(["--prompt", "Привет", "--no-browser-profiles"]) == 0
+    out = capsys.readouterr().out
+    assert "answer            : fast:Привет" in out
+    assert probe_calls == []
+    assert len(direct_calls) == 1
+    assert spy_probe is not None
+
+
+def test_firefox_cookie_snapshot_and_sessionstore_caches_invalidate_on_write(
+    tmp_path, monkeypatch
+) -> None:
+    """Repeated Firefox reads avoid redundant SQLite temp copies until the DB changes."""
+    from arena_api.auth import firefox_session as fs_mod
+
+    profile = tmp_path / "profile"
+    backups = profile / "sessionstore-backups"
+    backups.mkdir(parents=True)
+    db_path = profile / "cookies.sqlite"
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE moz_cookies ("
+        "host TEXT, name TEXT, value TEXT, path TEXT, expiry INTEGER, "
+        "isSecure INTEGER, isHttpOnly INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO moz_cookies VALUES ('.arena.ai', 'arena-auth-prod-v1.0', 'v1', '/', 0, 1, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    session_json = json.dumps(
+        {
+            "cookies": [
+                {
+                    "host": "arena.ai",
+                    "name": "sess_tok",
+                    "value": "s1",
+                    "path": "/",
+                }
+            ]
+        }
+    ).encode("utf-8")
+    (backups / "recovery.jsonlz4").write_bytes(session_json)
+
+    copy_calls = 0
+    real_copy2 = shutil.copy2
+
+    def counting_copy2(src, dst, *a, **kw):
+        nonlocal copy_calls
+        copy_calls += 1
+        return real_copy2(src, dst, *a, **kw)
+
+    monkeypatch.setattr(fs_mod.shutil, "copy2", counting_copy2)
+    fs_mod._SQLITE_SNAPSHOT_CACHE.clear()
+    fs_mod._SESSIONSTORE_CACHE.clear()
+
+    c1 = fs_mod.read_firefox_cookies(db_path, ("arena.ai",))
+    assert c1 == {"arena-auth-prod-v1.0": "v1", "sess_tok": "s1"}
+    assert copy_calls == 1
+
+    # Second read with unchanged files hits cache -> 0 extra shutil.copy2 calls!
+    c2 = fs_mod.read_firefox_cookies(db_path, ("arena.ai",))
+    assert c2 == c1
+    assert copy_calls == 1
+
+    # Updating SQLite invalidates cache immediately (even with identical value length!):
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE moz_cookies SET value = 'v2' WHERE name = 'arena-auth-prod-v1.0'")
+    conn.commit()
+    conn.close()
+
+    c3 = fs_mod.read_firefox_cookies(db_path, ("arena.ai",))
+    assert c3 == {"arena-auth-prod-v1.0": "v2", "sess_tok": "s1"}
+    assert copy_calls == 2
