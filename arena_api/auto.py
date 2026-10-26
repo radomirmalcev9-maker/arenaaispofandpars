@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -122,6 +123,7 @@ __all__ = [
     "explain_login",
     "explain_impersonation",
     "explain_sources",
+    "has_session_cookie",
     "interactive_login",
     "login_flow_from_env",
     "main",
@@ -495,6 +497,37 @@ def _rookiepy_module() -> Any | None:
     return rookiepy
 
 
+#: Account-level session cookie stems (edge-only cookies like ``cf_clearance``
+#: and UI flags like ``sidebar_state`` are excluded so an anonymous landing-page
+#: capture does not outrank a signed-in browser profile).
+_SESSION_SUBSTRING_HINTS: tuple[str, ...] = (
+    "session",
+    "token",
+    "auth",
+    "jwt",
+    "login",
+    "__secure",
+    "__host",
+)
+_SESSION_TOKEN_HINTS: frozenset[str] = frozenset({"sid", "sess"})
+_SESSION_SUFFIX_HINTS: tuple[str, ...] = ("sessid", "sessionid")
+
+
+def _is_session_cookie_name(name: str) -> bool:
+    lowered = name.lower()
+    if any(hint in lowered for hint in _SESSION_SUBSTRING_HINTS):
+        return True
+    if lowered.endswith(_SESSION_SUFFIX_HINTS):
+        return True
+    tokens = {part for part in re.split(r"[^a-z0-9]+", lowered) if part}
+    return bool(tokens & _SESSION_TOKEN_HINTS)
+
+
+def has_session_cookie(cookies: Mapping[str, str]) -> bool:
+    """Whether ``cookies`` includes at least one account-level session token."""
+    return any(_is_session_cookie_name(name) for name in cookies)
+
+
 def _from_other_browsers(options: AutoOptions) -> DiscoveredSession | None:
     """Read a Chromium-family profile through ``rookiepy``, if installed.
 
@@ -505,6 +538,7 @@ def _from_other_browsers(options: AutoOptions) -> DiscoveredSession | None:
     if rookiepy is None:
         return None
     domains = _domains_for(options)
+    fallback: DiscoveredSession | None = None
     for name in ROOKIEPY_BROWSERS:
         reader = getattr(rookiepy, name, None)
         if reader is None:
@@ -515,13 +549,17 @@ def _from_other_browsers(options: AutoOptions) -> DiscoveredSession | None:
             continue
         cookies = _flat_records(records)
         if cookies:
-            return DiscoveredSession(
+            found = DiscoveredSession(
                 source=f"browser:{name}",
                 cookies=cookies,
                 headers={},
                 description=f"{name} profile via rookiepy ({len(cookies)} names)",
             )
-    return None
+            if has_session_cookie(cookies):
+                return found
+            if fallback is None:
+                fallback = found
+    return fallback
 
 
 def _flat_records(records: Any) -> dict[str, str]:
@@ -539,22 +577,37 @@ def discover_session(options: AutoOptions | None = None) -> DiscoveredSession | 
 
     Order: explicit ``cookies=``, ``ARENA_COOKIE``/``ARENA_COOKIES_FILE``, a
     stored ``cookies.json``, the Firefox profile, then other browsers through
-    ``rookiepy``.
+    ``rookiepy``. Among implicit local sources (the default
+    ``./state/cookies.json`` and browser profiles), a signed-in session takes
+    precedence over an anonymous guest capture that holds no auth cookie.
     """
     options = options or AutoOptions()
-    candidates: list[Callable[[AutoOptions], DiscoveredSession | None]] = [
-        _from_explicit_cookies,
-        _from_environment,
-        _from_storage,
-    ]
-    if options.use_browser_profiles:
-        candidates.append(_from_firefox)
-        candidates.append(_from_other_browsers)
-    for candidate in candidates:
-        found = candidate(options)
+    for explicit in (_from_explicit_cookies, _from_environment):
+        found = explicit(options)
         if found is not None:
             return found
-    return None
+    if options.storage_path is not None:
+        stored = _from_storage(options)
+        if stored is not None:
+            return stored
+
+    implicit: list[Callable[[AutoOptions], DiscoveredSession | None]] = []
+    if options.storage_path is None:
+        implicit.append(_from_storage)
+    if options.use_browser_profiles:
+        implicit.append(_from_firefox)
+        implicit.append(_from_other_browsers)
+
+    guest_fallback: DiscoveredSession | None = None
+    for candidate in implicit:
+        found = candidate(options)
+        if found is None:
+            continue
+        if has_session_cookie(found.cookies):
+            return found
+        if guest_fallback is None:
+            guest_fallback = found
+    return guest_fallback
 
 
 def _report_line(label: str, value: str) -> str:
@@ -577,13 +630,18 @@ def explain_sources(options: AutoOptions | None = None) -> list[str]:
     path = _default_storage_path(options)
     if path is None:
         report.append(_report_line("stored cookies.json", "not configured"))
+    elif not path.is_file():
+        report.append(_report_line("stored cookies.json", f"{path} (absent)"))
     else:
-        report.append(
-            _report_line(
-                "stored cookies.json",
-                f"{path} " + ("(exists)" if path.is_file() else "(absent)"),
-            )
-        )
+        note = "(exists)"
+        if options.storage_path is None:
+            try:
+                stored = _from_storage(options)
+            except AuthenticationError:
+                stored = None
+            if stored is not None and not has_session_cookie(stored.cookies):
+                note = "(exists, guest/anonymous -- skipped for signed-in profile)"
+        report.append(_report_line("stored cookies.json", f"{path} {note}"))
     if not options.use_browser_profiles:
         report.append(
             _report_line(
@@ -732,12 +790,23 @@ def resolve_solver(options: AutoOptions) -> Any | None:
             ChallengeWaitSolver(
                 timeout=options.challenge_wait_timeout,
                 interactive=options.interactive,
+                prompt=options.prompt,
                 output=options.output,
             )
         )
     if not solvers:
         return None
     return solvers[0] if len(solvers) == 1 else CompositeSolver(*solvers)
+
+
+def _solver_needs_headed_window(solver: Any) -> bool:
+    """Whether ``solver`` asks a human to act in a visible browser window."""
+    if isinstance(solver, ChallengeWaitSolver):
+        return bool(solver.interactive)
+    members = getattr(solver, "solvers", None)
+    if members:
+        return any(_solver_needs_headed_window(item) for item in members)
+    return False
 
 
 def login_flow_from_env(options: AutoOptions) -> LoginFlow | None:
@@ -936,6 +1005,8 @@ def _verify_saved_session(options: AutoOptions, destination: Path) -> ProbeResul
         use_browser_profiles=False,
         login_from_env=False,
         interactive=False,
+        solve_captchas=False,
+        max_auth_refreshes=0,
         verify=False,
     )
     try:
@@ -1118,7 +1189,9 @@ def build_session_manager(
             capture_dir=capture_dir, raise_on_detection=False
         ),
         environment_options=BrowserEnvironmentOptions(
-            headless=True, artifacts_dir=options.artifacts_dir
+            headless=not _solver_needs_headed_window(solver),
+            channel=options.channel,
+            artifacts_dir=options.artifacts_dir,
         ),
         login_flow=login_flow_from_env(options),
         captcha_solver=solver,
@@ -1824,9 +1897,24 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
         )
         if not options.verify:
             return 0
-        with auto_client(options) as client:
+        status_options = replace(
+            options,
+            verify=False,
+            interactive=False,
+            solve_captchas=False,
+            login_from_env=False,
+            max_auth_refreshes=0,
+        )
+        with auto_client(status_options) as client:
             result = probe(client, options.probe_path)
         print(f"verification      : {result.describe()}")
+        if not result.ok and result.auth_problem and not impersonation_available():
+            print(
+                "hint              : TLS fingerprint impersonation is not installed "
+                f'({IMPERSONATE_EXTRA} or pip install -e ".[impersonate]"); '
+                "Cloudflare often challenges browser cookies sent with Python's "
+                "default TLS stack"
+            )
         return 0 if result.ok else 2
 
     with auto_client(options) as client:
