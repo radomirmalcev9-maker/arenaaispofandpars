@@ -3933,5 +3933,153 @@ def test_post_submit_bframe_autosolves_without_playwright_recaptcha_or_ffmpeg_an
     assert replayed_payloads[0]["recaptchaV2Token"] == "03AFcWeA_FRESH_V2_TOKEN"
 
 
+def test_cdp_whatwg_windows1252_mojibake_recovered_for_text_plain_without_charset(
+    tmp_path, monkeypatch
+) -> None:
+    """Chromium CDP decodes text/plain (without charset=utf-8) as WHATWG windows-1252; verify lossless UTF-8 recovery."""
+    original_answer = (
+        "Привет! Спасибо, всё отлично! 😊 Я — искусственный интеллект, "
+        "так что у меня всегда «рабочее настроение».\n\n"
+        "А у тебя как дела? Чем могу помочь?"
+    )
+    wire_line = f"a0:{json.dumps(original_answer, ensure_ascii=False)}\nad:{{\"finishReason\":\"stop\"}}\n"
+    raw_utf8 = wire_line.encode("utf-8")
+
+    # Simulate Blink TextResourceDecoder WHATWG windows-1252 decoding on text/plain:
+    whatwg_table = list(range(256))
+    for b in range(0x80, 0xA0):
+        try:
+            whatwg_table[b] = ord(bytes((b,)).decode("cp1252"))
+        except UnicodeDecodeError:
+            whatwg_table[b] = b
+    corrupted_cdp_text = "".join(chr(whatwg_table[b]) for b in raw_utf8)
+    assert "ÐŸÑ€Ð¸Ð²ÐµÑ‚!" in corrupted_cdp_text
+
+    # Also verify charset=utf-8 and standalone non-UTF-8 Latin-1 stay untouched:
+    assert (
+        auto_module._recover_cdp_utf8_bytes("café", "text/plain; charset=utf-8")
+        == "café".encode("utf-8")
+    )
+    assert (
+        auto_module._recover_cdp_utf8_bytes("café", "text/plain")
+        == "café".encode("utf-8")
+    )
+
+    class FakeRequest:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.method = "POST"
+
+    class FakeResponse:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.status = 200
+            # Notice: no "; charset=utf-8" in content-type, matching live arena.ai!
+            self.headers = {"content-type": "text/plain"}
+            self.request = FakeRequest(url)
+
+        async def text(self) -> str:
+            return corrupted_cdp_text
+
+    class FakeLocator:
+        def __init__(self, selector: str, page: "MojibakePage") -> None:
+            self.selector = selector
+            self._page = page
+
+        @property
+        def first(self) -> "FakeLocator":
+            return self
+
+        async def click(self) -> None:
+            if "data-arena-send" in self.selector:
+                url = "https://arena.ai/nextjs-api/stream/create-evaluation"
+                self._page._emit("request", FakeRequest(url))
+                self._page._emit("response", FakeResponse(url))
+
+        async def fill(self, value: str) -> None:
+            return None
+
+    class MojibakePage:
+        def __init__(self) -> None:
+            self.context = None
+            self._listeners: dict[str, list[object]] = {}
+
+        def on(self, event: str, cb: object) -> None:
+            self._listeners.setdefault(event, []).append(cb)
+
+        def remove_listener(self, event: str, cb: object) -> None:
+            return None
+
+        def _emit(self, event: str, payload: object) -> None:
+            for cb in list(self._listeners.get(event, ())):
+                assert callable(cb)
+                cb(payload)
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector, self)
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def content(self) -> str:
+            return "<html><body><form><textarea></textarea></form></body></html>"
+
+        async def evaluate(self, script: str) -> object:
+            if "arena_cleanup_marks" in script:
+                return None
+            if "data-arena-composer" in script and "data-arena-send" not in script:
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {"found": True, "confidence": "explicit", "x": 650, "y": 700}
+            if "recaptcha_anchor" in script:
+                return {"kind": None}
+            return None
+
+    class FakeEnv:
+        def __init__(self, options) -> None:
+            self.options = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def new_page(self):
+            return MojibakePage()
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=False),
+        solver=RecaptchaToolkitSolver(),
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+    )
+    client = auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        cookies={"arena-auth-prod-v1.0": "jwt"},
+        verification_token=tok,
+    )
+    try:
+        assert client.complete("Привет! Как дела?") == original_answer
+    finally:
+        client.close()
+
+
+def test_safe_stdout_write_handles_legacy_windows_codepage(monkeypatch) -> None:
+    raw_buf = io.BytesIO()
+    cp1251_stream = io.TextIOWrapper(raw_buf, encoding="cp1251", errors="strict")
+    monkeypatch.setattr(auto_module.sys, "stdout", cp1251_stream)
+    auto_module._safe_stdout_write("Привет! 😊 Всё отлично!")
+    written = raw_buf.getvalue().decode("cp1251")
+    assert "Привет!" in written
+    assert "Всё отлично!" in written
+
+
+
 
 

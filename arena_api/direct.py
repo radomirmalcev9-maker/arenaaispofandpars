@@ -850,10 +850,11 @@ class DirectArenaClient(_DirectMixin):
                 generation_params=generation.model_parameters() or None,
                 follow_up=follow_up,
             ) as (content_type, wire_chunks):
+                stream_deadline = time.monotonic() + generation.queue_timeout
                 for kind, value in _iter_wire_records(
                     wire_chunks, content_type=content_type
                 ):
-                    if time.monotonic() >= deadline:
+                    if time.monotonic() >= stream_deadline:
                         raise QueueTimeoutError(
                             "Direct Chat stream exceeded its configured timeout."
                         )
@@ -1158,10 +1159,11 @@ class AsyncDirectArenaClient(_DirectMixin):
                 generation_params=generation.model_parameters() or None,
                 follow_up=follow_up,
             ) as (content_type, wire_chunks):
+                stream_deadline = time.monotonic() + generation.queue_timeout
                 async for kind, value in _aiter_wire_records(
                     wire_chunks, content_type=content_type
                 ):
-                    if time.monotonic() >= deadline:
+                    if time.monotonic() >= stream_deadline:
                         raise QueueTimeoutError(
                             "Direct Chat stream exceeded its configured timeout."
                         )
