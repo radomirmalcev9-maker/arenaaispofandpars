@@ -230,8 +230,9 @@ def _models_from_markup(markup: str) -> list[ModelInfo]:
 
     # Use regex only as a last-resort fallback; parsing JSON first avoids a
     # loosely matched escaped string overriding a structured model record.
-    for candidate in candidates:
-        _regex_models(candidate, result)
+    if not result:
+        for candidate in candidates:
+            _regex_models(candidate, result)
 
     return sorted(
         result.values(), key=lambda item: (item.display_name or item.id).casefold()
@@ -605,9 +606,34 @@ class _DirectMixin:
                     f"Model {model!r} is currently unavailable."
                 )
             return min(available, key=model_chat_score).id
+        examples: list[str] = []
+        for item in sorted(
+            (m for m in known if m.available), key=model_chat_score
+        ):
+            label = str(item.display_name or item.id)
+            if label not in examples:
+                examples.append(label)
+            if len(examples) >= 5:
+                break
+        suffix = f" Examples: {', '.join(examples)}." if examples else ""
         raise ModelUnavailableError(
-            f"Model {model!r} was not found in the current Direct Chat model list."
+            f"Model {model!r} was not found in the current Direct Chat model list.{suffix}"
         )
+
+    def _stream_endpoint_path(self, chat_id: str, *, follow_up: bool) -> str:
+        if follow_up and self.direct_stream_path == DIRECT_STREAM_PATH:
+            return f"/nextjs-api/stream/post-to-evaluation/{chat_id}"
+        return self.direct_stream_path
+
+    def _stream_headers(self, base_url: str) -> dict[str, str]:
+        origin = base_url.rstrip("/")
+        referer = f"{origin}/{self.direct_page_path.lstrip('/')}"
+        return {
+            "content-type": "application/json",
+            "accept": "text/event-stream, text/plain, */*",
+            "origin": origin,
+            "referer": referer,
+        }
 
 
 class DirectArenaClient(_DirectMixin):
@@ -701,11 +727,12 @@ class DirectArenaClient(_DirectMixin):
         verification_token: str | None = None,
         config: GenerationConfig | None = None,
         conversation_id: str | None = None,
+        follow_up: bool = False,
     ) -> Iterator[StreamChunk]:
         generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
         model_id = self._resolve_model(model, self.get_models())
         token = self._token(verification_token)
-        chat_id = conversation_id or self.conversation_id or uuid7()
+        chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
         body = self._request_body(prompt, model_id, token, chat_id, generation)
@@ -714,11 +741,8 @@ class DirectArenaClient(_DirectMixin):
         deadline = time.monotonic() + generation.queue_timeout
         with self.transport.stream_request(
             "POST",
-            self.direct_stream_path,
-            headers={
-                "content-type": "application/json",
-                "accept": "text/event-stream, text/plain, */*",
-            },
+            self._stream_endpoint_path(chat_id, follow_up=follow_up),
+            headers=self._stream_headers(self.transport.base_url),
             content=json.dumps(body, separators=(",", ":")),
             timeout=httpx.Timeout(generation.queue_timeout),
         ) as response:
@@ -813,6 +837,7 @@ class DirectChatSession:
                 verification_token=verification_token,
                 config=self.config,
                 conversation_id=self.conversation_id,
+                follow_up=prior_conversation_id is not None,
             ):
                 if chunk.delta:
                     collected.append(chunk.delta)
@@ -943,11 +968,12 @@ class AsyncDirectArenaClient(_DirectMixin):
         verification_token: str | None = None,
         config: GenerationConfig | None = None,
         conversation_id: str | None = None,
+        follow_up: bool = False,
     ) -> AsyncIterator[StreamChunk]:
         generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
         model_id = self._resolve_model(model, await self.get_models())
         token = self._token(verification_token)
-        chat_id = conversation_id or self.conversation_id or uuid7()
+        chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
         body = self._request_body(prompt, model_id, token, chat_id, generation)
@@ -955,11 +981,8 @@ class AsyncDirectArenaClient(_DirectMixin):
         deadline = time.monotonic() + generation.queue_timeout
         async with self.transport.stream_request(
             "POST",
-            self.direct_stream_path,
-            headers={
-                "content-type": "application/json",
-                "accept": "text/event-stream, text/plain, */*",
-            },
+            self._stream_endpoint_path(chat_id, follow_up=follow_up),
+            headers=self._stream_headers(self.transport.base_url),
             content=json.dumps(body, separators=(",", ":")),
             timeout=httpx.Timeout(generation.queue_timeout),
         ) as response:
@@ -1049,6 +1072,7 @@ class AsyncDirectChatSession:
                 verification_token=verification_token,
                 config=self.config,
                 conversation_id=self.conversation_id,
+                follow_up=prior_conversation_id is not None,
             ):
                 if chunk.delta:
                     collected.append(chunk.delta)

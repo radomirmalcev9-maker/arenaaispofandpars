@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import json
 import os
 import re
 import sys
@@ -79,7 +80,14 @@ from .auth.captcha import (
     describe_solver,
 )
 from .auth.challenge import ChallengeHandler, ChallengeKind, ChallengeObservation
-from .auth.login import DEFAULT_STATE_PATH, LoginResult, login_and_save
+from .auth.environment import HIDE_WEBDRIVER_SCRIPT
+from .auth.login import (
+    AUTOMATION_BLINK_SWITCH,
+    AUTOMATION_DEFAULT_ARGS_TO_DROP,
+    DEFAULT_STATE_PATH,
+    LoginResult,
+    login_and_save,
+)
 from .auth.diagnostics import (
     collect_firefox_report,
     format_firefox_report,
@@ -1527,65 +1535,126 @@ def _token_solver(solver: Any) -> Any:
     return solver
 
 
-_EXECUTE_RECAPTCHA_V3_JS = """
-async () => {
-    const deadline = Date.now() + 4000;
-    let g = null;
-    while (Date.now() < deadline) {
-        g = (window.grecaptcha && window.grecaptcha.enterprise) || window.grecaptcha;
-        if (g && typeof g.execute === "function") break;
-        await new Promise((r) => setTimeout(r, 150));
-    }
-    if (!g || typeof g.execute !== "function") return null;
-    let siteKey = null;
-    for (const el of document.querySelectorAll("script[src*='recaptcha']")) {
-        try {
-            const u = new URL(el.src, location.href);
-            const k = u.searchParams.get("render");
-            if (k && k !== "explicit") { siteKey = k; break; }
-        } catch (_) {}
-    }
-    if (!siteKey) {
-        for (const el of document.querySelectorAll("iframe[src*='recaptcha']")) {
-            try {
+ARENA_RECAPTCHA_SITE_KEY_ENV = "ARENA_RECAPTCHA_SITE_KEY"
+_DEFAULT_ARENA_RECAPTCHA_SITE_KEY = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0"
+
+
+def _default_recaptcha_site_key(page_url: str) -> str:
+    explicit = os.environ.get(ARENA_RECAPTCHA_SITE_KEY_ENV, "").strip()
+    if explicit:
+        return explicit
+    host = (urlparse(page_url).hostname or "").lower()
+    if host == "arena.ai" or host.endswith(".arena.ai"):
+        return _DEFAULT_ARENA_RECAPTCHA_SITE_KEY
+    return ""
+
+
+def _build_execute_recaptcha_v3_js(fallback_site_key: str) -> str:
+    encoded_fallback = json.dumps(fallback_site_key)
+    return f"""
+async () => {{
+    const fallbackKey = {encoded_fallback};
+    const findDomSiteKey = () => {{
+        for (const el of document.querySelectorAll("script[src*='recaptcha']")) {{
+            try {{
+                const u = new URL(el.src, location.href);
+                const k = u.searchParams.get("render");
+                if (k && k !== "explicit") return k;
+            }} catch (_) {{}}
+        }}
+        for (const el of document.querySelectorAll("iframe[src*='recaptcha']")) {{
+            try {{
                 const u = new URL(el.src, location.href);
                 const k = u.searchParams.get("k");
-                if (k) { siteKey = k; break; }
-            } catch (_) {}
-        }
-    }
-    if (!siteKey) {
+                if (k) return k;
+            }} catch (_) {{}}
+        }}
         const el = document.querySelector("[data-sitekey]");
-        if (el) siteKey = el.getAttribute("data-sitekey");
-    }
-    if (!siteKey && window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
-        const seen = new Set();
-        const stack = [window.___grecaptcha_cfg.clients];
-        while (stack.length && !siteKey) {
-            const cur = stack.pop();
-            if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
-            seen.add(cur);
-            for (const v of Object.values(cur)) {
-                if (typeof v === "string" && /^6L[A-Za-z0-9_-]{38}$/.test(v)) {
-                    siteKey = v;
+        if (el) {{
+            const k = el.getAttribute("data-sitekey");
+            if (k) return k;
+        }}
+        if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {{
+            const seen = new Set();
+            const stack = [window.___grecaptcha_cfg.clients];
+            while (stack.length) {{
+                const cur = stack.pop();
+                if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
+                seen.add(cur);
+                for (const v of Object.values(cur)) {{
+                    if (typeof v === "string" && /^6L[A-Za-z0-9_-]{{38}}$/.test(v)) {{
+                        return v;
+                    }}
+                    if (v && typeof v === "object") stack.push(v);
+                }}
+            }}
+        }}
+        return null;
+    }};
+
+    let siteKey = findDomSiteKey();
+    if (!siteKey) {{
+        const scripts = Array.from(
+            document.querySelectorAll("script[src*='/_next/static/chunks/']")
+        ).slice(0, 20);
+        for (const s of scripts) {{
+            try {{
+                const txt = await (await fetch(s.src, {{ cache: "force-cache" }})).text();
+                const m =
+                    txt.match(/(?:recaptcha|siteKey|SITE_KEY)[^"']{{0,80}}["'](6L[A-Za-z0-9_-]{{38}})["']/i) ||
+                    txt.match(/["'](6Le[A-Za-z0-9_-]{{37}})["']/);
+                if (m && m[1]) {{
+                    siteKey = m[1];
                     break;
-                }
-                if (v && typeof v === "object") stack.push(v);
-            }
-        }
-    }
+                }}
+            }} catch (_) {{}}
+        }}
+    }}
+    if (!siteKey && fallbackKey) {{
+        siteKey = fallbackKey;
+    }}
     if (!siteKey) return null;
-    return await new Promise((resolve) => {
-        const timer = setTimeout(() => resolve(null), 15000);
-        const run = () => {
-            Promise.resolve(g.execute(siteKey, { action: "chat_submit" }))
-                .then((tok) => { clearTimeout(timer); resolve(tok || null); })
-                .catch(() => { clearTimeout(timer); resolve(null); });
-        };
+
+    const getExecutor = () => {{
+        if (window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === "function") {{
+            return window.grecaptcha.enterprise;
+        }}
+        if (window.grecaptcha && typeof window.grecaptcha.execute === "function") {{
+            return window.grecaptcha;
+        }}
+        return null;
+    }};
+
+    if (!getExecutor()) {{
+        const existing = document.querySelector("script[src*='recaptcha/enterprise.js'], script[src*='recaptcha/api.js']");
+        if (!existing && document.head) {{
+            const tag = document.createElement("script");
+            tag.src = "https://www.google.com/recaptcha/enterprise.js?render=" + encodeURIComponent(siteKey);
+            tag.async = true;
+            tag.defer = true;
+            document.head.appendChild(tag);
+        }}
+    }}
+
+    const deadline = Date.now() + 20000;
+    let g = getExecutor();
+    while (!g && Date.now() < deadline) {{
+        await new Promise((r) => setTimeout(r, 150));
+        g = getExecutor();
+    }}
+    if (!g) return null;
+
+    return await new Promise((resolve) => {{
+        const timer = setTimeout(() => resolve(null), 20000);
+        const run = () => {{
+            Promise.resolve(g.execute(siteKey, {{ action: "chat_submit" }}))
+                .then((tok) => {{ clearTimeout(timer); resolve(tok || null); }})
+                .catch(() => {{ clearTimeout(timer); resolve(null); }});
+        }};
         if (typeof g.ready === "function") g.ready(run);
         else run();
-    });
-}
+    }});
+}}
 """
 
 
@@ -1655,6 +1724,12 @@ class DirectVerificationToken:
         env_kwargs: dict[str, Any] = {
             "headless": True,
             "artifacts_dir": self.options.artifacts_dir,
+            "install_determinism_script": False,
+            "reduced_motion": "no-preference",
+            "color_scheme": "no-preference",
+            "ignore_default_args": AUTOMATION_DEFAULT_ARGS_TO_DROP,
+            "launch_args": (AUTOMATION_BLINK_SWITCH,),
+            "extra_init_scripts": (HIDE_WEBDRIVER_SCRIPT,),
         }
         if self.options.channel:
             env_kwargs["channel"] = self.options.channel
@@ -1665,6 +1740,12 @@ class DirectVerificationToken:
         )
         try:
             async with BrowserEnvironment(options) as environment:
+                handler = getattr(environment, "challenge_handler", None)
+                if handler is not None:
+                    # DirectVerificationToken drives the page imperatively; a
+                    # passive response-listener solve would reload the page in
+                    # parallel while page.evaluate / solver.asolve is running.
+                    handler.solve_on_detection = False
                 page = await environment.new_page()
                 context = getattr(page, "context", None)
                 if (
@@ -1686,8 +1767,11 @@ class DirectVerificationToken:
                 if isinstance(self.solver, RecaptchaToolkitSolver) and callable(
                     getattr(page, "evaluate", None)
                 ):
+                    js = _build_execute_recaptcha_v3_js(
+                        _default_recaptcha_site_key(self.page_url)
+                    )
                     try:
-                        direct_tok = await page.evaluate(_EXECUTE_RECAPTCHA_V3_JS)
+                        direct_tok = await page.evaluate(js)
                     except Exception:  # noqa: BLE001
                         direct_tok = None
                     if isinstance(direct_tok, str) and direct_tok.strip():
@@ -2297,15 +2381,21 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
                 ):
                     raise
                 with _direct_client_for_cli(client, options) as direct:
-                    models = direct.get_models()
+                    models = sorted(direct.get_models(), key=model_chat_score)
             print(f"models            : {len(models)}")
             for model in models[:25]:
                 print(f"  {model.id} — {model.display_name}")
         if args.prompt:
             explicit_vtoken = args.verification_token
+            requested_model = args.model
+            if (
+                isinstance(requested_model, str)
+                and requested_model.strip().lower() == "auto"
+            ):
+                requested_model = None
             stream_kwargs: dict[str, Any] = {}
-            if args.model is not None:
-                stream_kwargs["model"] = args.model
+            if requested_model is not None:
+                stream_kwargs["model"] = requested_model
             used_gradio = False
             if explicit_vtoken is None:
                 try:
@@ -2325,12 +2415,14 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
                 with _direct_client_for_cli(
                     client, options, verification_token=resolved_vtoken
                 ) as direct:
-                    target_model = args.model
+                    direct_models = (
+                        list(models) if models is not None else direct.get_models()
+                    )
+                    target_model = requested_model
                     if target_model is None:
-                        direct_models = (
-                            models if models is not None else direct.get_models()
-                        )
                         target_model = _default_direct_chat_model(direct_models)
+                    else:
+                        direct._resolve_model(target_model, direct_models)
                     print(f"model             : {target_model}")
                     _stream_to_stdout(
                         direct.stream(args.prompt, model=target_model)
