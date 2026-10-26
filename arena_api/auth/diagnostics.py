@@ -37,7 +37,7 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +47,9 @@ from .firefox_session import (
     FIREFOX_ROOT_ENV,
     FirefoxSessionError,
     FirefoxSessionManager,
+    _domain_matches,
     _expiry_seconds,
+    _sessionstore_cookie_rows,
 )
 
 __all__ = [
@@ -62,6 +64,16 @@ __all__ = [
 #: Cookies detailed per profile. Enough for a real session (a frontend sets a
 #: handful) and short enough to stay readable in a bug report.
 MAX_REPORTED_COOKIES = 25
+
+#: Pure-Python UTC epoch arithmetic avoids Windows UCRT ``_gmtime64_s`` failing
+#: with ``OSError: [Errno 22]`` on far-future timestamps (> year 3000).
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MAX_DISPLAY_EPOCH = 253_402_300_799  # 9999-12-31T23:59:59Z
+
+
+def _utc_from_epoch(seconds: int | float) -> datetime:
+    clamped = min(max(float(seconds), 0.0), float(_MAX_DISPLAY_EPOCH))
+    return _EPOCH + timedelta(seconds=clamped)
 
 #: Cookie names that usually carry the session itself, used only to point a
 #: reader at the interesting rows -- never to decide whether a session is valid.
@@ -114,7 +126,7 @@ class CookieFingerprint:
             "name": self.name,
             "path": self.path,
             "expires": (
-                datetime.fromtimestamp(self.expires, tz=timezone.utc)
+                _utc_from_epoch(self.expires)
                 .isoformat()
                 .replace("+00:00", "Z")
                 if self.expires
@@ -138,9 +150,7 @@ class CookieFingerprint:
             )
         )
         expiry = (
-            datetime.fromtimestamp(self.expires, tz=timezone.utc).strftime(
-                "%Y-%m-%d"
-            )
+            _utc_from_epoch(self.expires).strftime("%Y-%m-%d")
             if self.expires
             else "session"
         )
@@ -197,15 +207,6 @@ def _looks_like_auth(name: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def _domain_matches(host: str, targets: Sequence[str]) -> bool:
-    candidate = str(host).lstrip(".").lower()
-    for target in targets:
-        wanted = str(target).lstrip(".").lower()
-        if candidate == wanted or candidate.endswith("." + wanted):
-            return True
-    return False
-
-
 @contextmanager
 def _snapshot(database: Path) -> Iterator[Path]:
     """Copy ``cookies.sqlite`` and its sidecars so a live Firefox is untouched."""
@@ -240,6 +241,7 @@ def _database_overview(database: Path) -> dict[str, Any]:
         "path": str(database),
         "exists": database.is_file(),
         "size": 0,
+        "wal_size": 0,
         "modified": None,
         "journal_mode": None,
         "rows": 0,
@@ -251,10 +253,14 @@ def _database_overview(database: Path) -> dict[str, Any]:
     try:
         stat = database.stat()
         overview["size"] = stat.st_size
+        mtime = stat.st_mtime
+        wal = database.with_name(database.name + "-wal")
+        if wal.is_file():
+            wal_stat = wal.stat()
+            overview["wal_size"] = wal_stat.st_size
+            mtime = max(mtime, wal_stat.st_mtime)
         overview["modified"] = (
-            datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z")
+            _utc_from_epoch(mtime).isoformat().replace("+00:00", "Z")
         )
     except OSError as exc:  # pragma: no cover - permission edge
         overview["error"] = f"{type(exc).__name__}: {exc}"
@@ -306,67 +312,102 @@ def _raw_rows(database: Path) -> list[sqlite3.Row]:
 
 
 def _row(record: Any, key: str, default: Any = None) -> Any:
-    """Read one column of a :class:`sqlite3.Row` that may not exist here."""
+    """Read one column of a :class:`sqlite3.Row` or mapping."""
+    if isinstance(record, Mapping):
+        return record.get(key, default)
     return record[key] if key in record.keys() else default
 
 
 def _fingerprints(
     database: Path, targets: Sequence[str]
-) -> tuple[list[CookieFingerprint], int, list[str], list[str], int]:
+) -> tuple[
+    list[CookieFingerprint], int, list[str], list[str], int, str | None, int
+]:
     """Fingerprints for the matching cookies, plus what else is worth knowing.
 
+    Reads both ``cookies.sqlite`` (persistent cookies) and Firefox's
+    ``sessionstore`` (``recovery.jsonlz4`` / ``sessionstore.jsonlz4`` /
+    ``sessionstore.js`` -- session cookies without ``Expires``/``Max-Age``).
     Returns ``(matching, expired_matching, other_hosts, subdomain_hosts,
-    total_rows)``. ``subdomain_hosts`` matters because a cookie stored for
-    ``beta.arena.ai`` is *not* sent to ``arena.ai`` by any browser: if the whole
-    session lives there, the base URL is the thing to change, not the reader.
+    total_rows, sessionstore_source, sessionstore_matching)``.
+    ``subdomain_hosts`` matters because a cookie stored for ``beta.arena.ai``
+    is *not* sent to ``arena.ai`` by any browser: if the whole session lives
+    there, the base URL is the thing to change, not the reader.
     """
     matching: list[CookieFingerprint] = []
     expired = 0
     others: set[str] = set()
     subdomains: set[str] = set()
-    rows = _raw_rows(database)
+    sqlite_rows: list[Any] = _raw_rows(database) if database.is_file() else []
+    sessionstore_source, sessionstore_rows = _sessionstore_cookie_rows(
+        database.parent
+    )
+    seen_keys: set[tuple[str, str, str, str]] = set()
+    sessionstore_matching = 0
     now = time.time()
-    for row in rows:
-        host = str(_row(row, "host", "") or "")
-        name = str(_row(row, "name", "") or "")
-        value = _row(row, "value", "") or ""
-        if not _domain_matches(host, targets):
-            if "arena" in host.lower():
-                others.add(host)
-            continue
-        host_only = host.lstrip(".").lower()
-        if any(
-            host_only != str(target).lstrip(".").lower()
-            and host_only.endswith("." + str(target).lstrip(".").lower())
-            for target in targets
-        ):
-            subdomains.add(host)
-        moment = _expiry_seconds(_row(row, "expiry"))
-        if moment is not None and moment < now:
-            expired += 1
-            continue
-        length, digest, shape = _fingerprint_value(str(value))
-        same_site = _row(row, "sameSite", 0)
-        matching.append(
-            CookieFingerprint(
-                host=host,
-                name=name,
-                path=str(_row(row, "path", "/") or "/"),
-                expires=int(moment) if moment is not None else 0,
-                secure=bool(_row(row, "isSecure", 0)),
-                http_only=bool(_row(row, "isHttpOnly", 0)),
-                same_site=_SAME_SITE.get(
-                    int(same_site) if isinstance(same_site, int) else 0, "unset"
-                ),
-                container=str(_row(row, "originAttributes", "") or ""),
-                value_length=length,
-                value_sha256=digest,
-                shape=shape,
-                looks_like_auth=_looks_like_auth(name),
+
+    for from_sessionstore, batch in (
+        (False, sqlite_rows),
+        (True, sessionstore_rows),
+    ):
+        for row in batch:
+            host = str(_row(row, "host", "") or "")
+            name = str(_row(row, "name", "") or "")
+            value = _row(row, "value", "") or ""
+            path = str(_row(row, "path", "/") or "/")
+            container = str(_row(row, "originAttributes", "") or "")
+            if not _domain_matches(host, targets):
+                if "arena" in host.lower():
+                    others.add(host)
+                continue
+            key = (host, name, path, container)
+            if key in seen_keys:
+                continue
+            host_only = host.lstrip(".").lower()
+            if any(
+                host_only != str(target).lstrip(".").lower()
+                and host_only.endswith("." + str(target).lstrip(".").lower())
+                for target in targets
+            ):
+                subdomains.add(host)
+            moment = _expiry_seconds(_row(row, "expiry"))
+            if moment is not None and moment < now:
+                expired += 1
+                continue
+            seen_keys.add(key)
+            if from_sessionstore:
+                sessionstore_matching += 1
+            length, digest, shape = _fingerprint_value(str(value))
+            same_site = _row(row, "sameSite", 0)
+            matching.append(
+                CookieFingerprint(
+                    host=host,
+                    name=name,
+                    path=path,
+                    expires=int(moment) if moment is not None else 0,
+                    secure=bool(_row(row, "isSecure", 0)),
+                    http_only=bool(_row(row, "isHttpOnly", 0)),
+                    same_site=_SAME_SITE.get(
+                        int(same_site) if isinstance(same_site, int) else 0,
+                        "unset",
+                    ),
+                    container=container,
+                    value_length=length,
+                    value_sha256=digest,
+                    shape=shape,
+                    looks_like_auth=_looks_like_auth(name),
+                )
             )
-        )
     matching.sort(key=lambda item: (not item.looks_like_auth, item.name))
-    return matching, expired, sorted(others), sorted(subdomains), len(rows)
+    return (
+        matching,
+        expired,
+        sorted(others),
+        sorted(subdomains),
+        len(sqlite_rows),
+        sessionstore_source,
+        sessionstore_matching,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -469,33 +510,48 @@ def collect_firefox_report(
             f"only the first 8 of {len(candidates)} profiles are detailed"
         )
     for profile in candidates[:8]:
-        database = profile / "cookies.sqlite"
+        database = (
+            Path(cookie_database).expanduser()
+            if cookie_database is not None
+            else profile / "cookies.sqlite"
+        )
         entry: dict[str, Any] = {
             "profile": str(profile),
             "cookies_sqlite": _database_overview(database),
+            "sessionstore": {"source": None, "matching": 0},
             "matching": 0,
             "expired_matching": 0,
             "other_arena_hosts": [],
             "subdomain_hosts": [],
             "cookies": [],
         }
-        if database.is_file():
-            try:
-                matching, expired, others, subdomains, _ = _fingerprints(
-                    database, targets
-                )
-            except (sqlite3.DatabaseError, OSError) as exc:
-                entry["error"] = f"{type(exc).__name__}: {exc}"
-            else:
-                entry["matching"] = len(matching)
-                entry["expired_matching"] = expired
-                entry["other_arena_hosts"] = others
-                entry["subdomain_hosts"] = subdomains
-                entry["cookies"] = [
-                    item.as_dict() for item in matching[:MAX_REPORTED_COOKIES]
-                ]
-                if len(matching) > MAX_REPORTED_COOKIES:
-                    entry["omitted"] = len(matching) - MAX_REPORTED_COOKIES
+        try:
+            (
+                matching,
+                expired,
+                others,
+                subdomains,
+                _,
+                sessionstore_source,
+                sessionstore_matching,
+            ) = _fingerprints(database, targets)
+        except (sqlite3.DatabaseError, OSError) as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            entry["sessionstore"] = {
+                "source": sessionstore_source,
+                "matching": sessionstore_matching,
+            }
+            entry["matching"] = len(matching)
+            entry["expired_matching"] = expired
+            entry["other_arena_hosts"] = others
+            entry["subdomain_hosts"] = subdomains
+            entry["cookies"] = [
+                item.as_dict() for item in matching[:MAX_REPORTED_COOKIES]
+            ]
+            if len(matching) > MAX_REPORTED_COOKIES:
+                entry["omitted"] = len(matching) - MAX_REPORTED_COOKIES
+            if database.is_file() or sessionstore_source is not None:
                 report["warnings"].extend(
                     _profile_warnings(
                         profile, matching, expired, others, subdomains, targets
@@ -551,7 +607,7 @@ def _profile_warnings(
 ) -> list[str]:
     warnings: list[str] = []
     name = profile.name
-    if expired:
+    if expired and not any(item.looks_like_auth for item in matching):
         warnings.append(
             f"{name}: {expired} cookie(s) for {', '.join(targets)} are expired "
             "and were skipped -- the browser needs to renew the session"
@@ -612,11 +668,6 @@ def _report_warnings(
     cookies = report.get("cookies") or {}
     if cookies.get("error"):
         warnings.append(f"reading the session failed: {cookies['error']}")
-    elif cookies.get("count"):
-        names = ", ".join(cookies.get("names") or [])
-        warnings.append(
-            f"session read successfully: {cookies['count']} cookie name(s) -- {names}"
-        )
     return warnings
 
 
@@ -663,18 +714,32 @@ def format_firefox_report(report: Mapping[str, Any]) -> list[str]:
         marker = " (selected)" if str(entry.get("profile")) == str(selected) else ""
         line(f"profile {index}", f"{entry.get('profile')}{marker}")
         database = entry.get("cookies_sqlite") or {}
+        sessionstore = entry.get("sessionstore") or {}
         if not database.get("exists"):
             line("  cookies.sqlite", "missing")
-            continue
-        line(
-            "  cookies.sqlite",
-            f"{database.get('size', 0)} bytes, "
-            f"journal {database.get('journal_mode')}, "
-            f"{database.get('rows', 0)} row(s), "
-            f"modified {database.get('modified')}",
-        )
-        if database.get("error"):
-            line("  read error", database["error"])
+            if not sessionstore.get("source"):
+                continue
+        else:
+            wal_note = (
+                f" (+{database['wal_size']} bytes wal)"
+                if database.get("wal_size")
+                else ""
+            )
+            line(
+                "  cookies.sqlite",
+                f"{database.get('size', 0)} bytes{wal_note}, "
+                f"journal {database.get('journal_mode')}, "
+                f"{database.get('rows', 0)} row(s), "
+                f"modified {database.get('modified')}",
+            )
+            if database.get("error"):
+                line("  read error", database["error"])
+        if sessionstore.get("matching"):
+            line(
+                "  sessionstore",
+                f"{sessionstore.get('source')} "
+                f"({sessionstore.get('matching')} session cookie(s))",
+            )
         line(
             "  matching cookies",
             f"{entry.get('matching', 0)} "
