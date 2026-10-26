@@ -80,11 +80,11 @@ class BrowserEnvironmentOptions:
     #: Playwright's ``browser_type.launch(proxy=...)``.
     proxy: str | None = None
 
-    #: Sets ``navigator.language`` and ``navigator.languages``.
-    locale: str = "en-US"
+    #: Sets ``navigator.language`` and ``navigator.languages``; ``None`` keeps the host locale.
+    locale: str | None = "en-US"
 
-    #: Sets the ``Intl``/``Date`` timezone.
-    timezone_id: str = "UTC"
+    #: Sets the ``Intl``/``Date`` timezone; ``None`` keeps the host timezone.
+    timezone_id: str | None = "UTC"
 
     #: Viewport in CSS pixels; ``None`` uses the window size.
     viewport: dict[str, int] | None = field(
@@ -201,13 +201,15 @@ class BrowserEnvironmentOptions:
     def context_kwargs(self) -> dict[str, Any]:
         """Render the Playwright ``new_context`` keyword arguments."""
         kwargs: dict[str, Any] = {
-            "locale": self.locale,
-            "timezone_id": self.timezone_id,
             "device_scale_factor": self.device_scale_factor,
             "reduced_motion": self.reduced_motion,
             "color_scheme": self.color_scheme,
             "java_script_enabled": self.java_script_enabled,
         }
+        if self.locale is not None:
+            kwargs["locale"] = self.locale
+        if self.timezone_id is not None:
+            kwargs["timezone_id"] = self.timezone_id
         if self.viewport is not None:
             kwargs["viewport"] = dict(self.viewport)
             kwargs["no_viewport"] = False

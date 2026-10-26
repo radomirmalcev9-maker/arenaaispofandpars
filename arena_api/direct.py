@@ -410,6 +410,25 @@ def _check_direct_prefix(
 
 _SSE_PREFIXES: tuple[str, ...] = ("data:", "event:", "id:", "retry:", ":")
 _MAX_REASONABLE_CHAT_RANK = 100_000
+_MEDIA_ONLY_HINTS: tuple[str, ...] = (
+    "image",
+    "video",
+    "flux",
+    "imagen",
+    "midjourney",
+    "ideogram",
+    "recraft",
+    "seedream",
+    "suno",
+    "veo",
+    "sora",
+    "kling",
+    "hailuo",
+    "runway",
+    "pika",
+    "luma",
+    "kontext",
+)
 
 
 def _looks_like_standard_sse(prefix_bytes: bytes) -> bool:
@@ -443,6 +462,10 @@ def model_chat_score(item: ModelInfo) -> int:
             score += 100_000
         out_caps = caps.get("outputCapabilities")
         if out_caps is not None and not _has_capability(out_caps, "text"):
+            score += 50_000
+    else:
+        label = f"{item.display_name or ''} {item.id}".casefold()
+        if any(hint in label for hint in _MEDIA_ONLY_HINTS):
             score += 50_000
     rank_by_mod = meta.get("rankByModality")
     chat_rank = (
@@ -626,9 +649,12 @@ class _DirectMixin:
     @staticmethod
     def _resolve_model(model: str | None, known: list[ModelInfo]) -> str:
         if model is None:
-            raise ModelUnavailableError(
-                "Pass a model id or display name returned by get_models()."
-            )
+            available_all = [item for item in known if item.available]
+            if not available_all:
+                raise ModelUnavailableError(
+                    "No available Direct Chat models were found."
+                )
+            return min(available_all, key=model_chat_score).id
         for item in known:
             if model == item.id:
                 if not item.available:
@@ -787,7 +813,16 @@ class DirectArenaClient(_DirectMixin):
         follow_up: bool = False,
     ) -> Iterator[StreamChunk]:
         generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
-        model_id = self._resolve_model(model, self.get_models())
+        use_browser = _uses_browser_stream(
+            self.verification_token,
+            verification_token,
+            custom_http_transport=self.transport._custom_http_transport,
+        )
+        explicit_model_id: str | None = (
+            self._resolve_model(model, self.get_models())
+            if model is not None
+            else None
+        )
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
@@ -795,18 +830,25 @@ class DirectArenaClient(_DirectMixin):
         finished = False
         text = ""
         deadline = time.monotonic() + generation.queue_timeout
-        if _uses_browser_stream(
-            self.verification_token,
-            verification_token,
-            custom_http_transport=self.transport._custom_http_transport,
-        ):
+        if use_browser:
             browser_runner: Any = self.verification_token
+
+            def _fallback_body(tok: str) -> dict[str, Any]:
+                resolved_id = explicit_model_id or self._resolve_model(
+                    None, self.get_models()
+                )
+                return self._request_body(
+                    prompt, resolved_id, tok, chat_id, generation
+                )
+
             with browser_runner.stream_evaluation(
                 endpoint_path,
-                lambda tok: self._request_body(
-                    prompt, model_id, tok, chat_id, generation
-                ),
+                _fallback_body,
                 timeout=generation.queue_timeout,
+                prompt=prompt,
+                model_id_override=explicit_model_id,
+                generation_params=generation.model_parameters() or None,
+                follow_up=follow_up,
             ) as (content_type, wire_chunks):
                 for kind, value in _iter_wire_records(
                     wire_chunks, content_type=content_type
@@ -827,6 +869,7 @@ class DirectArenaClient(_DirectMixin):
                 )
             return
 
+        model_id = explicit_model_id or self._resolve_model(None, self.get_models())
         initial_token: str | None = self._token(verification_token)
 
         def build_content() -> str:
@@ -1078,25 +1121,42 @@ class AsyncDirectArenaClient(_DirectMixin):
         follow_up: bool = False,
     ) -> AsyncIterator[StreamChunk]:
         generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
-        model_id = self._resolve_model(model, await self.get_models())
+        use_browser = _uses_browser_stream(
+            self.verification_token,
+            verification_token,
+            custom_http_transport=self.transport._custom_http_transport,
+        )
+        explicit_model_id: str | None = (
+            self._resolve_model(model, await self.get_models())
+            if model is not None
+            else None
+        )
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
         endpoint_path = self._stream_endpoint_path(chat_id, follow_up=follow_up)
         text = ""
         deadline = time.monotonic() + generation.queue_timeout
-        if _uses_browser_stream(
-            self.verification_token,
-            verification_token,
-            custom_http_transport=self.transport._custom_http_transport,
-        ):
+        if use_browser:
             browser_runner: Any = self.verification_token
+            cached_default_id: str | None = explicit_model_id
+            if cached_default_id is None and self._models is not None:
+                cached_default_id = self._resolve_model(None, self._models)
+
+            def _fallback_body(tok: str) -> dict[str, Any]:
+                resolved_id = cached_default_id or "00000000-0000-0000-0000-000000000000"
+                return self._request_body(
+                    prompt, resolved_id, tok, chat_id, generation
+                )
+
             async with browser_runner.astream_evaluation(
                 endpoint_path,
-                lambda tok: self._request_body(
-                    prompt, model_id, tok, chat_id, generation
-                ),
+                _fallback_body,
                 timeout=generation.queue_timeout,
+                prompt=prompt,
+                model_id_override=explicit_model_id,
+                generation_params=generation.model_parameters() or None,
+                follow_up=follow_up,
             ) as (content_type, wire_chunks):
                 async for kind, value in _aiter_wire_records(
                     wire_chunks, content_type=content_type
@@ -1114,6 +1174,9 @@ class AsyncDirectArenaClient(_DirectMixin):
                 "Arena Direct Chat stream ended without a completion record."
             )
 
+        model_id = explicit_model_id or self._resolve_model(
+            None, await self.get_models()
+        )
         initial_token: str | None = self._token(verification_token)
 
         def build_content() -> str:

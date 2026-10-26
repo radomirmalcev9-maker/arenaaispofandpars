@@ -2751,7 +2751,7 @@ def test_cli_prompt_falls_back_to_direct_chat_and_selects_ranked_text_model(
 
     assert main(["--prompt", "Hi!", "--no-browser-profiles"]) == 0
     captured = capsys.readouterr()
-    assert "model             : gemini-2.5-flash" in captured.out
+    assert "model             :" not in captured.out
     assert "answer            : Привет!" in captured.out
     assert captured.err.count("[arena-api] session:") == 1
     assert len(sent_bodies) == 1
@@ -3062,4 +3062,171 @@ def test_direct_verification_token_401_user_not_found_raises_without_headed_retr
     with pytest.raises(AuthenticationError, match="User not found"):
         asyncio.run(run())
     assert seen_headless == [True]
+
+
+def test_direct_composer_submission_uses_native_ui_without_forcing_model_and_handles_v2_escalation(
+    tmp_path, monkeypatch
+) -> None:
+    seen_env_options: list[object] = []
+    typed_texts: list[str] = []
+    clicked_selectors: list[str] = []
+    arm_scripts: list[str] = []
+
+    class FakeLocator:
+        def __init__(self, selector: str, page: "ComposerPage") -> None:
+            self.selector = selector
+            self._page = page
+
+        @property
+        def first(self) -> "FakeLocator":
+            return self
+
+        async def click(self) -> None:
+            clicked_selectors.append(self.selector)
+            if "data-arena-send" in self.selector:
+                self._page._trigger_ui_submit()
+
+        async def fill(self, value: str) -> None:
+            typed_texts.append(f"fill:{value}")
+
+        async def press(self, key: str) -> None:
+            clicked_selectors.append(f"press:{key}")
+
+    class FakeKeyboard:
+        async def type(self, text: str, delay: int = 0) -> None:
+            typed_texts.append(text)
+
+    class FakeMouse:
+        async def move(self, x: float, y: float, steps: int = 1) -> None:
+            return None
+
+    class FakeContext:
+        async def add_cookies(self, cookies) -> None:
+            return None
+
+        async def cookies(self, urls=None):
+            return []
+
+    class ComposerPage:
+        def __init__(self, *, headless: bool) -> None:
+            self._headless = headless
+            self.context = FakeContext()
+            self.keyboard = FakeKeyboard()
+            self.mouse = FakeMouse()
+            self._exposed: dict[str, object] = {}
+            self._submitted = False
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector, self)
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def content(self) -> str:
+            return "<html><body><form><textarea></textarea><button type='submit'>Send</button></form></body></html>"
+
+        async def expose_function(self, name: str, fn: object) -> None:
+            self._exposed[name] = fn
+
+        def _trigger_ui_submit(self) -> None:
+            self._submitted = True
+            err_fn = self._exposed["__arenaDirectHttpError"]
+            meta_fn = self._exposed["__arenaDirectMeta"]
+            chunk_fn = self._exposed["__arenaDirectChunk"]
+            eof_fn = self._exposed["__arenaDirectEof"]
+            assert (
+                callable(err_fn)
+                and callable(meta_fn)
+                and callable(chunk_fn)
+                and callable(eof_fn)
+            )
+            if self._headless:
+                err_fn(
+                    {
+                        "status": 403,
+                        "body": '{"error":"recaptcha validation failed"}',
+                        "contentType": "application/json",
+                        "cfMitigated": "",
+                    }
+                )
+                return
+            # Simulate arena.ai's React UI receiving an initial v3 403 and
+            # automatically escalating to invisible v2 on the next fetch.
+            err_fn(
+                {
+                    "status": 403,
+                    "body": '{"error":"recaptcha validation failed"}',
+                    "contentType": "application/json",
+                    "cfMitigated": "",
+                }
+            )
+            meta_fn("text/plain; charset=utf-8")
+            chunk_fn('a0:"Ответ из UI"\nad:{"finishReason":"stop"}\n')
+            eof_fn()
+
+        async def evaluate(self, script: str) -> object:
+            if "__arenaTapArmed" in script:
+                arm_scripts.append(script)
+                return None
+            if "composer_nonempty" in script:
+                return not self._submitted
+            if "data-arena-composer" in script and "data-arena-send" not in script:
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {"found": True, "x": 650, "y": 700}
+            if "bframe" in script:
+                return False
+            raise AssertionError(f"unexpected evaluate script: {script[:80]}")
+
+    class FakeEnv:
+        def __init__(self, options) -> None:
+            self.options = options
+            seen_env_options.append(options)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def new_page(self):
+            return ComposerPage(headless=self.options.headless)
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=RecaptchaToolkitSolver(),
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+        cookie_source="firefox",
+    )
+
+    client = auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        cookies={"arena-auth-prod-v1.0": "jwt"},
+        verification_token=tok,
+    )
+    monkeypatch.setattr(
+        client,
+        "get_models",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("get_models() should not be called when model is None")
+        ),
+    )
+    try:
+        answer = client.complete("Объясни TCP и UDP.")
+    finally:
+        client.close()
+
+    assert answer == "Ответ из UI"
+    assert typed_texts == ["Объясни TCP и UDP.", "Объясни TCP и UDP."]
+    assert any("window.__arenaBodyPatch = null" in s for s in arm_scripts)
+    assert len(seen_env_options) == 2
+    assert getattr(seen_env_options[0], "locale") is None
+    assert getattr(seen_env_options[0], "timezone_id") is None
+
 
