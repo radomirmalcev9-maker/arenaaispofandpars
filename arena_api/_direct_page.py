@@ -8,10 +8,12 @@ imports so ``import arena_api`` remains fast and dependency-light.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -772,13 +774,9 @@ async def _click_challenge_checkbox(
 async def _gentle_page_warmup(page: Any) -> None:
     mouse = getattr(page, "mouse", None)
     move_fn = getattr(mouse, "move", None) if mouse is not None else None
-    wait_fn = getattr(page, "wait_for_timeout", None)
     if callable(move_fn):
         try:
-            await move_fn(280.0, 260.0, steps=6)
-            if callable(wait_fn):
-                await wait_fn(80)
-            await move_fn(460.0, 420.0, steps=8)
+            await move_fn(360.0, 340.0, steps=3)
         except Exception:  # noqa: BLE001
             pass
 
@@ -885,7 +883,18 @@ async def _submit_prompt_via_composer(
             f"() => {{ window.__arenaBodyPatch = {patch_literal}; window.__arenaTapArmed = true; }}"
         )
 
+    wait_fn = getattr(page, "wait_for_timeout", None)
     info = await eval_fn(_FIND_COMPOSER_JS)
+    if (
+        isinstance(info, Mapping)
+        and not info.get("found")
+        and callable(wait_fn)
+    ):
+        for _ in range(25):
+            await wait_fn(40)
+            info = await eval_fn(_FIND_COMPOSER_JS)
+            if not isinstance(info, Mapping) or info.get("found"):
+                break
     if not isinstance(info, Mapping) or not info.get("found"):
         return False
 
@@ -894,8 +903,7 @@ async def _submit_prompt_via_composer(
         cx = float(info.get("x") or 400)
         cy = float(info.get("y") or 700)
         try:
-            await mouse.move(max(40.0, cx - 120.0), max(40.0, cy - 80.0), steps=5)
-            await mouse.move(cx, cy, steps=8)
+            await mouse.move(cx, cy, steps=3)
         except Exception:  # noqa: BLE001
             pass
 
@@ -906,11 +914,11 @@ async def _submit_prompt_via_composer(
     single_line = "\n" not in prompt and "\r" not in prompt
     if (
         single_line
-        and len(prompt) <= 160
+        and len(prompt) <= 32
         and keyboard is not None
         and callable(getattr(keyboard, "type", None))
     ):
-        await keyboard.type(prompt, delay=12)
+        await keyboard.type(prompt, delay=2)
         try:
             non_empty = await eval_fn(_COMPOSER_NONEMPTY_JS)
         except Exception:  # noqa: BLE001
@@ -918,18 +926,17 @@ async def _submit_prompt_via_composer(
         if not non_empty:
             await composer.fill(prompt)
     else:
-        first_line = prompt.splitlines()[0][:24] if prompt else ""
+        first_line = prompt.splitlines()[0][:4] if prompt else ""
         if (
             first_line
             and keyboard is not None
             and callable(getattr(keyboard, "type", None))
         ):
-            await keyboard.type(first_line, delay=12)
+            await keyboard.type(first_line, delay=2)
         await composer.fill(prompt)
 
-    wait_fn = getattr(page, "wait_for_timeout", None)
     if callable(wait_fn):
-        await wait_fn(150)
+        await wait_fn(15)
 
     btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
     try:
@@ -939,7 +946,7 @@ async def _submit_prompt_via_composer(
                     await mouse.move(
                         float(btn_info.get("x") or 500),
                         float(btn_info.get("y") or 700),
-                        steps=6,
+                        steps=2,
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -951,7 +958,7 @@ async def _submit_prompt_via_composer(
             # submission while grecaptcha.enterprise.execute() is still running.
             if btn_info.get("confidence") == "fallback":
                 if callable(wait_fn):
-                    await wait_fn(900)
+                    await wait_fn(500)
                 already_started = bool(has_submitted and has_submitted())
                 if not already_started:
                     challenge = await _detect_post_submit_challenge(page)
@@ -971,3 +978,339 @@ async def _submit_prompt_via_composer(
         except Exception:  # noqa: BLE001
             pass
     return True
+
+
+# --------------------------------------------------------------------------- #
+# Real-time C++ CDP response streaming (Network.streamResourceContent)
+# --------------------------------------------------------------------------- #
+
+_CDP_ARM_TIMEOUT_SECONDS = 2.0
+
+
+def _is_eval_stream_url_local(url: str) -> bool:
+    return any(marker in url for marker in _EVAL_STREAM_URL_MARKERS)
+
+
+class _CdpEvalStreamPump:
+    """Stream Direct Chat HTTP 2xx evaluation bodies live over CDP.
+
+    Uses ``Network.streamResourceContent`` + ``Network.dataReceived`` so raw
+    wire chunks reach Python immediately as tokens arrive from ``arena.ai``
+    (zero JS injection, zero ``resp.text()`` full-response wait, and raw wire
+    UTF-8 bytes untouched by Blink's ``TextResourceDecoder``).
+    """
+
+    def __init__(self, cdp: Any, *, owns_session: bool = True) -> None:
+        self._cdp = cdp
+        self._owns_session = owns_session
+        self._queue: asyncio.Queue[tuple[str, Any]] | None = None
+        self._eval_requests: set[str] = set()
+        self._captures: dict[str, dict[str, Any]] = {}
+        self._unmatched_cdp_claims: deque[
+            asyncio.Future[asyncio.Future[None] | None]
+        ] = deque()
+        self._unmatched_pw_waiters: deque[
+            asyncio.Future[asyncio.Future[None] | None]
+        ] = deque()
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._listeners: list[tuple[str, Callable[..., Any]]] = []
+        self._closed = False
+
+    @classmethod
+    async def attach(
+        cls,
+        context: Any,
+        page: Any,
+        *,
+        existing_cdp: Any = None,
+    ) -> _CdpEvalStreamPump | None:
+        cdp = existing_cdp
+        owns_session = False
+        if cdp is None:
+            new_cdp_fn = getattr(context, "new_cdp_session", None)
+            if not callable(new_cdp_fn):
+                return None
+            try:
+                cdp = await new_cdp_fn(page)
+                owns_session = True
+            except Exception:  # noqa: BLE001
+                return None
+        on_fn = getattr(cdp, "on", None)
+        send_fn = getattr(cdp, "send", None)
+        if not (callable(on_fn) and callable(send_fn)):
+            if owns_session:
+                detach_fn = getattr(cdp, "detach", None)
+                if callable(detach_fn):
+                    try:
+                        await detach_fn()
+                    except Exception:  # noqa: BLE001
+                        pass
+            return None
+        try:
+            await send_fn("Network.enable")
+        except Exception:  # noqa: BLE001
+            if owns_session:
+                detach_fn = getattr(cdp, "detach", None)
+                if callable(detach_fn):
+                    try:
+                        await detach_fn()
+                    except Exception:  # noqa: BLE001
+                        pass
+            return None
+        pump = cls(cdp, owns_session=owns_session)
+        pump._install_listeners()
+        return pump
+
+    def _install_listeners(self) -> None:
+        on_fn = getattr(self._cdp, "on", None)
+        if not callable(on_fn):
+            return
+        pairs: tuple[tuple[str, Callable[[Any], None]], ...] = (
+            ("Network.requestWillBeSent", self._on_request_will_be_sent),
+            ("Network.responseReceived", self._on_response_received),
+            ("Network.dataReceived", self._on_data_received),
+            ("Network.loadingFinished", self._on_loading_finished),
+            ("Network.loadingFailed", self._on_loading_failed),
+        )
+        for ev_name, handler in pairs:
+            on_fn(ev_name, handler)
+            self._listeners.append((ev_name, handler))
+
+    def bind_queue(
+        self, queue_obj: asyncio.Queue[tuple[str, Any]] | None
+    ) -> None:
+        self._queue = queue_obj
+        self._eval_requests.clear()
+        for entry in list(self._captures.values()):
+            done_fut = entry.get("done_fut")
+            if isinstance(done_fut, asyncio.Future) and not done_fut.done():
+                done_fut.set_result(None)
+        self._captures.clear()
+        while self._unmatched_cdp_claims:
+            fut = self._unmatched_cdp_claims.popleft()
+            if not fut.done():
+                fut.set_result(None)
+        while self._unmatched_pw_waiters:
+            fut = self._unmatched_pw_waiters.popleft()
+            if not fut.done():
+                fut.set_result(None)
+
+    def _on_request_will_be_sent(self, params: Any) -> None:
+        if self._closed or self._queue is None or not isinstance(params, Mapping):
+            return
+        req_id = params.get("requestId")
+        req_obj = params.get("request")
+        if not (isinstance(req_id, str) and req_id and isinstance(req_obj, Mapping)):
+            return
+        method = str(req_obj.get("method") or "GET").upper()
+        url = str(req_obj.get("url") or "")
+        if method == "POST" and _is_eval_stream_url_local(url):
+            self._eval_requests.add(req_id)
+
+    def _on_response_received(self, params: Any) -> None:
+        if self._closed or self._queue is None or not isinstance(params, Mapping):
+            return
+        req_id = params.get("requestId")
+        if not isinstance(req_id, str) or req_id not in self._eval_requests:
+            return
+        resp_obj = params.get("response")
+        if not isinstance(resp_obj, Mapping):
+            return
+        status = int(resp_obj.get("status") or 200)
+        if status >= 400:
+            self._eval_requests.discard(req_id)
+            return
+        ct_val = ""
+        raw_hdrs = resp_obj.get("headers")
+        if isinstance(raw_hdrs, Mapping):
+            for hk, hv in raw_hdrs.items():
+                if str(hk).lower() == "content-type":
+                    ct_val = str(hv or "")
+                    break
+
+        loop = asyncio.get_running_loop()
+        if self._unmatched_pw_waiters:
+            claim_fut = self._unmatched_pw_waiters.popleft()
+        else:
+            claim_fut = loop.create_future()
+            self._unmatched_cdp_claims.append(claim_fut)
+
+        done_fut: asyncio.Future[None] = loop.create_future()
+        entry: dict[str, Any] = {
+            "armed": False,
+            "failed_arm": False,
+            "pending_chunks": [],
+            "ended": None,
+            "content_type": ct_val,
+            "queue": self._queue,
+            "done_fut": done_fut,
+        }
+        self._captures[req_id] = entry
+        task = loop.create_task(self._arm_stream(req_id, entry, claim_fut))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _emit_to_entry_queue(
+        self, entry: Mapping[str, Any], item: tuple[str, Any]
+    ) -> None:
+        q = entry.get("queue")
+        if isinstance(q, asyncio.Queue) and q is self._queue:
+            q.put_nowait(item)
+
+    async def _arm_stream(
+        self,
+        req_id: str,
+        entry: dict[str, Any],
+        claim_fut: asyncio.Future[asyncio.Future[None] | None],
+    ) -> None:
+        try:
+            res = await asyncio.wait_for(
+                self._cdp.send(
+                    "Network.streamResourceContent", {"requestId": req_id}
+                ),
+                timeout=_CDP_ARM_TIMEOUT_SECONDS,
+            )
+            if not isinstance(res, Mapping):
+                raise RuntimeError("empty streamResourceContent response")
+            buf_b64 = res.get("bufferedData")
+            buffered = (
+                base64.b64decode(buf_b64)
+                if isinstance(buf_b64, str) and buf_b64
+                else b""
+            )
+        except Exception:  # noqa: BLE001
+            entry["failed_arm"] = True
+            self._captures.pop(req_id, None)
+            self._eval_requests.discard(req_id)
+            done_fut = entry["done_fut"]
+            if not done_fut.done():
+                done_fut.set_result(None)
+            if not claim_fut.done():
+                claim_fut.set_result(None)
+            return
+
+        done_fut = entry["done_fut"]
+        if not claim_fut.done():
+            claim_fut.set_result(done_fut)
+
+        self._emit_to_entry_queue(entry, ("meta", entry["content_type"]))
+        if buffered:
+            self._emit_to_entry_queue(entry, ("chunk", buffered))
+        pending: list[bytes] = entry["pending_chunks"]
+        for raw_chunk in pending:
+            if raw_chunk:
+                self._emit_to_entry_queue(entry, ("chunk", raw_chunk))
+        pending.clear()
+
+        entry["armed"] = True
+        ended = entry["ended"]
+        if ended is not None:
+            self._captures.pop(req_id, None)
+            self._eval_requests.discard(req_id)
+            self._emit_to_entry_queue(entry, ended)
+            if not done_fut.done():
+                done_fut.set_result(None)
+
+    def _on_data_received(self, params: Any) -> None:
+        if not self._captures or not isinstance(params, Mapping):
+            return
+        req_id = params.get("requestId")
+        if not isinstance(req_id, str):
+            return
+        entry = self._captures.get(req_id)
+        if entry is None or entry.get("failed_arm"):
+            return
+        b64 = params.get("data")
+        if not isinstance(b64, str) or not b64:
+            return
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:  # noqa: BLE001
+            return
+        if not raw:
+            return
+        if entry["armed"]:
+            self._emit_to_entry_queue(entry, ("chunk", raw))
+        else:
+            entry["pending_chunks"].append(raw)
+
+    def _on_loading_finished(self, params: Any) -> None:
+        self._finish_request(params, ("eof", None))
+
+    def _on_loading_failed(self, params: Any) -> None:
+        if not isinstance(params, Mapping):
+            return
+        if params.get("canceled"):
+            terminal: tuple[str, Any] = ("eof", None)
+        else:
+            err_text = str(params.get("errorText") or "network stream failed")
+            terminal = ("stream_error", err_text)
+        self._finish_request(params, terminal)
+
+    def _finish_request(
+        self, params: Any, terminal: tuple[str, Any]
+    ) -> None:
+        if not isinstance(params, Mapping):
+            return
+        req_id = params.get("requestId")
+        if not isinstance(req_id, str):
+            return
+        self._eval_requests.discard(req_id)
+        entry = self._captures.get(req_id)
+        if entry is None or entry.get("failed_arm"):
+            return
+        if entry["armed"]:
+            self._captures.pop(req_id, None)
+            self._emit_to_entry_queue(entry, terminal)
+            done_fut = entry["done_fut"]
+            if not done_fut.done():
+                done_fut.set_result(None)
+        else:
+            entry["ended"] = terminal
+
+    async def await_claim_for_2xx(self) -> asyncio.Future[None] | None:
+        if self._closed or self._queue is None:
+            return None
+        if self._unmatched_cdp_claims:
+            claim_fut = self._unmatched_cdp_claims.popleft()
+            return await claim_fut
+        if not self._eval_requests:
+            return None
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[asyncio.Future[None] | None] = (
+            loop.create_future()
+        )
+        self._unmatched_pw_waiters.append(waiter)
+        try:
+            return await asyncio.wait_for(waiter, timeout=0.35)
+        except asyncio.TimeoutError:
+            try:
+                self._unmatched_pw_waiters.remove(waiter)
+            except ValueError:
+                pass
+            return None
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.bind_queue(None)
+        remove_fn = getattr(self._cdp, "remove_listener", None)
+        if callable(remove_fn):
+            for ev_name, cb in self._listeners:
+                try:
+                    remove_fn(ev_name, cb)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._listeners.clear()
+        for task in list(self._tasks):
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
+        if self._owns_session:
+            detach_fn = getattr(self._cdp, "detach", None)
+            if callable(detach_fn):
+                try:
+                    await detach_fn()
+                except Exception:  # noqa: BLE001
+                    pass
