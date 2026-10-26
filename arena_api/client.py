@@ -47,6 +47,7 @@ from .transport import (
     ArenaTransport,
     AsyncArenaTransport,
     CookieInput,
+    ProxyInput,
     impersonation_available,
 )
 
@@ -73,10 +74,24 @@ class _ResolvedSessionSource:
     #: curl_cffi profile matching the browser this session came from, when the
     #: source knows it -- a Firefox manager knows it is Firefox.
     impersonate: str | None = None
+    #: Manual proxy configured in the browser profile itself, if any.
+    proxy: str | None = None
 
 
 def _base_host(base_url: str) -> str | None:
     return urlparse(base_url).hostname
+
+
+def _derived_proxy(manager: SessionManager, base_url: str) -> str | None:
+    getter = getattr(manager, "proxy_url", None)
+    if not callable(getter):
+        return None
+    parsed = urlparse(base_url)
+    try:
+        value = getter(scheme=parsed.scheme or "https", host=parsed.hostname)
+    except Exception:  # noqa: BLE001 - optional profile metadata
+        return None
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _derived_impersonation(manager: SessionManager, *, from_string: bool) -> str | None:
@@ -180,6 +195,7 @@ def _resolve_session_source(
         cookies=cookies,
         headers=manager.firefox_headers(),
         impersonate=_derived_impersonation(manager, from_string=from_firefox),
+        proxy=_derived_proxy(manager, base_url),
     )
 
 
@@ -577,6 +593,7 @@ class ArenaClient(_ArenaClientMixin):
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
         verify: bool | str = True,
+        proxy: ProxyInput = None,
         chat_fn_index: int | None = None,
         battle_fn_index: int | None = None,
         chat_payload_factory: ChatPayloadFactory | None = None,
@@ -599,6 +616,8 @@ class ArenaClient(_ArenaClientMixin):
             timeout=timeout,
             http2=http2,
             verify=verify,
+            proxy=proxy,
+            fallback_proxy=session.proxy if session is not None else None,
             http_transport=http_transport,
             impersonate=resolve_impersonation(
                 impersonate,
@@ -826,6 +845,7 @@ class AsyncArenaClient(_ArenaClientMixin):
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
         verify: bool | str = True,
+        proxy: ProxyInput = None,
         chat_fn_index: int | None = None,
         battle_fn_index: int | None = None,
         chat_payload_factory: ChatPayloadFactory | None = None,
@@ -848,6 +868,8 @@ class AsyncArenaClient(_ArenaClientMixin):
             timeout=timeout,
             http2=http2,
             verify=verify,
+            proxy=proxy,
+            fallback_proxy=session.proxy if session is not None else None,
             http_transport=http_transport,
             impersonate=resolve_impersonation(
                 impersonate,

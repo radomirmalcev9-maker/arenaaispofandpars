@@ -225,7 +225,7 @@ class CurlCffiProbe:
                     "curl_cffi is required for session validation; "
                     "install it with `pip install curl_cffi`"
                 ) from exc
-            request = curl_requests.get
+            request = None
         else:
             request = factory
 
@@ -236,11 +236,20 @@ class CurlCffiProbe:
             "allow_redirects": True,
             "verify": self.verify,
         }
-        if self.proxy:
-            options["proxy"] = self.proxy
         if self.impersonate:
             options["impersonate"] = self.impersonate
-        response = request(url, **options)
+        if request is None:
+            from ..transport import resolve_proxy_url
+
+            effective_proxy = resolve_proxy_url(url, self.proxy)
+            if effective_proxy:
+                options["proxy"] = effective_proxy
+            with curl_requests.Session(trust_env=False) as session:
+                response = session.get(url, **options)
+        else:
+            if self.proxy:
+                options["proxy"] = self.proxy
+            response = request(url, **options)
         return RawResponse(
             status=int(response.status_code),
             headers={

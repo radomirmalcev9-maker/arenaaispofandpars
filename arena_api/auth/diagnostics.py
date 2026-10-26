@@ -450,12 +450,29 @@ def _rookiepy_state() -> str:
     return "installed"
 
 
+def _pkg_version(dist_name: str) -> str | None:
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version(dist_name)
+    except (ImportError, PackageNotFoundError):
+        return None
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def _impersonation_state() -> str:
     """Whether browser TLS fingerprint impersonation is available."""
     has_curl = importlib.util.find_spec("curl_cffi") is not None
     has_transport = importlib.util.find_spec("httpx_curl_cffi") is not None
     if has_curl and has_transport:
-        return "installed (curl_cffi + httpx_curl_cffi)"
+        curl_ver = _pkg_version("curl-cffi") or _pkg_version("curl_cffi")
+        tr_ver = _pkg_version("httpx-curl-cffi") or _pkg_version("httpx_curl_cffi")
+        curl_label = f"curl_cffi {curl_ver}" if curl_ver else "curl_cffi"
+        tr_label = (
+            f"httpx_curl_cffi {tr_ver}" if tr_ver else "httpx_curl_cffi"
+        )
+        return f"installed ({curl_label} + {tr_label})"
     return 'not installed (pip install -e ".[impersonate]")'
 
 

@@ -115,6 +115,9 @@ _LOCALE_REQUESTED_RE = re.compile(
 _UA_OVERRIDE_RE = re.compile(
     r'user_pref\(\s*"general\.useragent\.override"\s*,\s*"([^"]*)"\s*\)'
 )
+_PREF_ENTRY_RE = re.compile(
+    r'user_pref\(\s*"([^"]+)"\s*,\s*("(?:[^"\\]|\\.)*"|true|false|-?\d+)\s*\)'
+)
 _BCP47_TAG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 
 _COOKIE_RECORD_QUERY = """
@@ -798,6 +801,99 @@ def _normalize_accept_language(value: str) -> str:
     return f"{tag},{language};q=0.8,en-US;q=0.5,en;q=0.3"
 
 
+def _bracket_proxy_host(host: str) -> str:
+    cleaned = host.strip()
+    if ":" in cleaned and not cleaned.startswith("["):
+        return f"[{cleaned}]"
+    return cleaned
+
+
+def _firefox_no_proxy_matches(host: str | None, raw_patterns: str) -> bool:
+    if not host:
+        return False
+    target = host.strip().strip("[]").lower()
+    if not target:
+        return False
+    for token in re.split(r"[\s,]+", raw_patterns.strip()):
+        pattern = token.strip().lower()
+        if not pattern:
+            continue
+        pattern = pattern.split(":", 1)[0] if pattern.count(":") == 1 else pattern.strip("[]")
+        if pattern in ("*", "<local>") and "." not in target:
+            return True
+        if pattern == "*":
+            return True
+        stripped = pattern.lstrip(".")
+        if target == stripped or target.endswith("." + stripped):
+            return True
+    return False
+
+
+def _parse_firefox_proxy(
+    prefs_text: str, *, scheme: str = "https", host: str | None = None
+) -> str | None:
+    """Extract a manual proxy URL from Firefox ``prefs.js`` when configured.
+
+    Firefox uses ``network.proxy.type == 1`` for manual proxy settings; its
+    default (``5``) delegates to the OS proxy, which ``urllib.request`` already
+    reads. Only manual settings are returned here so ``network.proxy.type == 0``
+    ("No proxy") or stale host fields left behind after switching back to
+    system proxy are ignored.
+    """
+    prefs: dict[str, Any] = {}
+    for key, raw_val in _PREF_ENTRY_RE.findall(prefs_text):
+        if not key.startswith("network.proxy."):
+            continue
+        if raw_val.startswith('"') and raw_val.endswith('"'):
+            prefs[key] = raw_val[1:-1].replace(r"\"", '"').replace(r"\\", "\\")
+        elif raw_val == "true":
+            prefs[key] = True
+        elif raw_val == "false":
+            prefs[key] = False
+        else:
+            try:
+                prefs[key] = int(raw_val)
+            except ValueError:
+                continue
+
+    if prefs.get("network.proxy.type") != 1:
+        return None
+    no_proxies_on = str(prefs.get("network.proxy.no_proxies_on", "localhost, 127.0.0.1"))
+    if _firefox_no_proxy_matches(host, no_proxies_on):
+        return None
+
+    target_scheme = scheme.lower() or "https"
+    if target_scheme == "https":
+        ssl_host = str(prefs.get("network.proxy.ssl") or "").strip()
+        ssl_port = prefs.get("network.proxy.ssl_port")
+        if ssl_host and isinstance(ssl_port, int) and ssl_port > 0:
+            return f"http://{_bracket_proxy_host(ssl_host)}:{ssl_port}"
+        if prefs.get("network.proxy.share_proxy_settings") is True:
+            http_host = str(prefs.get("network.proxy.http") or "").strip()
+            http_port = prefs.get("network.proxy.http_port")
+            if http_host and isinstance(http_port, int) and http_port > 0:
+                return f"http://{_bracket_proxy_host(http_host)}:{http_port}"
+    elif target_scheme == "http":
+        http_host = str(prefs.get("network.proxy.http") or "").strip()
+        http_port = prefs.get("network.proxy.http_port")
+        if http_host and isinstance(http_port, int) and http_port > 0:
+            return f"http://{_bracket_proxy_host(http_host)}:{http_port}"
+
+    socks_host = str(prefs.get("network.proxy.socks") or "").strip()
+    socks_port = prefs.get("network.proxy.socks_port")
+    socks_version = prefs.get("network.proxy.socks_version", 5)
+    if (
+        socks_host
+        and isinstance(socks_port, int)
+        and socks_port > 0
+        and socks_version == 5
+    ):
+        remote_dns = bool(prefs.get("network.proxy.socks_remote_dns", False))
+        socks_scheme = "socks5h" if remote_dns else "socks5"
+        return f"{socks_scheme}://{_bracket_proxy_host(socks_host)}:{socks_port}"
+    return None
+
+
 class FirefoxSessionManager:
     """Load, validate, and refresh an Arena session from local Firefox.
 
@@ -1411,6 +1507,15 @@ class FirefoxSessionManager:
             if source:
                 return _normalize_accept_language(source)
         return "en-US,en;q=0.5"
+
+    def proxy_url(
+        self, *, scheme: str = "https", host: str | None = None
+    ) -> str | None:
+        """Return the manual proxy URL configured in ``prefs.js``, if any."""
+        text = self._prefs_text()
+        if not text:
+            return None
+        return _parse_firefox_proxy(text, scheme=scheme, host=host)
 
     def firefox_headers(self, *, navigation: bool = False) -> dict[str, str]:
         """Return request headers matching a real Firefox on this machine.

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import os
 import re
 import sys
@@ -67,6 +68,8 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Literal, TextIO
 from urllib.parse import urlparse
+
+import httpx
 
 from .auth.browser import BrowserEnvironment, BrowserEnvironmentOptions, run_sync
 from .auth.captcha import (
@@ -101,10 +104,15 @@ from .exceptions import (
     RateLimitError,
 )
 from .transport import (
+    ARENA_PROXY_ENV,
     IMPERSONATE_EXTRA,
     CookieInput,
+    ProxyInput,
     impersonation_available,
     normalize_cookies,
+    normalize_proxy,
+    redact_proxy_url,
+    resolve_proxy_url,
 )
 
 __all__ = [
@@ -122,6 +130,7 @@ __all__ = [
     "discover_session",
     "explain_login",
     "explain_impersonation",
+    "explain_proxy",
     "explain_sources",
     "has_session_cookie",
     "interactive_login",
@@ -334,6 +343,7 @@ class AutoOptions:
     timeout: float = DEFAULT_TIMEOUT
     http2: bool = True
     verify_tls: bool | str = True
+    proxy: ProxyInput = None
     http_transport: Any = None
 
     #: Where browser artefacts (challenge captures, traces) are written.
@@ -348,6 +358,7 @@ class AutoOptions:
             raise ValueError("solve_captchas must be True, False or 'auto'")
         if self.challenge_wait_timeout <= 0:
             raise ValueError("challenge_wait_timeout must be positive")
+        normalize_proxy(self.proxy)
         # ``off``/``False``/"" all mean "do not impersonate"; "auto" is kept and
         # resolved later, once the session has been discovered.
         if self.impersonate is False or self.impersonate in ("off", ""):
@@ -1050,6 +1061,20 @@ class AutoSessionManager(BrowserSessionManager):
                 pass
         return super().firefox_headers(navigation=navigation)
 
+    def proxy_url(
+        self, *, scheme: str = "https", host: str | None = None
+    ) -> str | None:
+        """Manual proxy configured on the underlying browser profile, if any."""
+        if self._from_fallback and self.fallback is not None:
+            getter = getattr(self.fallback, "proxy_url", None)
+            if callable(getter):
+                try:
+                    value = getter(scheme=scheme, host=host)
+                except Exception:  # noqa: BLE001
+                    return None
+                return value if isinstance(value, str) and value.strip() else None
+        return None
+
     def adopt(self, cookies: Mapping[str, str]) -> None:
         """Replace the stored session with freshly read cookies."""
         self.import_cookies(dict(cookies))
@@ -1162,6 +1187,39 @@ def explain_impersonation(options: AutoOptions) -> str:
     return "auto -> follow the discovered session (firefox / chrome / edge)"
 
 
+def _firefox_fallback_proxy(options: AutoOptions) -> str | None:
+    if not options.use_browser_profiles:
+        return None
+    parsed = urlparse(options.base_url)
+    try:
+        manager = FirefoxSessionManager(
+            domains=options.cookie_domains(),
+            profiles_root=options.profiles_root,
+            profile_name=options.profile_name,
+            cookie_database=options.cookie_database,
+            interactive=False,
+        )
+        return manager.proxy_url(
+            scheme=parsed.scheme or "https", host=parsed.hostname
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def explain_proxy(options: AutoOptions) -> str:
+    """One line for ``--explain``: how outbound connections will be routed."""
+    choice = normalize_proxy(options.proxy)
+    if choice is False:
+        return "off (direct connection)"
+    if isinstance(choice, str):
+        return f"{redact_proxy_url(choice)} (explicit)"
+    fallback = _firefox_fallback_proxy(options)
+    resolved = resolve_proxy_url(options.base_url, None, fallback_proxy=fallback)
+    if resolved is None:
+        return "auto -> direct"
+    return f"auto -> {redact_proxy_url(resolved)}"
+
+
 def build_session_manager(
     options: AutoOptions, discovered: DiscoveredSession
 ) -> AutoSessionManager:
@@ -1226,8 +1284,16 @@ def _classify(exc: ArenaError) -> ProbeResult:
         return ProbeResult(False, "session rejected or expired", True, exc)
     if isinstance(exc, RateLimitError):
         return ProbeResult(False, "rate limited", False, exc)
-    # Anything else (redirect, non-JSON body, network hiccup) is not a session
-    # problem: the frontend may simply not expose the probe path.
+    if isinstance(exc.__cause__, httpx.RequestError):
+        return ProbeResult(
+            False,
+            f"network error ({type(exc.__cause__).__name__})",
+            False,
+            exc,
+        )
+    # Anything else (redirect, HTTP 404/500, non-JSON body) reached the server
+    # and is not a session problem: the frontend may simply not expose the
+    # probe path.
     return ProbeResult(True, f"reachable, probe inconclusive ({type(exc).__name__})", False, exc)
 
 
@@ -1381,6 +1447,7 @@ def auto_client(options: AutoOptions | None = None, **overrides: Any) -> ArenaCl
         timeout=options.timeout,
         http2=options.http2,
         verify=options.verify_tls,
+        proxy=options.proxy,
         http_transport=options.http_transport,
         max_auth_refreshes=options.max_auth_refreshes,
     )
@@ -1409,6 +1476,7 @@ async def auto_async_client(
         timeout=options.timeout,
         http2=options.http2,
         verify=options.verify_tls,
+        proxy=options.proxy,
         http_transport=options.http_transport,
         max_auth_refreshes=options.max_auth_refreshes,
     )
@@ -1566,6 +1634,7 @@ def auto_direct_client(
             timeout=options.timeout,
             http2=options.http2,
             verify=options.verify_tls,
+            proxy=options.proxy,
             verification_token=verification_token,
             http_transport=options.http_transport,
             max_auth_refreshes=options.max_auth_refreshes,
@@ -1597,6 +1666,7 @@ async def auto_async_direct_client(
             timeout=options.timeout,
             http2=options.http2,
             verify=options.verify_tls,
+            proxy=options.proxy,
             verification_token=verification_token,
             http_transport=options.http_transport,
             max_auth_refreshes=options.max_auth_refreshes,
@@ -1695,6 +1765,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--proxy",
+        default=None,
+        metavar="URL",
+        help=(
+            "HTTP/HTTPS/SOCKS5 proxy URL (e.g. http://127.0.0.1:2080 or "
+            "socks5h://127.0.0.1:1080), auto (default: ARENA_PROXY, "
+            "HTTPS_PROXY/ALL_PROXY, OS proxy, or Firefox prefs.js), or off"
+        ),
+    )
+    parser.add_argument(
         "--hide-automation",
         action="store_true",
         help=(
@@ -1768,6 +1848,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         channel=args.channel,
         hide_automation=args.hide_automation,
         impersonate=args.impersonate,
+        proxy=args.proxy,
         profiles_root=args.profile_root,
         profile_name=args.profile,
     )
@@ -1780,7 +1861,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     library error), ``2`` a session was found but the server rejected it.
     """
     args = build_arg_parser().parse_args(argv)
-    options = _options_from_args(args)
+    try:
+        options = _options_from_args(args)
+    except ValueError as exc:
+        print(f"[arena-api] {exc}", file=sys.stderr)
+        return 1
 
     if args.diagnose:
         report = collect_firefox_report(
@@ -1801,6 +1886,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(line)
         print(_report_line("login flow", _login_state(options)))
         print(_report_line("fingerprint", explain_impersonation(options)))
+        print(_report_line("proxy", explain_proxy(options)))
         available = solver_dependencies_available(options.captcha_backend)
         detail = (
             f"{options.solve_captchas} (backend {options.captcha_backend}, "
@@ -1906,10 +1992,30 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
             max_auth_refreshes=0,
         )
         with auto_client(status_options) as client:
+            active_proxy = getattr(
+                getattr(client, "transport", None), "proxy", None
+            )
             result = probe(client, options.probe_path)
+        if active_proxy:
+            print(f"proxy             : {redact_proxy_url(active_proxy)}")
         print(f"verification      : {result.describe()}")
         if not result.ok and result.error is not None:
             print(f"detail            : {result.error}")
+            if isinstance(result.error.__cause__, httpx.RequestError):
+                if active_proxy:
+                    print(
+                        "hint              : check that proxy "
+                        f"{redact_proxy_url(active_proxy)} is running and can "
+                        f"reach {options.base_url}"
+                    )
+                else:
+                    print(
+                        "hint              : could not establish a direct "
+                        "connection; if your network or split-tunnel VPN only "
+                        "routes the browser process, set HTTPS_PROXY / "
+                        f"{ARENA_PROXY_ENV} or pass --proxy "
+                        "http://127.0.0.1:<port> (or socks5h://127.0.0.1:<port>)"
+                    )
         if not result.ok and result.auth_problem:
             if not impersonation_available():
                 print(
@@ -1924,17 +2030,36 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
                     f"issued for another IP/build, reload {options.base_url} in Firefox "
                     "and run --status again"
                 )
-        return 0 if result.ok else 2
+        return 0 if result.ok else (2 if result.auth_problem else 1)
 
     with auto_client(options) as client:
         if args.models:
             try:
                 models = client.get_models()
             except ArenaError as exc:
-                if isinstance(exc, AuthenticationError):
+                if isinstance(exc, AuthenticationError) or isinstance(
+                    exc.__cause__, httpx.RequestError
+                ):
                     raise
-                with auto_direct_client(replace(options, verify=False)) as direct:
-                    models = direct.get_models()
+                shared_manager = getattr(client, "session_manager", None)
+                if shared_manager is not None:
+                    with DirectArenaClient(
+                        base_url=options.base_url,
+                        session_source=shared_manager,
+                        headers=options.headers,
+                        timeout=options.timeout,
+                        http2=options.http2,
+                        verify=options.verify_tls,
+                        proxy=options.proxy,
+                        http_transport=options.http_transport,
+                        max_auth_refreshes=options.max_auth_refreshes,
+                    ) as direct:
+                        models = direct.get_models()
+                else:
+                    with auto_direct_client(
+                        replace(options, verify=False, output=io.StringIO())
+                    ) as direct:
+                        models = direct.get_models()
             print(f"models            : {len(models)}")
             for model in models[:25]:
                 print(f"  {model.id} — {model.display_name}")

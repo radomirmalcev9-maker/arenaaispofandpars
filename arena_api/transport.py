@@ -19,11 +19,17 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import hashlib
 import importlib.util
 import json
 import math
+import os
+import shutil
 import ssl
+import sys
+import tempfile
 import time
+import urllib.request
 from collections.abc import (
     AsyncIterator,
     Callable,
@@ -41,7 +47,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, TypeAlias
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -59,10 +65,21 @@ from .exceptions import (
 CookieInput: TypeAlias = (
     Mapping[str, Any] | str | Path | Sequence[Mapping[str, Any]] | None
 )
+#: ``None``/``"auto"`` auto-detects from ``ARENA_PROXY``, ``HTTPS_PROXY`` /
+#: ``ALL_PROXY``, the OS proxy settings, or Firefox ``prefs.js``; ``False`` /
+#: ``"off"`` forces a direct connection; any URL string uses that proxy.
+ProxyInput: TypeAlias = str | bool | None
 # Optional hook consulted when a request fails with an auth error (HTTP 401/403
 # or a browser challenge). It returns fresh cookies to apply before retrying,
 # or None to surface the original error to the caller.
 SessionRefresher: TypeAlias = Callable[[ArenaError], Mapping[str, str] | None]
+
+#: Environment variable taking precedence over generic HTTP(S)/system proxies.
+ARENA_PROXY_ENV = "ARENA_PROXY"
+_SUPPORTED_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
+_CURL_ERROR_URL_SUFFIX = (
+    " See https://curl.se/libcurl/c/libcurl-errors.html first for more details."
+)
 
 
 _CHALLENGE_MARKERS = (
@@ -111,6 +128,234 @@ def validate_impersonate(value: Any) -> str:
     return value.strip()
 
 
+def normalize_proxy(proxy: ProxyInput) -> str | bool | None:
+    """Normalize a ``proxy=`` setting into ``None`` (auto), ``False`` (off), or a URL.
+
+    Windows ``Internet Settings`` registry entries returned by
+    :func:`urllib.request.getproxies` label unprefixed SOCKS proxies as
+    ``socks4://``, which modern local proxy clients implement as SOCKS5 and
+    which ``httpx.Proxy`` rejects unless upgraded to ``socks5://``.
+    """
+    if proxy is None or proxy is True:
+        return None
+    if proxy is False:
+        return False
+    if not isinstance(proxy, str):
+        raise ValueError(
+            "proxy must be a URL string (e.g. 'http://127.0.0.1:2080' or "
+            "'socks5h://127.0.0.1:1080'), False/'off', or None"
+        )
+    text = proxy.strip()
+    lowered = text.lower()
+    if lowered in ("", "auto"):
+        return None
+    if lowered in ("off", "false", "none", "direct"):
+        return False
+    if "://" not in text:
+        text = f"http://{text}"
+        lowered = text.lower()
+    for legacy_prefix in ("socks4a://", "socks4://", "socks://"):
+        if lowered.startswith(legacy_prefix):
+            scheme_replacement = (
+                "socks5h://" if legacy_prefix == "socks4a://" else "socks5://"
+            )
+            text = scheme_replacement + text[len(legacy_prefix) :]
+            break
+    parsed = urlparse(text)
+    scheme = parsed.scheme.lower()
+    if scheme not in _SUPPORTED_PROXY_SCHEMES or not parsed.netloc:
+        raise ValueError(
+            f"Unsupported proxy URL {proxy!r}; expected http://, https://, "
+            "socks5:// or socks5h://"
+        )
+    return urlunparse(parsed._replace(scheme=scheme))
+
+
+def _is_loopback_host(host: str) -> bool:
+    cleaned = host.strip().strip("[]").lower()
+    return (
+        cleaned in ("localhost", "::1")
+        or cleaned.startswith("127.")
+        or cleaned.endswith(".localhost")
+    )
+
+
+def _proxy_bypassed(host: str, port: int | None) -> bool:
+    try:
+        if urllib.request.proxy_bypass(host):
+            return True
+        if port is not None and urllib.request.proxy_bypass(f"{host}:{port}"):
+            return True
+    except Exception:  # noqa: BLE001 - malformed NO_PROXY or registry entries
+        return False
+    return False
+
+
+def resolve_proxy_url(
+    base_url: str,
+    proxy: ProxyInput = None,
+    *,
+    fallback_proxy: str | None = None,
+) -> str | None:
+    """Resolve the effective proxy URL for ``base_url``, or ``None`` for direct.
+
+    Precedence when ``proxy`` is ``None`` (auto):
+
+    1. ``ARENA_PROXY`` environment variable (``off``/``direct`` disables all proxies);
+    2. ``HTTPS_PROXY`` / ``HTTP_PROXY`` / ``ALL_PROXY`` and OS system proxy
+       settings via :func:`urllib.request.getproxies` (including Windows
+       ``Internet Settings``), honouring ``NO_PROXY`` and skipping loopback;
+    3. ``fallback_proxy`` (e.g. manual proxy settings from Firefox ``prefs.js``).
+    """
+    choice = normalize_proxy(proxy)
+    if choice is False:
+        return None
+    if isinstance(choice, str):
+        return choice
+
+    env_raw = os.environ.get(ARENA_PROXY_ENV)
+    env_choice = normalize_proxy(env_raw) if env_raw is not None else None
+    if env_choice is False:
+        return None
+
+    parsed = urlparse(base_url)
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.hostname or "").lower()
+    if not host or _is_loopback_host(host):
+        return None
+    if isinstance(env_choice, str):
+        return env_choice
+    if _proxy_bypassed(host, parsed.port):
+        return None
+
+    try:
+        system_proxies = urllib.request.getproxies()
+    except Exception:  # noqa: BLE001 - defensive on broken OS proxy stores
+        system_proxies = {}
+    candidate = (
+        system_proxies.get(scheme)
+        or system_proxies.get("all")
+        or (system_proxies.get("http") if scheme == "https" else None)
+    )
+    if candidate:
+        try:
+            normalized = normalize_proxy(candidate)
+        except ValueError:
+            normalized = None
+        if isinstance(normalized, str):
+            return normalized
+
+    if fallback_proxy:
+        try:
+            normalized_fb = normalize_proxy(fallback_proxy)
+        except ValueError:
+            normalized_fb = None
+        if isinstance(normalized_fb, str):
+            return normalized_fb
+    return None
+
+
+def redact_proxy_url(proxy_url: str | None) -> str:
+    """Format a proxy URL for logs/diagnostics with credentials removed."""
+    if not proxy_url:
+        return "direct"
+    parsed = urlparse(proxy_url)
+    if parsed.username is None and parsed.password is None:
+        return proxy_url
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"***@{host}" + (f":{parsed.port}" if parsed.port else "")
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+def _httpx_supports_proxy(proxy_url: str) -> bool:
+    scheme = urlparse(proxy_url).scheme.lower()
+    if scheme in ("http", "https"):
+        return True
+    return importlib.util.find_spec("socksio") is not None
+
+
+def _env_proxies_supported_by_httpx() -> bool:
+    for key in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        raw = os.environ.get(key, "").strip()
+        if raw and not _httpx_supports_proxy(raw if "://" in raw else f"http://{raw}"):
+            return False
+    return True
+
+
+def _windows_short_ascii_path(path: str) -> str | None:
+    """Return the Windows 8.3 short path when it is pure ASCII and exists."""
+    try:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return None
+        get_short = windll.kernel32.GetShortPathNameW
+        needed = int(get_short(path, None, 0))
+        if needed <= 0:
+            return None
+        buf = ctypes.create_unicode_buffer(needed + 1)
+        written = int(get_short(path, buf, needed + 1))
+        if written <= 0:
+            return None
+        short = buf.value
+        if short and short.isascii() and os.path.isfile(short):
+            return short
+    except Exception:  # noqa: BLE001 - non-Windows or restricted API
+        return None
+    return None
+
+
+def _windows_ascii_ca_bundle(ca_path: str) -> str | None:
+    """Ensure libcurl receives an ASCII-only CA bundle path on Windows.
+
+    ``curl_cffi`` encodes ``CURLOPT_CAINFO`` with ``locale.getpreferredencoding``
+    while BoringSSL opens the file with narrow C ``fopen()``; when a Windows
+    account directory contains non-ASCII characters (e.g. Cyrillic) and UTF-8
+    mode or a mismatched codepage is active, TLS handshakes fail with
+    ``CURLE_SSL_CACERT_BADFILE`` / ``ConnectError``.
+    """
+    if ca_path.isascii() or not os.path.isfile(ca_path):
+        return ca_path if ca_path.isascii() else None
+    short = _windows_short_ascii_path(ca_path)
+    if short:
+        return short
+    digest = hashlib.sha256(ca_path.encode("utf-8", "replace")).hexdigest()[:12]
+    filename = f"arena-api-cacert-{digest}.pem"
+    candidate_dirs = [
+        tempfile.gettempdir(),
+        os.environ.get("PUBLIC", ""),
+        str(Path(ca_path).anchor) + "Temp" if Path(ca_path).anchor else "",
+    ]
+    try:
+        source_size = os.path.getsize(ca_path)
+    except OSError:
+        return None
+    for raw_dir in candidate_dirs:
+        if not raw_dir or not raw_dir.isascii():
+            continue
+        target_dir = Path(raw_dir)
+        if not target_dir.is_dir():
+            continue
+        target = target_dir / filename
+        try:
+            if not target.is_file() or target.stat().st_size != source_size:
+                shutil.copyfile(ca_path, target)
+            return str(target)
+        except OSError:
+            continue
+    return None
+
+
 def _adapt_verify(verify: bool | str) -> bool | str:
     """Translate httpx's ``verify=`` into what curl accepts.
 
@@ -124,27 +369,49 @@ def _adapt_verify(verify: bool | str) -> bool | str:
             "ssl.SSLContext; pass the CA bundle path as verify='path/to/ca.pem'"
         )
     if isinstance(verify, Path):  # pragma: no cover - defensive, httpx types say str
-        return str(verify)
+        verify = str(verify)
     if not isinstance(verify, (bool, str)):
         raise ArenaError(
             f"verify must be a bool or a CA bundle path when impersonating, got "
             f"{type(verify).__name__}"
         )
+    if sys.platform.startswith("win"):
+        if isinstance(verify, str) and not verify.isascii():
+            staged = _windows_ascii_ca_bundle(verify)
+            if staged:
+                return staged
+        elif verify is True:
+            try:
+                import certifi
+
+                ca_file = certifi.where()
+            except Exception:  # noqa: BLE001
+                ca_file = ""
+            if ca_file and not ca_file.isascii():
+                staged = _windows_ascii_ca_bundle(ca_file)
+                if staged:
+                    return staged
     return verify
 
 
 def build_impersonation_transport(
-    impersonate: str, *, verify: bool | str = True, asynchronous: bool = False
+    impersonate: str,
+    *,
+    verify: bool | str = True,
+    proxy: ProxyInput = None,
+    asynchronous: bool = False,
 ) -> Any:
     """Return a curl_cffi-backed ``httpx`` transport for one browser profile.
 
     :param impersonate: curl_cffi profile, e.g. ``"firefox"`` (the newest
         supported Firefox), ``"firefox147"`` (an exact build) or ``"chrome"``.
     :param verify: TLS verification, following ``httpx.Client(verify=...)``.
+    :param proxy: proxy URL, ``False``/``"off"`` for direct, or ``None`` (auto).
     :param asynchronous: build the ``AsyncCurlTransport`` instead of the sync one.
     :raises ArenaError: the optional dependency is not installed.
     """
     profile = validate_impersonate(impersonate)
+    proxy_choice = normalize_proxy(proxy)
     try:
         from httpx_curl_cffi import AsyncCurlTransport, CurlTransport
     except ImportError as exc:  # pragma: no cover - dependency path
@@ -154,7 +421,20 @@ def build_impersonation_transport(
             "to send the request with httpx's own TLS fingerprint)"
         ) from exc
     options: dict[str, Any] = {"impersonate": profile, "verify": _adapt_verify(verify)}
-    return AsyncCurlTransport(**options) if asynchronous else CurlTransport(**options)
+    if isinstance(proxy_choice, str):
+        options["proxy"] = proxy_choice
+    transport = (
+        AsyncCurlTransport(**options) if asynchronous else CurlTransport(**options)
+    )
+    # ``httpx_curl_cffi`` hardcodes ``trust_env=False`` on its internal
+    # ``curl_cffi`` session; since ``curl-cffi 0.17.0``, ``trust_env=False``
+    # actively sets ``CURLOPT_PROXY=""`` and disables ``HTTPS_PROXY`` /
+    # ``ALL_PROXY`` unless re-enabled or given an explicit ``proxy=``.
+    if proxy_choice is not False and "proxy" not in options:
+        session = getattr(transport, "_session", None)
+        if session is not None and hasattr(session, "trust_env"):
+            session.trust_env = True
+    return transport
 
 
 def parse_cookie_header(value: str) -> dict[str, str]:
@@ -315,6 +595,14 @@ def _network_error(exc: httpx.RequestError, *, streaming: bool) -> ArenaError:
         return QueueTimeoutError("The Arena stream timed out before completing.")
     if isinstance(exc, httpx.TimeoutException):
         return ArenaError("The Arena HTTP request timed out.")
+    raw = str(exc).strip()
+    detail = raw.splitlines()[0].strip() if raw else ""
+    if detail.endswith(_CURL_ERROR_URL_SUFFIX):
+        detail = detail[: -len(_CURL_ERROR_URL_SUFFIX)].strip()
+    if detail:
+        return ArenaError(
+            f"Arena network request failed ({type(exc).__name__}): {detail}"
+        )
     return ArenaError(f"Arena network request failed ({type(exc).__name__}).")
 
 
@@ -501,6 +789,8 @@ class ArenaTransport:
 
     #: curl_cffi profile in use, or ``None`` for httpx's own fingerprint.
     impersonate: str | None
+    #: Resolved proxy URL in use, or ``None`` for a direct connection.
+    proxy: str | None
 
     def __init__(
         self,
@@ -512,6 +802,8 @@ class ArenaTransport:
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
         verify: bool | str = True,
+        proxy: ProxyInput = None,
+        fallback_proxy: str | None = None,
         http_transport: httpx.BaseTransport | None = None,
         impersonate: str | None = None,
         session_refresher: SessionRefresher | None = None,
@@ -525,7 +817,11 @@ class ArenaTransport:
                 "pass either http_transport= or impersonate=, not both: "
                 "impersonation *is* a transport"
             )
+        proxy_choice = normalize_proxy(proxy)
         self.base_url = _normalize_base_url(base_url)
+        self.proxy = resolve_proxy_url(
+            self.base_url, proxy, fallback_proxy=fallback_proxy
+        )
         merged_headers = _merged_default_headers(headers)
         self._base_cookies = normalize_cookies(cookies)
         self._session_cookies: dict[str, str] = dict(session_cookies or {})
@@ -536,11 +832,26 @@ class ArenaTransport:
         )
         if self.impersonate is not None:
             http_transport = build_impersonation_transport(
-                self.impersonate, verify=verify
+                self.impersonate,
+                verify=verify,
+                proxy=self.proxy if self.proxy is not None else False,
             )
             merged_headers = _impersonation_wire_headers(
                 self.impersonate, self.base_url, merged_headers
             )
+        client_kwargs: dict[str, Any] = {}
+        if http_transport is not None:
+            client_kwargs["trust_env"] = False
+        else:
+            if (
+                proxy_choice is False
+                or self.proxy is not None
+                or _is_loopback_host(urlparse(self.base_url).hostname or "")
+                or not _env_proxies_supported_by_httpx()
+            ):
+                client_kwargs["trust_env"] = False
+            if self.proxy is not None and _httpx_supports_proxy(self.proxy):
+                client_kwargs["proxy"] = self.proxy
         self.session = httpx.Client(
             headers=merged_headers,
             cookies=self._effective_cookies(),
@@ -549,6 +860,7 @@ class ArenaTransport:
             verify=verify,
             follow_redirects=False,
             transport=http_transport,
+            **client_kwargs,
         )
         self._closed = False
 
@@ -762,6 +1074,8 @@ class AsyncArenaTransport:
 
     #: curl_cffi profile in use, or ``None`` for httpx's own fingerprint.
     impersonate: str | None
+    #: Resolved proxy URL in use, or ``None`` for a direct connection.
+    proxy: str | None
 
     def __init__(
         self,
@@ -773,6 +1087,8 @@ class AsyncArenaTransport:
         timeout: float = DEFAULT_TIMEOUT,
         http2: bool = True,
         verify: bool | str = True,
+        proxy: ProxyInput = None,
+        fallback_proxy: str | None = None,
         http_transport: httpx.AsyncBaseTransport | None = None,
         impersonate: str | None = None,
         session_refresher: SessionRefresher | None = None,
@@ -786,7 +1102,11 @@ class AsyncArenaTransport:
                 "pass either http_transport= or impersonate=, not both: "
                 "impersonation *is* a transport"
             )
+        proxy_choice = normalize_proxy(proxy)
         self.base_url = _normalize_base_url(base_url)
+        self.proxy = resolve_proxy_url(
+            self.base_url, proxy, fallback_proxy=fallback_proxy
+        )
         merged_headers = _merged_default_headers(headers)
         self._base_cookies = normalize_cookies(cookies)
         self._session_cookies: dict[str, str] = dict(session_cookies or {})
@@ -797,11 +1117,27 @@ class AsyncArenaTransport:
         )
         if self.impersonate is not None:
             http_transport = build_impersonation_transport(
-                self.impersonate, verify=verify, asynchronous=True
+                self.impersonate,
+                verify=verify,
+                proxy=self.proxy if self.proxy is not None else False,
+                asynchronous=True,
             )
             merged_headers = _impersonation_wire_headers(
                 self.impersonate, self.base_url, merged_headers
             )
+        client_kwargs: dict[str, Any] = {}
+        if http_transport is not None:
+            client_kwargs["trust_env"] = False
+        else:
+            if (
+                proxy_choice is False
+                or self.proxy is not None
+                or _is_loopback_host(urlparse(self.base_url).hostname or "")
+                or not _env_proxies_supported_by_httpx()
+            ):
+                client_kwargs["trust_env"] = False
+            if self.proxy is not None and _httpx_supports_proxy(self.proxy):
+                client_kwargs["proxy"] = self.proxy
         self.session = httpx.AsyncClient(
             headers=merged_headers,
             cookies=self._effective_cookies(),
@@ -810,6 +1146,7 @@ class AsyncArenaTransport:
             verify=verify,
             follow_redirects=False,
             transport=http_transport,
+            **client_kwargs,
         )
         self._closed = False
 
