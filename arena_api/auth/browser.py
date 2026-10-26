@@ -139,6 +139,12 @@ class BrowserEnvironmentOptions:
     #: Path to a Playwright ``storage_state`` JSON used to seed cookies.
     storage_state: str | Path | None = None
 
+    #: Optional persistent Chromium profile directory. When set,
+    #: :class:`BrowserEnvironment` uses ``launch_persistent_context`` so trust
+    #: cookies (``_GRECAPTCHA``, ``cf_clearance``) and ``localStorage`` survive
+    #: across runs.
+    user_data_dir: str | Path | None = None
+
     #: Directory for traces, HARs and screenshots. ``None`` disables capture.
     artifacts_dir: str | Path | None = None
 
@@ -250,6 +256,28 @@ class BrowserEnvironmentOptions:
             kwargs["ignore_default_args"] = list(self.ignore_default_args)
         return kwargs
 
+    def persistent_context_kwargs(self) -> dict[str, Any]:
+        """Render the Playwright ``launch_persistent_context`` keyword arguments."""
+        kwargs = self.launch_kwargs()
+        ctx_kwargs = self.context_kwargs()
+        ctx_kwargs.pop("storage_state", None)
+        kwargs.update(ctx_kwargs)
+        return kwargs
+
+
+def _is_profile_in_use_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "processsingleton",
+            "singletonlock",
+            "already in use",
+            "in use by another",
+            "profile appears to be in use",
+        )
+    )
+
 
 def _playwright_proxy_settings(proxy_url: str) -> dict[str, str]:
     """Convert a URL string into Playwright's ``ProxySettings`` dictionary.
@@ -306,6 +334,8 @@ class BrowserEnvironment:
             self.options.artifacts_dir = Path(self.options.artifacts_dir)
         self._playwright: Any = None
         self._browser: Any = None
+        self._persistent_context: Any = None
+        self._claimed_initial_page: bool = False
         self._contexts: list[Any] = []
         self._started = False
         self._challenge_handler: ChallengeHandler | None = None
@@ -368,9 +398,40 @@ class BrowserEnvironment:
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            **self.options.launch_kwargs()
-        )
+        try:
+            if self.options.user_data_dir is not None:
+                profile_dir = Path(self.options.user_data_dir).expanduser()
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                p_kwargs = self.options.persistent_context_kwargs()
+                if self.options.record_har:
+                    p_kwargs["record_har_path"] = str(
+                        self._artifact_path("network.har")
+                    )
+                    p_kwargs.setdefault("record_har_content", "omit")
+                try:
+                    self._persistent_context = (
+                        await self._playwright.chromium.launch_persistent_context(
+                            str(profile_dir), **p_kwargs
+                        )
+                    )
+                except Exception as exc:
+                    if _is_profile_in_use_error(exc):
+                        self._browser = await self._playwright.chromium.launch(
+                            **self.options.launch_kwargs()
+                        )
+                    else:
+                        raise
+            else:
+                self._browser = await self._playwright.chromium.launch(
+                    **self.options.launch_kwargs()
+                )
+        except Exception:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+            raise
         self._started = True
         return self
 
@@ -378,9 +439,16 @@ class BrowserEnvironment:
         """Close every context, then the browser and Playwright."""
         if not self._started:
             return
+        if (
+            self._persistent_context is not None
+            and self._persistent_context not in self._contexts
+        ):
+            self._contexts.append(self._persistent_context)
         for context in list(self._contexts):
             await self._safe_close_context(context)
         self._contexts.clear()
+        self._persistent_context = None
+        self._claimed_initial_page = False
         if self._browser is not None:
             try:
                 await self._browser.close()
@@ -437,6 +505,19 @@ class BrowserEnvironment:
         """Create a browser context with the configured normalisation."""
         if not self._started:
             await self.start()
+        if self._persistent_context is not None and not overrides:
+            context = self._persistent_context
+            if context not in self._contexts:
+                context.set_default_timeout(self.options.default_timeout)
+                context.set_default_navigation_timeout(
+                    self.options.navigation_timeout
+                )
+                if self.options.record_trace:
+                    await context.tracing.start(
+                        screenshots=True, snapshots=True, sources=True
+                    )
+                self._contexts.append(context)
+            return context
         kwargs = self.options.context_kwargs()
         kwargs.update(overrides)
         if self.options.record_har:
@@ -459,7 +540,16 @@ class BrowserEnvironment:
         """
         if context is None:
             context = await self.new_context(**overrides)
-        page = await context.new_page()
+        existing_pages = (
+            getattr(context, "pages", None)
+            if context is self._persistent_context and not self._claimed_initial_page
+            else None
+        )
+        if existing_pages:
+            self._claimed_initial_page = True
+            page = existing_pages[0]
+        else:
+            page = await context.new_page()
         if self.options.install_determinism_script:
             script = build_init_script(
                 self.options.determinism or DeterminismOptions()
