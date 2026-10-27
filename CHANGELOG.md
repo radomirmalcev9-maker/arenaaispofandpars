@@ -7,6 +7,11 @@
 
 ### Claude Code на моделях Arena: Anthropic-совместимый API
 
+- **`arena-api --version`**: печатает версию, **каталог установленного
+  пакета** и наличие шима (`--claude`). Старая сборка отвечает на новый флаг
+  «unrecognized arguments», и это неотличимо от ошибки в коде — теперь первый
+  вопрос «какая копия пакета ответила» решается одной командой.
+
 `arena-api --claude` (или `arena-claude`) поднимает на loopback-порту
 Anthropic Messages API, ответы на который генерирует Arena Direct Chat. С
 `ANTHROPIC_BASE_URL` на этот порт оболочка Claude Code работает на моделях
