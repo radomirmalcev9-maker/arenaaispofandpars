@@ -98,10 +98,15 @@ def test_importing_the_package_pulls_no_heavy_dependency() -> None:
 
 def test_console_script_points_at_a_callable(pyproject: dict) -> None:
     target = pyproject["project"]["scripts"]["arena-api"]
-    assert target == "arena_api.auto:main"
+    # The console script goes through the light front-end (which routes a
+    # one-shot --prompt to the warm daemon); the in-process entry point stays.
+    assert target == "arena_api._cli:main"
     module_name, _, attribute = target.partition(":")
     module = __import__(module_name, fromlist=[attribute])
     assert callable(getattr(module, attribute))
+    from arena_api.auto import main as auto_main
+
+    assert callable(auto_main)
 
 
 def test_documented_extras_exist(pyproject: dict) -> None:
