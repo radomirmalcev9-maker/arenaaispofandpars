@@ -2710,6 +2710,7 @@ class DirectVerificationToken:
                     has_submitted=lambda: eval_request_seen,
                     install_legacy_tap_flags=not has_network_events,
                     fast_submit=fast_submit,
+                    mark=_latency_mark,
                 )
 
             if not used_composer:
@@ -2801,6 +2802,7 @@ class DirectVerificationToken:
                         has_submitted=lambda: eval_request_seen,
                         install_legacy_tap_flags=not has_network_events,
                         fast_submit=fast_submit,
+                        mark=_latency_mark,
                     )
 
             if not used_composer:

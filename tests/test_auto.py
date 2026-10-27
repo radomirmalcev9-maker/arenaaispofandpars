@@ -3287,9 +3287,17 @@ def test_direct_composer_submission_uses_native_ui_without_forcing_model_and_han
     assert getattr(seen_env_options[0], "timezone_id") is None
 
 
-def _composer_page(*, enter_submits: bool) -> tuple[object, dict[str, int]]:
+def _composer_page(
+    *, enter_submits: bool, confidence: str = "explicit"
+) -> tuple[object, dict[str, int]]:
     """Minimal composer page: records focus/press/click on the Send button."""
-    events = {"focus": 0, "press": 0, "send_click": 0, "submitted": 0}
+    events = {
+        "focus": 0,
+        "press": 0,
+        "send_click": 0,
+        "submitted": 0,
+        "waits": 0,
+    }
 
     class Composer:
         def __init__(self) -> None:
@@ -3344,6 +3352,7 @@ def _composer_page(*, enter_submits: bool) -> tuple[object, dict[str, int]]:
             return Locator(selector)
 
         async def wait_for_timeout(self, ms: int) -> None:
+            events["waits"] += 1
             return None
 
         async def evaluate(self, script: str) -> object:
@@ -3354,7 +3363,7 @@ def _composer_page(*, enter_submits: bool) -> tuple[object, dict[str, int]]:
             if "data-arena-composer" in script and "data-arena-send" not in script:
                 return {"found": True, "tag": "textarea", "x": 400, "y": 700}
             if "data-arena-send" in script:
-                return {"found": True, "confidence": "explicit", "x": 650, "y": 700}
+                return {"found": True, "confidence": confidence, "x": 650, "y": 700}
             return None
 
     return Page(), events
@@ -3401,6 +3410,60 @@ def test_fast_submit_falls_back_to_the_send_button() -> None:
     assert submitted is True
     assert events["press"] == 1
     assert events["send_click"] == 1  # Enter did nothing: the button is still used
+
+
+def test_submit_reports_phase_marks_for_the_timeline() -> None:
+    page, events = _composer_page(enter_submits=False)
+    marks: list[str] = []
+    submitted = asyncio.run(
+        auto_module._submit_prompt_via_composer(
+            page,
+            "привет",
+            has_submitted=lambda: events["submitted"] == 1,
+            mark=marks.append,
+        )
+    )
+    assert submitted is True
+    # The profile has to say where the half second before `submit.start` went,
+    # so the composer phases are marked in order.
+    assert marks == [
+        "composer.visible",
+        "composer.focused",
+        "prompt.filled",
+        "send.dispatched",
+    ]
+
+
+def test_submit_survives_a_broken_mark_callback() -> None:
+    page, events = _composer_page(enter_submits=False)
+
+    def boom(_name: str) -> None:
+        raise RuntimeError("metrics are none of your business")
+
+    submitted = asyncio.run(
+        auto_module._submit_prompt_via_composer(
+            page,
+            "привет",
+            has_submitted=lambda: events["submitted"] == 1,
+            mark=boom,
+        )
+    )
+    assert submitted is True
+    assert events["send_click"] == 1
+
+
+def test_fallback_send_stops_waiting_as_soon_as_the_submit_starts() -> None:
+    page, events = _composer_page(enter_submits=False, confidence="fallback")
+    submitted = asyncio.run(
+        auto_module._submit_prompt_via_composer(
+            page, "привет", has_submitted=lambda: events["submitted"] == 1
+        )
+    )
+    assert submitted is True
+    # A heuristic Send click is watched for up to 500 ms, but a click that
+    # actually submitted must not cost the full wait (20 x 25 ms).
+    assert events["waits"] < 20
+    assert events["press"] == 0  # no duplicate Enter on top of a live submit
 
 
 def test_post_submit_recaptcha_anchor_checkbox_clicked_without_expose_function(

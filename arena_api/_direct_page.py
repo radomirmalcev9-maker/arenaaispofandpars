@@ -867,11 +867,22 @@ async def _submit_prompt_via_composer(
     has_submitted: Callable[[], bool] | None = None,
     install_legacy_tap_flags: bool = False,
     fast_submit: bool = False,
+    mark: Callable[[str], None] | None = None,
 ) -> bool:
     locator_fn = getattr(page, "locator", None)
     eval_fn = getattr(page, "evaluate", None)
     if not (callable(locator_fn) and callable(eval_fn)):
         return False
+
+    def _mark(name: str) -> None:
+        # Phase marks are diagnostic only: a broken callback must never break
+        # a submission.
+        if mark is None:
+            return
+        try:
+            mark(name)
+        except Exception:  # noqa: BLE001
+            pass
 
     patch_obj: dict[str, Any] = {}
     if model_id_override:
@@ -900,6 +911,7 @@ async def _submit_prompt_via_composer(
                 break
     if not isinstance(info, Mapping) or not info.get("found"):
         return False
+    _mark("composer.visible")
 
     composer = locator_fn('[data-arena-composer="1"]').first
     # focus() instead of click(): no actionability animation, no mouse move, no
@@ -914,6 +926,7 @@ async def _submit_prompt_via_composer(
             await composer.click()
     else:
         await composer.click()
+    _mark("composer.focused")
 
     keyboard = getattr(page, "keyboard", None)
     single_line = "\n" not in prompt and "\r" not in prompt
@@ -939,6 +952,7 @@ async def _submit_prompt_via_composer(
         ):
             await keyboard.type(first_line, delay=2)
         await composer.fill(prompt)
+    _mark("prompt.filled")
 
     if fast_submit:
         # Enter submits the composer in one event instead of mark-scan + mouse
@@ -954,6 +968,7 @@ async def _submit_prompt_via_composer(
             else:
                 for _ in range(5):
                     if has_submitted is not None and has_submitted():
+                        _mark("send.dispatched")
                         try:
                             await eval_fn(_CLEANUP_ARENA_DOM_MARKS_JS)
                         except Exception:  # noqa: BLE001
@@ -967,13 +982,21 @@ async def _submit_prompt_via_composer(
         if isinstance(btn_info, Mapping) and btn_info.get("found"):
             send_btn = locator_fn('[data-arena-send="1"]').first
             await send_btn.click()
+            _mark("send.dispatched")
             # Only press Enter as a fallback when no explicit submit/Send button
             # matched and no evaluation request or challenge has started yet;
             # pressing Enter on top of an explicit Send click fires a duplicate
             # submission while grecaptcha.enterprise.execute() is still running.
             if btn_info.get("confidence") == "fallback":
+                # The button was matched by a heuristic, so the click may have
+                # hit something inert.  Give the submit up to 500 ms to show up,
+                # but stop as soon as it does instead of always paying the full
+                # half second before pressing Enter.
                 if callable(wait_fn):
-                    await wait_fn(500)
+                    for _ in range(20):
+                        if has_submitted is not None and has_submitted():
+                            break
+                        await wait_fn(25)
                 already_started = bool(has_submitted and has_submitted())
                 if not already_started:
                     challenge = await _detect_post_submit_challenge(page)
