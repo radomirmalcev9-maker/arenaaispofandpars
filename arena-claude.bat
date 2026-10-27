@@ -1,34 +1,44 @@
 @echo off
 rem ===========================================================================
-rem  arena-claude.bat -- Claude Code на моделях Arena, одним файлом.
+rem  arena-claude.bat -- Claude Code on Arena models, one file.
 rem
-rem  Что делает:
-rem    1. поднимает Anthropic-совместимый шим  (arena-api --claude --port N)
-rem       в скрытом окне, лог пишет в %TEMP%\arena-claude-<port>.log;
-rem    2. ждёт, пока порт начнёт отвечать на /healthz (до 60 секунд);
-rem    3. выставляет ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY и запускает claude;
-rem    4. когда Claude Code закрывается -- гасит шим (если поднимал его сам).
+rem  What it does:
+rem    1. picks the *installed build that really has the shim*: it tries
+rem       arena-api, then `py -m arena_api`, then `python -m arena_api`, and
+rem       keeps the first one that reports "anthropic shim: yes" and --session
+rem       support (a stale install in PATH is the usual reason "it does not
+rem       work");
+rem    2. starts it hidden:  --claude --port N (log in %TEMP%);
+rem    3. waits for /healthz, and fails immediately with the log tail if the
+rem       shim process dies (no 60-second silence);
+rem    4. exports ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / ANTHROPIC_MODEL and
+rem       runs claude, forwarding every argument;
+rem    5. stops the shim it started when Claude Code exits.
 rem
-rem  Запуск:
-rem    arena-claude.bat                 обычный запуск (порт 8082)
-rem    arena-claude.bat --resume ...    все аргументы уходят в claude как есть
-rem    arena-claude.bat doctor          диагностика: пакет, сессия, движок, SSE
+rem  Usage:
+rem    arena-claude.bat                 normal start (port 8082)
+rem    arena-claude.bat --resume ...    forwarded to claude as is
+rem    arena-claude.bat doctor          package / session / engine / SSE check
+rem    arena-claude.bat version         which build answers and what it can do
 rem
-rem  Настройки (переменные окружения перед запуском):
-rem    ARENA_CLAUDE_PORT=8082           порт шима
-rem    ARENA_CLAUDE_MODEL=arena-auto    модель на стороне Arena
-rem    ARENA_CLAUDE_SESSION=firefox     источник сессии: firefox, firefox:<профиль>,
+rem  Settings (environment variables, set them before running):
+rem    ARENA_CLAUDE_PORT=8082           shim port
+rem    ARENA_CLAUDE_MODEL=arena-auto    model Arena should use
+rem    ARENA_CLAUDE_SESSION=firefox     session source: firefox, firefox:<profile>,
 rem                                     storage, chrome, auto
-rem    ARENA_CLAUDE_ENGINE=warm         движок: warm (демон), http, echo
+rem    ARENA_CLAUDE_ENGINE=warm         warm (daemon), http, echo
+rem    ARENA_CLAUDE_VERBOSE=1           log every request in the shim log
 rem
-rem  Требуется: установленный пакет arena-api и Claude Code (`claude` в PATH).
-rem  Работает на Windows 10+ (использует curl или PowerShell для проверки порта).
+rem  The output of this file is deliberately ASCII: cmd reads a script in the
+rem  console codepage, so Cyrillic here turns into garbage.  Russian
+rem  diagnostics come from Python (arena-api --claude --doctor), which writes
+rem  through the console API and is unaffected by the codepage.
 rem ===========================================================================
 
 setlocal EnableExtensions
+chcp 65001 >nul 2>&1
 title Arena + Claude Code
 
-rem --- настройки по умолчанию ------------------------------------------------
 set "SHIM_PORT=%ARENA_CLAUDE_PORT%"
 if "%SHIM_PORT%"=="" set "SHIM_PORT=8082"
 set "MODEL=%ARENA_CLAUDE_MODEL%"
@@ -37,152 +47,209 @@ set "SESSION=%ARENA_CLAUDE_SESSION%"
 if "%SESSION%"=="" set "SESSION=firefox"
 set "ENGINE=%ARENA_CLAUDE_ENGINE%"
 if "%ENGINE%"=="" set "ENGINE=warm"
+set "EXTRA="
+if "%ARENA_CLAUDE_VERBOSE%"=="1" set "EXTRA=--verbose"
 
 set "SHIMPID="
 set "STARTED_SHIM="
-set "LOG=%TEMP%\arena-claude-%SHIM_PORT%.log"
+set "BUILD_OK="
+set "LAUNCH_EXE="
+set "LAUNCH_ARGS="
+set "DOCTOR_ARGS="
+set "BASE=%TEMP%\arena-claude-%SHIM_PORT%"
+set "LOG=%BASE%.log"
+set "ERRLOG=%BASE%.err.log"
+set "VERSION_FILE=%BASE%.version.txt"
 
-call :find_arena
-if not defined LAUNCH_EXE goto :no_package
+rem Python must write UTF-8 into the log whatever the console codepage is.
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 
-if /i "%~1"=="doctor" goto :doctor
-if /i "%~1"=="--doctor" goto :doctor
+call :pick_build
+if not defined LAUNCH_EXE goto no_package
 
-rem --- уже слушает? тогда второй шим не нужен --------------------------------
+if /i "%~1"=="doctor" goto doctor
+if /i "%~1"=="--doctor" goto doctor
+if /i "%~1"=="version" goto print_version
+if /i "%~1"=="--version" goto print_version
+
+if not "%BUILD_OK%"=="1" goto stale_build
+
 call :probe
-if "%PORT_OPEN%"=="1" goto :run_claude
+if "%PORT_OPEN%"=="1" goto run_claude
 
-echo [arena] запускаю шим на порту %SHIM_PORT% (движок %ENGINE%, сессия %SESSION%)...
+echo [arena] starting shim on port %SHIM_PORT%  (engine=%ENGINE% session=%SESSION% model=%MODEL%)
+echo [arena] using %LAUNCH_EXE% %DOCTOR_ARGS%
 if exist "%LOG%" del "%LOG%" >nul 2>&1
-if exist "%LOG%.err" del "%LOG%.err" >nul 2>&1
+if exist "%ERRLOG%" del "%ERRLOG%" >nul 2>&1
 
-for /f "usebackq delims=" %%p in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath '%LAUNCH_EXE%' -ArgumentList '%LAUNCH_ARGS%' -PassThru -WindowStyle Hidden -RedirectStandardOutput '%LOG%' -RedirectStandardError '%LOG%.err'; $p.Id" 2^>nul`) do set "SHIMPID=%%p"
+for /f "usebackq delims=" %%p in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath '%LAUNCH_EXE%' -ArgumentList %PS_ARGS% -PassThru -WindowStyle Hidden -RedirectStandardOutput '%LOG%' -RedirectStandardError '%ERRLOG%'; $p.Id" 2^>nul`) do set "SHIMPID=%%p"
 
-if not defined SHIMPID goto :no_start
+if not defined SHIMPID goto no_start
 set "STARTED_SHIM=1"
+echo [arena] shim pid %SHIMPID%, log %LOG%
 
 set /a TRIES=0
 :wait_loop
-set /a TRIES+=1
 call :probe
-if "%PORT_OPEN%"=="1" goto :shim_ready
-if %TRIES% GEQ 60 goto :no_response
-timeout /t 1 /nobreak >nul
+if "%PORT_OPEN%"=="1" goto shim_ready
+call :alive
+if not "%ALIVE%"=="1" goto shim_died
+set /a TRIES+=1
+if %TRIES% GEQ 30 goto no_response
+ping -n 2 127.0.0.1 >nul
 goto :wait_loop
+
+:shim_died
+echo.
+echo [arena] ERROR: the shim exited right after start.
+call :show_log
+echo.
+echo [arena] running diagnostics...
+call :run_doctor
+call :stop_shim
+call :cleanup
+endlocal & exit /b 1
 
 :no_response
 echo.
-echo [arena] ОШИБКА: шим не ответил на http://127.0.0.1:%SHIM_PORT%/healthz за 60 секунд.
-echo [arena] лог: %LOG%
-if exist "%LOG%.err" (
-    echo ------- последние строки лога -------
-    powershell -NoProfile -Command "Get-Content -Tail 15 '%LOG%.err'"
-    powershell -NoProfile -Command "Get-Content -Tail 15 '%LOG%'"
-)
+echo [arena] ERROR: no answer on http://127.0.0.1:%SHIM_PORT%/healthz in 30 s.
+call :show_log
 echo.
-echo [arena] запускаю диагностику...
+echo [arena] running diagnostics...
 call :run_doctor
 call :stop_shim
+call :cleanup
 endlocal & exit /b 1
 
 :no_start
 echo.
-echo [arena] ОШИБКА: не удалось запустить шим через PowerShell.
-echo [arena] проверьте, что установлен пакет: pip install -U -e ".[auto]"
-echo [arena] и что команда видна:  arena-api --version
+echo [arena] ERROR: PowerShell could not start the shim.
+echo [arena] Run it yourself to see the reason:
+echo         %LAUNCH_EXE% %DOCTOR_ARGS% --claude --port %SHIM_PORT%
+call :cleanup
+endlocal & exit /b 1
+
+:stale_build
+echo.
+echo [arena] ERROR: no installed arena-api can serve --claude here.
+echo [arena] A build without the shim or without --session was found instead.
+echo.
+if exist "%VERSION_FILE%" powershell -NoProfile -Command "Get-Content -Encoding UTF8 '%VERSION_FILE%'"
+echo [arena] Fix it from the repository clone:
+echo         pip install -U -e ".[auto]"
+echo [arena] Then check:  arena-claude.bat version
+call :cleanup
 endlocal & exit /b 1
 
 :shim_ready
-echo [arena] шим готов.
+echo [arena] shim is up.
 
 :run_claude
 echo.
 echo   ANTHROPIC_BASE_URL = http://127.0.0.1:%SHIM_PORT%
-echo   модель             = %MODEL%
-echo   сессия             = %SESSION%
+echo   model              = %MODEL%
+echo   session            = %SESSION%
+echo   engine             = %ENGINE%
 echo.
-if not defined STARTED_SHIM echo [arena] порт %SHIM_PORT% уже слушал -- использую его и не буду гасить.
+if not defined STARTED_SHIM echo [arena] port %SHIM_PORT% was already served - reusing it, not stopping it.
 
 where claude >nul 2>&1
-if errorlevel 1 goto :no_claude
+if errorlevel 1 goto no_claude
 
 set "ANTHROPIC_BASE_URL=http://127.0.0.1:%SHIM_PORT%"
 set "ANTHROPIC_API_KEY=arena"
 set "ANTHROPIC_MODEL=%MODEL%"
 set "ANTHROPIC_SMALL_FAST_MODEL=%MODEL%"
-rem Телеметрия и проверки обновлений ходят в api.anthropic.com мимо шима --
-rem выключаем их, чтобы Claude Code не тормозил на них и не падал с ошибкой.
+rem Telemetry and update checks bypass the shim; switching them off keeps
+rem Claude Code from stalling on api.anthropic.com.
 set "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
 
 claude %*
 set "CLAUDE_EXIT=%ERRORLEVEL%"
 
 echo.
-echo [arena] Claude Code завершился (код %CLAUDE_EXIT%).
+echo [arena] Claude Code exited with code %CLAUDE_EXIT%.
 call :stop_shim
-if exist "%LOG%" del "%LOG%" >nul 2>&1
-if exist "%LOG%.err" del "%LOG%.err" >nul 2>&1
+call :cleanup
 endlocal & exit /b %CLAUDE_EXIT%
 
 :no_claude
-echo [arena] ОШИБКА: команда claude не найдена в PATH.
-echo [arena] установите Claude Code:  npm install -g @anthropic-ai/claude-code
+echo [arena] ERROR: the claude command is not in PATH.
+echo [arena] Install Claude Code:  npm install -g @anthropic-ai/claude-code
 echo.
-echo [arena] шим при этом работает: http://127.0.0.1:%SHIM_PORT%
-echo [arena] можно запустить вручную в другом окне:
+echo [arena] The shim is running anyway: http://127.0.0.1:%SHIM_PORT%
+echo [arena] In another window:
 echo           set ANTHROPIC_BASE_URL=http://127.0.0.1:%SHIM_PORT%
 echo           set ANTHROPIC_API_KEY=arena
 echo           claude
 pause
 call :stop_shim
+call :cleanup
 endlocal & exit /b 1
 
 rem ===========================================================================
-rem  Вспомогательные метки
+rem  Helpers
 rem ===========================================================================
 
 :doctor
-echo [arena] диагностика: пакет, сессия, движок ответа, протокол на loopback
+echo [arena] diagnostics: package, session, answer engine, loopback protocol
 echo.
 call :run_doctor
+call :cleanup
+endlocal & exit /b %ERRORLEVEL%
+
+:print_version
+"%LAUNCH_EXE%" %DOCTOR_ARGS% --version
+call :cleanup
 endlocal & exit /b %ERRORLEVEL%
 
 :run_doctor
-"%LAUNCH_EXE%" %DOCTOR_ARGS% --claude --doctor --engine %ENGINE% --session %SESSION% --model %MODEL%
+"%LAUNCH_EXE%" %DOCTOR_ARGS% --claude --doctor --engine %ENGINE% --session "%SESSION%" --model "%MODEL%"
 goto :eof
 
-rem --- поиск arena-api (или python -m arena_api) ------------------------------
-:find_arena
-set "LAUNCH_EXE="
-set "LAUNCH_ARGS="
+rem --- find the build that can actually serve -------------------------------
+:pick_build
+set "BUILD_OK="
+call :consider arena-api
+if "%BUILD_OK%"=="1" goto :build_args
+call :consider py
+if "%BUILD_OK%"=="1" goto :build_args
+call :consider python
+if "%BUILD_OK%"=="1" goto :build_args
+goto :eof
+
+:consider
+set "CAND="
+for /f "delims=" %%e in ('where %~1 2^>nul') do if not defined CAND set "CAND=%%e"
+if not defined CAND goto :eof
+set "LAUNCH_EXE=%CAND%"
 set "DOCTOR_ARGS="
-for /f "delims=" %%e in ('where arena-api 2^>nul') do (
-    set "LAUNCH_EXE=%%e"
-    goto :arena_found
-)
-for /f "delims=" %%e in ('where py 2^>nul') do (
-    set "LAUNCH_EXE=%%e"
-    set "LAUNCH_ARGS=-m arena_api"
-    set "DOCTOR_ARGS=-m arena_api"
-    goto :arena_found
-)
-for /f "delims=" %%e in ('where python 2^>nul') do (
-    set "LAUNCH_EXE=%%e"
-    set "LAUNCH_ARGS=-m arena_api"
-    set "DOCTOR_ARGS=-m arena_api"
-    goto :arena_found
-)
+if /i not "%~1"=="arena-api" set "DOCTOR_ARGS=-m arena_api"
+if exist "%VERSION_FILE%" del "%VERSION_FILE%" >nul 2>&1
+"%LAUNCH_EXE%" %DOCTOR_ARGS% --version > "%VERSION_FILE%" 2>&1
+findstr /C:"anthropic shim: yes" "%VERSION_FILE%" >nul 2>&1
+if errorlevel 1 goto :eof
+findstr /C:"--session" "%VERSION_FILE%" >nul 2>&1
+if errorlevel 1 goto :eof
+set "BUILD_OK=1"
 goto :eof
 
-:arena_found
-set "LAUNCH_ARGS=%LAUNCH_ARGS% --claude --port %SHIM_PORT% --engine %ENGINE% --session %SESSION% --model %MODEL%"
+:build_args
+set "LAUNCH_ARGS=--claude --port %SHIM_PORT% --engine %ENGINE% --session "%SESSION%" --model "%MODEL%" %EXTRA%"
+rem PowerShell takes the child arguments as an array of single-quoted strings,
+rem so a profile path with spaces survives the hand-off.
+set "PS_ARGS="
+if defined DOCTOR_ARGS set "PS_ARGS='-m','arena_api',"
+set "PS_ARGS=%PS_ARGS%'--claude','--port','%SHIM_PORT%','--engine','%ENGINE%','--session','%SESSION%','--model','%MODEL%'"
+if defined EXTRA set "PS_ARGS=%PS_ARGS%,'%EXTRA%'"
 goto :eof
 
-rem --- отвечает ли порт (curl, иначе PowerShell) ------------------------------
+rem --- /healthz probe: curl when present, PowerShell otherwise ---------------
 :probe
 set "PORT_OPEN=0"
 where curl >nul 2>&1
-if errorlevel 1 goto :probe_ps
+if errorlevel 1 goto probe_ps
 curl -s -f -m 2 -o NUL "http://127.0.0.1:%SHIM_PORT%/healthz" >nul 2>&1
 if not errorlevel 1 set "PORT_OPEN=1"
 goto :eof
@@ -193,7 +260,26 @@ for /f "usebackq delims=" %%r in (`powershell -NoProfile -Command "try { (Invoke
 )
 goto :eof
 
-rem --- остановка поднятого шима (только своего) --------------------------------
+rem --- is our shim process still alive? --------------------------------------
+:alive
+set "ALIVE=0"
+if not defined SHIMPID goto :eof
+tasklist /FI "PID eq %SHIMPID%" 2>nul | findstr /R /C:" %SHIMPID% " >nul 2>&1
+if not errorlevel 1 set "ALIVE=1"
+goto :eof
+
+rem --- print the tail of the shim log ---------------------------------------
+:show_log
+if not exist "%LOG%" goto show_err_log
+echo ------- shim stdout (tail) -------
+powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 20 '%LOG%'"
+:show_err_log
+if not exist "%ERRLOG%" goto :eof
+echo ------- shim stderr (tail) -------
+powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 20 '%ERRLOG%'"
+goto :eof
+
+rem --- stop the shim we started (never somebody else's) ----------------------
 :stop_shim
 if not defined STARTED_SHIM goto :eof
 if not defined SHIMPID goto :eof
@@ -201,10 +287,15 @@ taskkill /F /T /PID %SHIMPID% >nul 2>&1
 set "STARTED_SHIM="
 goto :eof
 
+:cleanup
+if exist "%VERSION_FILE%" del "%VERSION_FILE%" >nul 2>&1
+goto :eof
+
 :no_package
 echo.
-echo [arena] ОШИБКА: не найден ни arena-api, ни python.
-echo [arena] установите пакет из клона репозитория:
-echo           pip install -U -e ".[auto]"
-echo [arena] и проверьте:  arena-api --version
+echo [arena] ERROR: neither arena-api nor python was found.
+echo [arena] Install the package from the repository clone:
+echo         pip install -U -e ".[auto]"
+echo [arena] Then check:  arena-api --version
+call :cleanup
 endlocal & exit /b 1

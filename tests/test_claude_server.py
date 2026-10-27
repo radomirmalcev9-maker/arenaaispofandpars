@@ -1282,3 +1282,137 @@ def test_doctor_help_is_documented(serve: Any) -> None:
     parser = shim._serve_parser()
     assert parser.parse_args(["--doctor"]).doctor is True
     assert parser.parse_args([]).doctor is False
+
+
+# --------------------------------------------------------------------------- #
+# Startup session note (the banner must say "the session is missing")
+# --------------------------------------------------------------------------- #
+
+
+def test_startup_session_note_reports_a_missing_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arena_api import auto
+
+    monkeypatch.setattr(
+        auto, "find_session_for_doctor", lambda **_: (None, auto.AutoOptions())
+    )
+    ok, note = shim.startup_session_note(session="firefox:work")
+    assert ok is False
+    assert "НЕ НАЙДЕНА" in note
+    assert "firefox:work" in note
+    assert "--doctor" in note
+
+
+def test_startup_session_note_reports_a_found_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arena_api import auto
+
+    class Found:
+        description = "Firefox profile C:/x (3 names)"
+
+    monkeypatch.setattr(
+        auto, "find_session_for_doctor", lambda **_: (Found(), auto.AutoOptions())
+    )
+    ok, note = shim.startup_session_note(session="firefox")
+    assert ok is True
+    assert "Firefox profile" in note
+
+
+def test_startup_session_note_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_api import auto
+
+    def boom(**_: Any) -> Any:
+        raise RuntimeError("profile database is locked")
+
+    monkeypatch.setattr(auto, "find_session_for_doctor", boom)
+    ok, note = shim.startup_session_note(session="firefox")
+    assert ok is False
+    assert "profile database is locked" in note
+
+
+def test_banner_mentions_a_missing_session(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class FakeServer:
+        server_address = ("127.0.0.1", 4242)
+
+        class engine:
+            @staticmethod
+            def close() -> None:
+                return None
+
+        def serve_forever(self, poll_interval: float = 0.2) -> None:
+            raise KeyboardInterrupt
+
+        def shutdown(self) -> None:
+            return None
+
+        def server_close(self) -> None:
+            return None
+
+    monkeypatch.setattr(shim, "create_server", lambda **_: FakeServer())
+    monkeypatch.setattr(
+        shim,
+        "startup_session_note",
+        lambda **_: (False, "НЕ НАЙДЕНА (источник firefox:work)"),
+    )
+    assert shim.main(["--claude", "--session", "firefox:work"]) == 0
+    printed = capsys.readouterr().out
+    assert "session                  : firefox:work -> НЕ НАЙДЕНА" in printed
+
+
+def test_banner_skips_the_session_check_for_echo(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class FakeServer:
+        server_address = ("127.0.0.1", 4243)
+
+        class engine:
+            @staticmethod
+            def close() -> None:
+                return None
+
+        def serve_forever(self, poll_interval: float = 0.2) -> None:
+            raise KeyboardInterrupt
+
+        def shutdown(self) -> None:
+            return None
+
+        def server_close(self) -> None:
+            return None
+
+    def explode(**_: Any) -> Any:
+        raise AssertionError("echo needs no session, so it must not be probed")
+
+    monkeypatch.setattr(shim, "create_server", lambda **_: FakeServer())
+    monkeypatch.setattr(shim, "startup_session_note", explode)
+    assert shim.main(["--claude", "--engine", "echo"]) == 0
+    assert "session                  : firefox\n" in capsys.readouterr().out
+
+
+def test_version_report_lists_session_support(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from arena_api import _cli
+
+    assert _cli.main(["--version"]) == 0
+    printed = capsys.readouterr().out
+    assert "sessions     : yes (--session firefox" in printed
+
+
+def test_version_report_marks_a_build_without_session_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arena_api import _cli
+
+    class OldOptions:
+        __dataclass_fields__ = {"base_url": object()}
+
+    import arena_api.auto as auto_module
+
+    monkeypatch.setattr(auto_module, "AutoOptions", OldOptions)
+    report = "\n".join(_cli.version_report())
+    assert "sessions     : NOT supported" in report
+    assert "--session" not in report.split("sessions")[1]
