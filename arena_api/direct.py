@@ -860,6 +860,9 @@ class DirectArenaClient(_DirectMixin):
                     prompt, resolved_id, tok, chat_id, generation
                 )
 
+            runner_kwargs: dict[str, Any] = {}
+            if getattr(browser_runner, "supports_prefetch_hint", False):
+                runner_kwargs["prefetch_next"] = conversation_id is None
             with browser_runner.stream_evaluation(
                 endpoint_path,
                 _fallback_body,
@@ -868,6 +871,7 @@ class DirectArenaClient(_DirectMixin):
                 model_id_override=explicit_model_id,
                 generation_params=generation.model_parameters() or None,
                 follow_up=follow_up,
+                **runner_kwargs,
             ) as (content_type, wire_chunks):
                 stream_deadline = time.monotonic() + generation.queue_timeout
                 for kind, value in _iter_wire_records(
@@ -1172,6 +1176,9 @@ class AsyncDirectArenaClient(_DirectMixin):
                     prompt, resolved_id, tok, chat_id, generation
                 )
 
+            runner_kwargs: dict[str, Any] = {}
+            if getattr(browser_runner, "supports_prefetch_hint", False):
+                runner_kwargs["prefetch_next"] = conversation_id is None
             async with browser_runner.astream_evaluation(
                 endpoint_path,
                 _fallback_body,
@@ -1180,6 +1187,7 @@ class AsyncDirectArenaClient(_DirectMixin):
                 model_id_override=explicit_model_id,
                 generation_params=generation.model_parameters() or None,
                 follow_up=follow_up,
+                **runner_kwargs,
             ) as (content_type, wire_chunks):
                 stream_deadline = time.monotonic() + generation.queue_timeout
                 async for kind, value in _aiter_wire_records(
