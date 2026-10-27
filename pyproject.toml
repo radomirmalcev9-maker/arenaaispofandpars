@@ -78,6 +78,9 @@ auto = [
     "playwright-recaptcha>=0.5",
     "playwright-stealth>=2.0",
 ]
+# HTTP-прокси с Anthropic-совместимым API, чтобы arena-api можно было
+# подставить вместо Claude в Claude Code (ANTHROPIC_BASE_URL).
+api = ["fastapi>=0.100", "uvicorn>=0.20"]
 
 [tool.setuptools.packages.find]
 # recaptcha_toolkit ships inside the package (arena_api/_vendor) so that
