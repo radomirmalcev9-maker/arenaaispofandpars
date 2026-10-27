@@ -14,6 +14,10 @@ prints the medians plus the resulting speed-up.  It needs a working session
 there is nothing to compare.
 
 Notes:
+* nothing is delayed or retried between runs: the script measures back-to-back
+  invocations, exactly like calling the CLI in a loop;
+* a failed run is reported and skipped; the benchmark only stops when a whole
+  variant produced no measurement at all;
 * the first warm run pays for starting the daemon, so it is reported apart;
 * the prompt should produce a short answer — the benchmark measures the whole
   command, and a long generation dominates both variants equally.
@@ -84,49 +88,63 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"prompt: {args.prompt!r}")
     print(f"runs  : {args.runs} per variant\n")
 
+    failed: dict[str, int] = {"cold": 0, "warm": 0}
+
+    def measure(label: str, variant: str, argv: Sequence[str]) -> float | None:
+        seconds, code, err = _run(args.python, argv)
+        if code != 0:
+            failed[variant] += 1
+            first_line = err.splitlines()[0] if err else f"exit code {code}"
+            print(f"  {label}: failed — {first_line}")
+            return None
+        print(f"  {label}: {seconds:.2f}s")
+        return seconds
+
     cold: list[float] = []
     for index in range(args.runs):
         _run(args.python, ["--warm-stop"])
-        seconds, code, err = _run(args.python, [*common, "--no-warm"])
-        if code != 0:
-            print(f"cold run {index + 1} failed (exit {code}):\n{err}\n", file=sys.stderr)
-            return 2
-        cold.append(seconds)
-        print(f"  cold run {index + 1}: {seconds:.2f}s")
+        seconds = measure(f"cold run {index + 1}", "cold", [*common, "--no-warm"])
+        if seconds is not None:
+            cold.append(seconds)
 
-    first_warm, code, err = _run(args.python, common)
-    if code != 0:
-        print(f"the first warm run failed (exit {code}):\n{err}\n", file=sys.stderr)
-        return 2
+    first_warm = measure("first warm run (daemon start)", "warm", common)
     warm: list[float] = []
     for index in range(args.runs):
-        seconds, code, err = _run(args.python, common)
-        if code != 0:
-            print(f"warm run {index + 1} failed (exit {code}):\n{err}\n", file=sys.stderr)
-            return 2
-        warm.append(seconds)
-        print(f"  warm run {index + 1}: {seconds:.2f}s")
+        seconds = measure(f"warm run {index + 1}", "warm", common)
+        if seconds is not None:
+            warm.append(seconds)
 
     _run(args.python, ["--warm-stop"])
 
-    cold_median = statistics.median(cold)
-    warm_median = statistics.median(warm)
+    if not cold and not warm:
+        print(
+            "\nNo run succeeded. Start with `arena-api --status` to check the "
+            "session, then retry.",
+            file=sys.stderr,
+        )
+        return 2
+
     print()
-    print(f"{'variant':<26}{'runs (s)':<32}{'median':>10}")
-    print("-" * 68)
-    print(_format_runs("cold (--no-warm)", cold))
-    print(_format_runs("warm (daemon reused)", warm))
-    print(f"{'first warm run (start)':<26}{'':<32}{_label(first_warm):>10}")
-    if warm_median > 0:
-        print(f"\nspeed-up on repeated prompts: {cold_median / warm_median:.1f}x")
-        if first_warm > 0:
-            print(f"first call vs cold          : {cold_median / first_warm:.2f}x")
+    print(f"{'variant':<26}{'runs (s)':<32}{'median':>10}{'failed':>8}")
+    print("-" * 76)
+    print(_format_runs("cold (--no-warm)", cold), f"{failed['cold']:>8}")
+    print(_format_runs("warm (daemon reused)", warm), f"{failed['warm']:>8}")
+    if first_warm is not None:
+        print(f"{'first warm run (start)':<26}{'':<32}{_label(first_warm):>10}")
+    if cold and warm:
+        print(f"\nspeed-up on repeated prompts: {statistics.median(cold) / statistics.median(warm):.1f}x")
+        if first_warm:
+            print(f"first call vs cold          : {statistics.median(cold) / first_warm:.2f}x")
+    elif not cold:
+        print("\nThe cold side did not produce a measurement, so there is no ratio.")
+    elif not warm:
+        print("\nThe warm side did not produce a measurement, so there is no ratio.")
     print(
         "\nReminder: both variants include the model's own generation time; "
         "only the pre-answer overhead is removed,\nso the factor grows with "
         "shorter answers and shrinks on a slow network."
     )
-    return 0
+    return 0 if cold and warm else 1
 
 
 if __name__ == "__main__":

@@ -174,6 +174,7 @@ from .transport import (
     _is_verification_rejection,
     _looks_like_challenge,
     _raise_for_status,
+    _retry_after,
     impersonation_available,
     normalize_cookies,
     normalize_proxy,
@@ -1679,6 +1680,31 @@ def _is_page_usable(page: Any) -> bool:
     return True
 
 
+def _status_means_challenge(
+    status: int,
+    body: str,
+    headers: Mapping[str, str],
+    *,
+    solver_ready: bool,
+) -> bool:
+    """Whether an HTTP error status is (also) how a captcha is reported.
+
+    Arena's edge rejects a missing, failed or re-required reCAPTCHA with
+    ``403``/``429``/``503`` and an opaque JSON body, so the body alone cannot
+    tell a challenge from a real rate limit -- which is why a ``429`` used to
+    surface as :class:`~arena_api.exceptions.RateLimitError` even when the page
+    was showing a captcha the solver could have cleared.
+
+    A ``429`` is therefore a challenge candidate whenever a solver is
+    available: the page is scanned for the widget, the solver gets to run, and
+    a genuine rate limit still surfaces once the grace window expires without
+    a challenge appearing.
+    """
+    if _is_verification_rejection(body) or _looks_like_challenge(body, headers):
+        return True
+    return status == 429 and solver_ready
+
+
 async def _warm_page_responds(page: Any) -> bool:
     """Cheap liveness probe: a crashed/detached renderer fails ``page.title()``."""
     title_fn = getattr(page, "title", None)
@@ -2156,13 +2182,31 @@ class DirectVerificationToken:
         headers: Mapping[str, str],
     ) -> None:
         mitigated = headers.get("cf-mitigated", "").lower() == "challenge"
-        if mitigated or (status in (403, 503) and _looks_like_challenge(body, headers)):
+        if mitigated or (
+            status in (403, 429, 503) and _looks_like_challenge(body, headers)
+        ):
             raise ChallengeRequiredError(
                 f"The service requested an interactive browser verification (HTTP {status}). "
                 "Refresh or verify the session in a normal browser and retry."
             )
         detail = _extract_error_detail(body)
         suffix = f": {detail}" if detail else ""
+        if status == 429:
+            # The page was already scanned for a widget by the caller, so this
+            # is a limit rather than a challenge -- but say what was checked,
+            # because the two share a status code.
+            if self._explicit_solver:
+                solver = "explicit solver"
+            elif self.options.solve_captchas is not False:
+                solver = "enabled"
+            else:
+                solver = "disabled"
+            raise RateLimitError(
+                f"Arena answered HTTP 429{suffix}. No verification challenge was "
+                f"found on the page (captcha solving: {solver}); retry shortly, "
+                "or run with --show-browser to see whether a challenge appears.",
+                retry_after=_retry_after(headers),
+            )
         if status in (401, 403):
             if _is_verification_rejection(body):
                 raise ProtocolError(
@@ -2673,6 +2717,11 @@ class DirectVerificationToken:
             first_kind: str = ""
             first_val: Any = None
             deadline = time.monotonic() + timeout
+            # "Somebody can clear a challenge for us": either the automatic
+            # solver is available or the caller handed us one explicitly.
+            solver_ready = (
+                self.options.solve_captchas is not False or self._explicit_solver
+            )
             pending_verification_err: tuple[int, str, dict[str, str]] | None = None
             grace_until = 0.0
             clicked_checkbox_kinds: set[str] = set()
@@ -2728,16 +2777,19 @@ class DirectVerificationToken:
                         raise _RetryInHeadedBrowser(f"HTTP {status}")
                     if (
                         used_composer
-                        and (
-                            window_visible
-                            or self.options.solve_captchas is not False
-                        )
+                        and (window_visible or solver_ready)
                         and status in (403, 429, 503)
-                        and (
-                            _is_verification_rejection(err_body)
-                            or _looks_like_challenge(err_body, resp_headers)
+                        and _status_means_challenge(
+                            status,
+                            err_body,
+                            resp_headers,
+                            solver_ready=solver_ready,
                         )
                     ):
+                        # Keep the request alive while the page is scanned for a
+                        # challenge: a 429 that is really a captcha is solved
+                        # and the prompt is sent again, a genuine limit is
+                        # re-raised below once nothing appears.
                         pending_verification_err = (status, err_body, resp_headers)
                         grace_until = max(grace_until, time.monotonic() + 12.0)
                     else:
@@ -2745,9 +2797,7 @@ class DirectVerificationToken:
                             status, err_body, resp_headers
                         )
 
-                if used_composer and (
-                    window_visible or self.options.solve_captchas is not False
-                ):
+                if used_composer and (window_visible or solver_ready):
                     obs = await _detect_post_submit_challenge(page)
                     obs_kind = obs.get("kind")
                     if isinstance(obs_kind, str) and obs_kind:
