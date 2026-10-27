@@ -45,6 +45,13 @@ def _wants_warm_prompt(argv: Sequence[str]) -> bool:
     return any(item == "--prompt" or item.startswith("--prompt=") for item in argv)
 
 
+def _wants_claude_server(args: Sequence[str]) -> bool:
+    """``--claude`` (or a leading ``claude``) starts the Anthropic shim."""
+    if "--claude" in args or "--serve-anthropic" in args:
+        return True
+    return bool(args) and args[0] == "claude"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI; ``argv`` defaults to ``sys.argv[1:]``."""
     args = list(sys.argv[1:] if argv is None else argv)
@@ -62,6 +69,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if "--warm-start" in args:
             return start_main(args)
         return profile_main(args)
+    if _wants_claude_server(args):
+        from .compat import main as claude_main
+
+        return claude_main(args)
     if _wants_warm_prompt(args):
         from .warm import fast_prompt_main
 

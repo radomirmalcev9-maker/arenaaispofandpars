@@ -5,6 +5,33 @@
 
 ## Unreleased
 
+### Claude Code на моделях Arena: Anthropic-совместимый API
+
+`arena-api --claude` (или `arena-claude`) поднимает на loopback-порту
+Anthropic Messages API, ответы на который генерирует Arena Direct Chat. С
+`ANTHROPIC_BASE_URL` на этот порт оболочка Claude Code работает на моделях
+вашей сессии — вместо `api.anthropic.com`.
+
+- **`POST /v1/messages`**: поток (`message_start`, `ping`,
+  `content_block_start/delta/stop`, `message_delta`, `message_stop`, `error`)
+  и обычный JSON; `system`, история диалога, `stop_sequences`, `usage`.
+- **Эмуляция tool use**: `tools` рендерятся в промпт строгим форматом
+  `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`, ответ
+  разбирается обратно в блоки `tool_use` со `stop_reason: "tool_use"`. Без
+  этого Claude Code не может ни читать файлы, ни запускать команды.
+  Понимаются также ```json-фенс и «голый» JSON (последний — только с полем
+  аргументов, чтобы проза не выполнялась как вызов).
+- **Стриминг не деградирует**: текстовые ответы идут дельтами; буферизуется
+  только тот ответ, в котором реально начал формироваться вызов — с
+  удержанием 64 символов, чтобы `<tool_call>` не утёк в текст по частям.
+- **`POST /v1/messages/count_tokens`**, **`GET /v1/models`**,
+  **`GET /v1/models/{id}`**, **`/healthz`** и `/` с готовыми переменными для
+  Claude Code.
+- **Движки**: `warm` (тёплый демон, по умолчанию, с автооткатом на `http`),
+  `http` (свой `DirectArenaClient`), `echo` (проводка без сессии).
+- **Публичное API не менялось**: всё новое — отдельный подпакет
+  `arena_api.compat`, точка входа `--claude` и скрипт `arena-claude`.
+
 ### Меньше round-trip'ов при отправке, метрики стрима и `--fast-submit`
 
 По таймлайну из `--warm-profile` видно, что из 13–24 с ответа наши накладные
