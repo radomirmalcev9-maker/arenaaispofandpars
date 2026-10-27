@@ -1000,3 +1000,15 @@ def test_apply_stop_sequences_without_a_match() -> None:
     assert text == "полный ответ"
     assert stop is None
     assert shim.apply_stop_sequences("x", []) == ("x", None)
+
+
+def test_version_reports_where_the_build_lives(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from arena_api import _cli
+
+    assert _cli.main(["--version"]) == 0
+    printed = capsys.readouterr().out
+    assert "arena-api " in printed
+    assert "module       :" in printed
+    assert "anthropic shim: yes" in printed

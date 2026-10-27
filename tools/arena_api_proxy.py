@@ -16,6 +16,15 @@ Anthropic-совместимый HTTP-прокси над arena-api.
 Запуск:
     python tools/arena_api_proxy.py        # http://localhost:8765
     PORT=9000 python tools/arena_api_proxy.py
+
+.. note::
+    Это ранний прототип (и ему нужны ``fastapi`` и ``uvicorn``). В самой
+    библиотеке теперь есть полноценный шим с тем же протоколом::
+
+        arena-api --claude --port 8082
+
+    Он без внешних зависимостей, ходит через тёплый демон, сохраняет всю
+    историю и ``system``, поддерживает ``tool_use`` и ``stop_sequences``.
 """
 
 from __future__ import annotations
@@ -93,7 +102,6 @@ async def messages(request: Request):
     model = body.get("model", "arena")
     stream = body.get("stream", False)
     messages = body.get("messages", [])
-    max_tokens = body.get("max_tokens", 4096)
 
     prompt = _extract_prompt(messages)
     if not prompt:

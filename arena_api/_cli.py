@@ -15,6 +15,7 @@ to :func:`arena_api.auto.main` unchanged, so the CLI behaves exactly as before.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from collections.abc import Sequence
 
 from . import latency
@@ -45,6 +46,54 @@ def _wants_warm_prompt(argv: Sequence[str]) -> bool:
     return any(item == "--prompt" or item.startswith("--prompt=") for item in argv)
 
 
+def _package_version() -> str:
+    """The installed distribution version, or ``"unknown"`` for a loose tree."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:  # pragma: no cover - Python < 3.8
+        return "unknown"
+    try:
+        return version("arena-api")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _has_anthropic_shim() -> bool:
+    """Whether this build can serve ``--claude`` (i.e. is not stale)."""
+    from importlib.util import find_spec
+
+    try:
+        return find_spec("arena_api.compat.anthropic_server") is not None
+    except (ImportError, ValueError):  # pragma: no cover - broken install
+        return False
+
+
+def version_report() -> list[str]:
+    """Where this build lives and what it can do.
+
+    Printed by ``--version``: a stale install looks exactly like a code bug --
+    a new flag comes back as "unrecognized arguments" -- so the first question
+    is always *which* copy of the package answered.
+    """
+    import platform
+    import sys
+
+    import arena_api
+
+    module_dir = str(Path(str(arena_api.__file__)).parent)
+    shim = (
+        "yes (arena-api --claude)"
+        if _has_anthropic_shim()
+        else "no -- this build predates --claude, upgrade it"
+    )
+    return [
+        f"arena-api {_package_version()}",
+        f"module       : {module_dir}",
+        f"python       : {sys.executable} ({platform.python_version()})",
+        f"anthropic shim: {shim}",
+    ]
+
+
 def _wants_claude_server(args: Sequence[str]) -> bool:
     """``--claude`` (or a leading ``claude``) starts the Anthropic shim."""
     if "--claude" in args or "--serve-anthropic" in args:
@@ -56,6 +105,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI; ``argv`` defaults to ``sys.argv[1:]``."""
     args = list(sys.argv[1:] if argv is None else argv)
     latency.mark("cli.entry")
+    if "--version" in args:
+        print("\n".join(version_report()))
+        return 0
     if any(
         flag in args or any(item.startswith(f"{flag}=") for item in args)
         for flag in ("--warm-stop", "--warm-status", "--warm-start", "--warm-profile")
