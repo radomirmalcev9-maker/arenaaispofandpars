@@ -5804,3 +5804,83 @@ def test_follow_ups_are_never_archived() -> None:
     options = auto_module.AutoOptions(archive_after_answer=True)
     assert options.archive_after_answer is True
     assert auto_module.AutoOptions().archive_after_answer is False
+
+
+# --------------------------------------------------------------------------- #
+# A crashed run leaves profile locks behind; the next launch must recover
+# --------------------------------------------------------------------------- #
+
+
+def test_stale_profile_locks_are_removed(tmp_path) -> None:
+    from arena_api.auth import browser as browser_module
+
+    profile = tmp_path / "direct_browser_profile"
+    profile.mkdir()
+    dead = 999_999_999  # certainly not a live pid
+    (profile / "SingletonLock").write_text(f"DESKTOP-ABC-{dead}", encoding="utf-8")
+    (profile / "SingletonCookie").write_text("123", encoding="utf-8")
+    removed = browser_module.heal_profile_locks(profile)
+    assert "SingletonLock" in removed
+    assert "SingletonCookie" in removed
+    assert not (profile / "SingletonLock").exists()
+
+
+def test_a_live_lock_is_kept(tmp_path) -> None:
+    from arena_api.auth import browser as browser_module
+
+    profile = tmp_path / "direct_browser_profile"
+    profile.mkdir()
+    (profile / "SingletonLock").write_text(f"DESKTOP-ABC-{os.getpid()}", encoding="utf-8")
+    removed = browser_module.heal_profile_locks(profile)
+    assert "SingletonLock" not in removed
+    assert (profile / "SingletonLock").exists()
+    assert browser_module.profile_is_locked(profile) is True
+
+
+def test_lock_owner_parsing(tmp_path) -> None:
+    from arena_api.auth import browser as browser_module
+
+    lock = tmp_path / "SingletonLock"
+    lock.write_text("host-4242", encoding="utf-8")
+    assert browser_module._lock_owner_pid(lock) == 4242
+    lock.write_text("garbage", encoding="utf-8")
+    assert browser_module._lock_owner_pid(lock) is None
+    assert browser_module._lock_owner_pid(tmp_path / "missing") is None
+
+
+def test_closed_browser_error_is_recognised() -> None:
+    from arena_api.auth import browser as browser_module
+
+    assert browser_module._is_closed_browser_error(
+        RuntimeError("Target page, context or browser has been closed")
+    )
+    assert browser_module._is_closed_browser_error(RuntimeError("Browser closed"))
+    assert not browser_module._is_closed_browser_error(RuntimeError("net::ERR_PROXY"))
+
+
+def test_profile_hint_tells_what_to_do() -> None:
+    from arena_api.auth import browser as browser_module
+
+    hint = browser_module.profile_launch_hint(r"D:\repo\state\direct_browser_profile")
+    assert "chrome.exe" in hint
+    assert "--fresh-profile" in hint
+
+
+def test_fresh_profile_flag_is_parsed_and_resets_once(tmp_path) -> None:
+    parser = auto_module.build_arg_parser()
+    options = auto_module._options_from_args(parser.parse_args(["--fresh-profile"]))
+    assert options.reset_profile is True
+
+    profile = tmp_path / "direct_browser_profile"
+    profile.mkdir()
+    (profile / "Local State").write_text("{}", encoding="utf-8")
+    auto_module._maybe_reset_browser_profile(options, profile)
+    assert not profile.exists()
+    # The second call must not delete a profile the browser just recreated.
+    profile.mkdir()
+    auto_module._maybe_reset_browser_profile(options, profile)
+    assert profile.exists()
+
+
+def test_fresh_profile_is_off_by_default() -> None:
+    assert auto_module.AutoOptions().reset_profile is False

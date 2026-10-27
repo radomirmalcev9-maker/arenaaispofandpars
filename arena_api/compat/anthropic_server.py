@@ -1886,6 +1886,39 @@ def doctor(argv: Sequence[str] | None = None) -> int:
             server.server_close()
             engine.close()
 
+    report.step("5. Профиль браузера")
+    try:
+        from .._direct_page import _direct_browser_profile_dir
+        from ..auth.browser import (
+            heal_profile_locks,
+            profile_is_locked,
+            profile_launch_hint,
+        )
+        from ..auto import AutoOptions as _Options
+
+        profile_dir = _direct_browser_profile_dir(_Options(base_url=parsed.base_url))
+        if not profile_dir.exists():
+            report.ok(f"{profile_dir} ещё не создан (первый запуск создаст его)")
+        else:
+            healed = heal_profile_locks(profile_dir)
+            if healed:
+                report.note(f"сняты устаревшие блокировки: {', '.join(healed)}")
+            if profile_is_locked(profile_dir):
+                report.fail(
+                    f"профиль занят живым процессом: {profile_dir}",
+                    "закройте все окна Chrome/Edge (или завершите их в "
+                    "диспетчере задач) и повторите; как временный обход — "
+                    "arena-api --fresh-profile",
+                )
+            else:
+                size = sum(
+                    1 for _ in profile_dir.rglob("*") if _.is_file()
+                )
+                report.ok(f"{profile_dir} ({size} файлов, свободен)")
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        report.fail(f"профиль браузера не проверен: {type(exc).__name__}: {exc}",
+                    profile_launch_hint("{профиль}"))
+
     report.step("ИТОГ")
     if report.failures == 0:
         report.note("Шим отвечает. Запускайте:")

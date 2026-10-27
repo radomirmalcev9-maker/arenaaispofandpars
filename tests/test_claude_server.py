@@ -1526,3 +1526,118 @@ def test_banner_reports_the_archive_setting(
     printed = capsys.readouterr().out
     assert "archive after answer     : yes" in printed
     assert captured["archive"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Profile recovery on launch (the "browser has been closed" case)
+# --------------------------------------------------------------------------- #
+
+
+def test_recover_profile_falls_back_to_a_scratch_profile(
+    tmp_path: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio as _asyncio
+
+    from arena_api.auth import browser as browser_module
+
+    profile = tmp_path / "direct_browser_profile"  # type: ignore[operator]
+    profile.mkdir()
+    calls: list[str] = []
+
+    class Chromium:
+        async def launch_persistent_context(self, path: str, **_: Any) -> str:
+            calls.append(path)
+            if path == str(profile):
+                raise RuntimeError("Target page, context or browser has been closed")
+            return f"context:{path}"
+
+    class FakePlaywright:
+        chromium = Chromium()
+
+    env = browser_module.BrowserEnvironment(
+        browser_module.BrowserEnvironmentOptions(user_data_dir=str(profile))
+    )
+    env._playwright = FakePlaywright()  # type: ignore[assignment]
+    context = _asyncio.run(
+        env._recover_profile(
+            RuntimeError("Target page, context or browser has been closed"),
+            profile,
+            {},
+        )
+    )
+    assert context.startswith("context:")
+    assert calls[0] == str(profile)
+    assert calls[1] != str(profile)  # a throwaway profile
+    printed = capsys.readouterr().err
+    assert "temporary profile" in printed
+    assert env._scratch_profile_dir is not None
+
+
+def test_recover_profile_retries_after_removing_stale_locks(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    from arena_api.auth import browser as browser_module
+
+    profile = tmp_path / "direct_browser_profile"
+    profile.mkdir()
+    (profile / "SingletonLock").write_text("host-999999999", encoding="utf-8")
+    calls: list[str] = []
+
+    class Chromium:
+        async def launch_persistent_context(self, path: str, **_: Any) -> str:
+            calls.append(path)
+            if (profile / "SingletonLock").exists():
+                raise RuntimeError("ProcessSingleton: profile appears to be in use")
+            return f"context:{path}"
+
+    class FakePlaywright:
+        chromium = Chromium()
+
+    env = browser_module.BrowserEnvironment(
+        browser_module.BrowserEnvironmentOptions(user_data_dir=str(profile))
+    )
+    env._playwright = FakePlaywright()  # type: ignore[assignment]
+    context = _asyncio.run(
+        env._recover_profile(
+            RuntimeError("ProcessSingleton: profile appears to be in use"),
+            profile,
+            {},
+        )
+    )
+    # The stale lock was dropped and the real profile came up: trust cookies
+    # are preserved instead of silently switching to a scratch profile.
+    assert context == f"context:{profile}"
+    assert not (profile / "SingletonLock").exists()
+    assert env._scratch_profile_dir is None
+
+
+def test_recover_profile_explains_a_total_failure(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    from arena_api.auth import browser as browser_module
+
+    profile = tmp_path / "direct_browser_profile"
+    profile.mkdir()
+
+    class Chromium:
+        async def launch_persistent_context(self, path: str, **_: Any) -> str:
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    class FakePlaywright:
+        chromium = Chromium()
+
+    env = browser_module.BrowserEnvironment(
+        browser_module.BrowserEnvironmentOptions(user_data_dir=str(profile))
+    )
+    env._playwright = FakePlaywright()  # type: ignore[assignment]
+    with pytest.raises(RuntimeError) as caught:
+        _asyncio.run(
+            env._recover_profile(
+                RuntimeError("Target page, context or browser has been closed"),
+                profile,
+                {},
+            )
+        )
+    message = str(caught.value)
+    assert "chrome.exe" in message
+    assert "--fresh-profile" in message
