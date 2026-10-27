@@ -5,6 +5,20 @@
 
 ## Unreleased
 
+### Батник переживает сломанную установку
+
+- **`arena-claude.bat` теперь умеет запускать пакет прямо из клона**: если
+  `arena-api.exe` не работает (типичный случай — `ModuleNotFoundError: No module
+  named 'arena_api'`: скрипт остался, пакет в том Python удалён), батник
+  пробует `py -m arena_api` и `python -m arena_api` с `PYTHONPATH` на каталог
+  репозитория. Установка при этом не нужна вовсе.
+- **Внятная причина в сообщении**: при неудаче печатается вывод `--version` и
+  конкретный совет — «модуль удалён, переустановите: `py -m pip install -e "."`»
+  либо «сборка слишком старая: `py -m pip install -U -e ".[auto]"`».
+- **`arena-api --version` называет отсутствующие зависимости**:
+  `sessions : cannot import arena_api.auto: No module named 'httpx'
+  (install the dependencies: pip install -e ".[auto]")`.
+
 ### Архив беседы после полного ответа
 
 - **`AutoOptions.archive_after_answer` / `arena-api --archive-after-answer`**:
