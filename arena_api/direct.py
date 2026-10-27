@@ -6,7 +6,6 @@ only verification assertions explicitly supplied by the caller.
 
 from __future__ import annotations
 
-import asyncio
 import codecs
 import html
 import json
@@ -15,7 +14,6 @@ import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from typing import Any
 
@@ -833,35 +831,8 @@ class DirectArenaClient(_DirectMixin):
             verification_token,
             custom_http_transport=self.transport._custom_http_transport,
         )
-        token_source = (
-            verification_token
-            if verification_token is not None
-            else self.verification_token
-        )
         explicit_model_id: str | None = None
-        prefetched_model_id: str | None = None
-        initial_token: str | None = None
-        needs_catalog = model is None or not _UUID_RE.fullmatch(model)
-        if use_browser and model is not None and needs_catalog:
-            start_prewarm = getattr(self.verification_token, "prewarm", None)
-            if callable(start_prewarm):
-                start_prewarm()
-        if not use_browser and callable(token_source) and needs_catalog:
-            # The catalog HTTP request and a potentially slow token callback
-            # are independent.  Keep the callback on the caller's thread while
-            # the catalog lookup runs in a worker.
-            def _resolve_with_catalog() -> str:
-                return self._resolve_model(model, self.get_models())
-
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                resolved_future = pool.submit(_resolve_with_catalog)
-                initial_token = self._token(verification_token)
-                resolved_model_id = resolved_future.result()
-            if model is None:
-                prefetched_model_id = resolved_model_id
-            else:
-                explicit_model_id = resolved_model_id
-        elif model is not None:
+        if model is not None:
             # Supplying the UUID itself is the zero-request fast path.  Names
             # still need the catalog for their public-name -> UUID mapping.
             if _UUID_RE.fullmatch(model):
@@ -922,13 +893,8 @@ class DirectArenaClient(_DirectMixin):
                 )
             return
 
-        model_id = (
-            explicit_model_id
-            or prefetched_model_id
-            or self._resolve_model(None, self.get_models())
-        )
-        if initial_token is None:
-            initial_token = self._token(verification_token)
+        model_id = explicit_model_id or self._resolve_model(None, self.get_models())
+        initial_token: str | None = self._token(verification_token)
 
         def build_content() -> str:
             nonlocal initial_token
@@ -1168,17 +1134,6 @@ class AsyncDirectArenaClient(_DirectMixin):
                 )
         return list(self._models)
 
-    async def _resolve_model_with_catalog(self, model: str | None) -> str:
-        return self._resolve_model(model, await self.get_models())
-
-    async def _token_async(self, supplied: str | None) -> str:
-        source = supplied if supplied is not None else self.verification_token
-        if callable(source):
-            # Token callbacks are synchronous by API contract and may launch a
-            # browser.  Do not block the event loop (or a concurrent model GET).
-            return await asyncio.to_thread(self._token, supplied)
-        return self._token(supplied)
-
     async def astream(
         self,
         prompt: str,
@@ -1195,43 +1150,14 @@ class AsyncDirectArenaClient(_DirectMixin):
             verification_token,
             custom_http_transport=self.transport._custom_http_transport,
         )
-        token_source = (
-            verification_token
-            if verification_token is not None
-            else self.verification_token
-        )
         explicit_model_id: str | None = None
-        prefetched_model_id: str | None = None
-        initial_token: str | None = None
-        token_task: asyncio.Task[str] | None = None
-        needs_catalog = model is None or not _UUID_RE.fullmatch(model)
-        if not use_browser and callable(token_source) and needs_catalog:
-            token_task = asyncio.create_task(
-                asyncio.to_thread(self._token, verification_token)
-            )
-        if use_browser and model is not None and needs_catalog:
-            start_prewarm = getattr(self.verification_token, "aprewarm", None)
-            if callable(start_prewarm):
-                await start_prewarm()
-        if model is not None and not needs_catalog:
-            explicit_model_id = self._resolve_model(model, self._models or [])
-        elif token_task is not None:
-            resolved_result, token_result = await asyncio.gather(
-                self._resolve_model_with_catalog(model),
-                token_task,
-                return_exceptions=True,
-            )
-            if isinstance(resolved_result, BaseException):
-                raise resolved_result
-            if isinstance(token_result, BaseException):
-                raise token_result
-            if model is None:
-                prefetched_model_id = resolved_result
+        if model is not None:
+            if _UUID_RE.fullmatch(model):
+                explicit_model_id = self._resolve_model(model, self._models or [])
             else:
-                explicit_model_id = resolved_result
-            initial_token = token_result
-        elif model is not None:
-            explicit_model_id = await self._resolve_model_with_catalog(model)
+                explicit_model_id = self._resolve_model(
+                    model, await self.get_models()
+                )
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
@@ -1280,23 +1206,18 @@ class AsyncDirectArenaClient(_DirectMixin):
                 "Arena Direct Chat stream ended without a completion record."
             )
 
-        model_id = (
-            explicit_model_id
-            or prefetched_model_id
-            or await self._resolve_model_with_catalog(None)
+        model_id = explicit_model_id or self._resolve_model(
+            None, await self.get_models()
         )
-        if token_task is not None and initial_token is None:
-            initial_token = await token_task
-        elif initial_token is None:
-            initial_token = await self._token_async(verification_token)
+        initial_token: str | None = self._token(verification_token)
 
-        async def build_content() -> str:
+        def build_content() -> str:
             nonlocal initial_token
             if initial_token is not None:
                 tok = initial_token
                 initial_token = None
             else:
-                tok = await self._token_async(verification_token)
+                tok = self._token(verification_token)
             body = self._request_body(prompt, model_id, tok, chat_id, generation)
             return json.dumps(body, separators=(",", ":"))
 

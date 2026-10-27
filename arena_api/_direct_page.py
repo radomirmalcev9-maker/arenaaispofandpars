@@ -289,7 +289,7 @@ async () => {{
     const deadline = Date.now() + 20000;
     let g = getExecutor();
     while (!g && Date.now() < deadline) {{
-        await new Promise((r) => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 150));
         g = getExecutor();
     }}
     if (!g) return null;
@@ -485,7 +485,7 @@ async () => {
         y: Math.round(best.rect.top + best.rect.height / 2)
       };
     }
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 200));
   }
   return { found: false };
 }
@@ -918,7 +918,7 @@ async def _submit_prompt_via_composer(
         and keyboard is not None
         and callable(getattr(keyboard, "type", None))
     ):
-        await keyboard.type(prompt, delay=0)
+        await keyboard.type(prompt, delay=2)
         try:
             non_empty = await eval_fn(_COMPOSER_NONEMPTY_JS)
         except Exception:  # noqa: BLE001
@@ -932,8 +932,11 @@ async def _submit_prompt_via_composer(
             and keyboard is not None
             and callable(getattr(keyboard, "type", None))
         ):
-            await keyboard.type(first_line, delay=0)
+            await keyboard.type(first_line, delay=2)
         await composer.fill(prompt)
+
+    if callable(wait_fn):
+        await wait_fn(15)
 
     btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
     try:
@@ -954,23 +957,12 @@ async def _submit_prompt_via_composer(
             # pressing Enter on top of an explicit Send click fires a duplicate
             # submission while grecaptcha.enterprise.execute() is still running.
             if btn_info.get("confidence") == "fallback":
-                # Do not always pay a 500 ms penalty.  The request normally
-                # starts much sooner; poll the cheap submission flag and leave
-                # as soon as either the network request or a challenge starts.
-                already_started = False
-                for poll_index in range(20):
-                    already_started = bool(has_submitted and has_submitted())
-                    if already_started:
-                        break
-                    if poll_index % 4 == 0:
-                        challenge = await _detect_post_submit_challenge(page)
-                        already_started = challenge.get("kind") is not None
-                        if already_started:
-                            break
-                    if callable(wait_fn):
-                        await wait_fn(25)
-                    else:
-                        break
+                if callable(wait_fn):
+                    await wait_fn(500)
+                already_started = bool(has_submitted and has_submitted())
+                if not already_started:
+                    challenge = await _detect_post_submit_challenge(page)
+                    already_started = challenge.get("kind") is not None
                 if not already_started:
                     try:
                         still_has_text = bool(await eval_fn(_COMPOSER_NONEMPTY_JS))
