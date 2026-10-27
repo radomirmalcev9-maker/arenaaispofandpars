@@ -1292,6 +1292,10 @@ def scan_argv(argv: Sequence[str]) -> _WarmArgs:
             parsed.force = arg == "--warm"
             index += 1
             continue
+        if arg in ("--warm-start", "--warm-stop", "--warm-status"):
+            # Daemon commands, never forwarded to the daemon's own parser.
+            index += 1
+            continue
         if arg in ("--warm-idle", "--warm-timeout", "--warm-state"):
             value = argv[index + 1] if index + 1 < len(argv) else None
             _store_warm_option(parsed, arg, value)
@@ -1447,6 +1451,28 @@ def fast_prompt_main(argv: Sequence[str]) -> int | None:
     except Exception as exc:  # noqa: BLE001 - same contract as arena_api.auto.main
         print(f"[arena-api] {exc}", file=sys.stderr)
         return 1
+
+
+def start_main(argv: Sequence[str]) -> int:
+    """``--warm-start``: bring the daemon up now, for a later prompt."""
+    parsed = scan_argv(list(argv))
+    if not parsed.usable:
+        print("warm daemon       : cannot start (unsupported command line)")
+        return 2
+    try:
+        state = ensure_daemon(
+            payload=_payload_for(parsed),
+            base_url=parsed.base_url,
+            state_file=parsed.state_file,
+            idle_timeout=parsed.idle_timeout,
+            start_timeout=parsed.start_timeout,
+        )
+    except WarmDaemonUnavailable as exc:
+        print(f"warm daemon       : could not start ({exc})")
+        return 1
+    print(f"warm daemon       : running (pid {state.pid}, port {state.port})")
+    print(f"state file        : {state_path(parsed.state_file)}")
+    return 0
 
 
 def stop_main(argv: Sequence[str]) -> int:

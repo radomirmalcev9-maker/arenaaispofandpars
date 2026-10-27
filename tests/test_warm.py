@@ -414,6 +414,23 @@ def test_fast_prompt_main_reports_library_errors(
     assert "session rejected" in capsys.readouterr().err
 
 
+def test_start_main_reports_an_unavailable_daemon(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _unavailable(**_: Any) -> Any:
+        raise warm.WarmDaemonUnavailable("no browser")
+
+    monkeypatch.setattr(warm, "ensure_daemon", _unavailable)
+    assert warm.start_main(["--warm-start"]) == 1
+    assert "could not start" in capsys.readouterr().out
+
+
+def test_scan_argv_drops_daemon_commands() -> None:
+    parsed = warm.scan_argv(["--warm-start", "--warm-status", "--warm-stop"])
+    assert parsed.rest == []
+    assert parsed.prompt is None
+
+
 def test_fast_prompt_main_honours_no_warm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

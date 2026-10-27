@@ -3686,6 +3686,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--warm-start",
+        action="store_true",
+        help=(
+            "start the background warm daemon now and exit, so the next "
+            "--prompt finds the browser already loaded"
+        ),
+    )
+    parser.add_argument(
         "--warm-stop",
         action="store_true",
         help="stop the background warm daemon and exit",
@@ -3758,9 +3766,15 @@ def _main(argv: Sequence[str]) -> int:
     args = build_arg_parser().parse_args(list(argv))
     args._raw_argv = list(argv)  # noqa: SLF001 - used by the warm fast path
     _latency_mark("cli.args")
-    if getattr(args, "warm_stop", False) or getattr(args, "warm_status", False):
-        from .warm import status_main, stop_main
+    if (
+        getattr(args, "warm_start", False)
+        or getattr(args, "warm_stop", False)
+        or getattr(args, "warm_status", False)
+    ):
+        from .warm import start_main, status_main, stop_main
 
+        if args.warm_start:
+            return start_main(argv)
         return stop_main(argv) if args.warm_stop else status_main(argv)
     try:
         options = _options_from_args(args)

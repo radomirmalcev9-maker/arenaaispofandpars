@@ -14,7 +14,8 @@
   с правами `0600`) и платят только за отправку промпта и подпись reCAPTCHA v3,
   а не за `discover_session` + запуск Chromium + `page.goto`. Управление:
   `--warm` / `--no-warm`, `--warm-status`, `--warm-stop`, `--warm-idle`,
-  `--warm-timeout`, `--warm-state` и переменные `ARENA_WARM`,
+  `--warm-timeout`, `--warm-state`, `--warm-start` (поднять демон заранее,
+  например из скрипта при входе) и переменные `ARENA_WARM`,
   `ARENA_WARM_IDLE`, `ARENA_WARM_TIMEOUT`, `ARENA_WARM_STATE`.
 - **Надёжность:** при любой проблеме (нет браузера, занятый профиль,
   устаревший state-файл, отклонённая сессия, чужой `--base-url`) запрос
