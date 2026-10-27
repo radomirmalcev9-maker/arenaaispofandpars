@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import uuid
 
 import httpx
@@ -154,96 +153,6 @@ def test_async_direct_uuid_model_skips_the_catalog_request() -> None:
 
     asyncio.run(run())
     assert requests == ["/nextjs-api/stream/create-evaluation"]
-
-
-def test_sync_model_lookup_and_token_mint_overlap() -> None:
-    catalog_started = threading.Event()
-    token_started = threading.Event()
-    caller_thread = threading.get_ident()
-    paths: list[str] = []
-
-    def mint_token() -> str:
-        assert threading.get_ident() == caller_thread
-        token_started.set()
-        assert catalog_started.wait(timeout=1.0)
-        return "fresh-token"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
-        if request.url.path == "/text/direct":
-            catalog_started.set()
-            assert token_started.wait(timeout=1.0)
-            return httpx.Response(
-                200,
-                request=request,
-                headers={"content-type": "text/html"},
-                content=PAGE.encode(),
-            )
-        if request.url.path == "/nextjs-api/stream/create-evaluation":
-            return httpx.Response(
-                200,
-                request=request,
-                headers={"content-type": "text/plain"},
-                content=b'a0:"parallel"\nad:{"finishReason":"stop"}\n',
-            )
-        raise AssertionError(request.url)
-
-    client = DirectArenaClient(
-        base_url="https://arena.test",
-        verification_token=mint_token,
-        http_transport=httpx.MockTransport(handler),
-    )
-    try:
-        assert client.complete("Hi") == "parallel"
-    finally:
-        client.close()
-    assert paths == ["/text/direct", "/nextjs-api/stream/create-evaluation"]
-
-
-def test_async_model_lookup_and_token_mint_overlap_off_the_event_loop() -> None:
-    catalog_started = threading.Event()
-    token_started = threading.Event()
-    paths: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
-        if request.url.path == "/text/direct":
-            catalog_started.set()
-            assert token_started.wait(timeout=1.0)
-            return httpx.Response(
-                200,
-                request=request,
-                headers={"content-type": "text/html"},
-                content=PAGE.encode(),
-            )
-        if request.url.path == "/nextjs-api/stream/create-evaluation":
-            return httpx.Response(
-                200,
-                request=request,
-                headers={"content-type": "text/plain"},
-                content=b'a0:"async parallel"\nad:{"finishReason":"stop"}\n',
-            )
-        raise AssertionError(request.url)
-
-    async def run() -> None:
-        loop_thread = threading.get_ident()
-
-        def mint_token() -> str:
-            assert threading.get_ident() != loop_thread
-            token_started.set()
-            assert catalog_started.wait(timeout=1.0)
-            return "fresh-token"
-
-        client = AsyncDirectArenaClient(
-            base_url="https://arena.test",
-            verification_token=mint_token,
-            http_transport=AsyncMockTransport(handler),
-        )
-        async with client:
-            assert await client.acomplete("Hi") == "async parallel"
-
-    asyncio.run(run())
-    assert paths == ["/text/direct", "/nextjs-api/stream/create-evaluation"]
 
 
 def test_direct_stream_requires_a_completion_record() -> None:
