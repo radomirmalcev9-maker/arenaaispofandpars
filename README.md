@@ -220,6 +220,18 @@ arena-api --version     # версия + путь к установленном�
 pip install -U -e ".[auto]"   # из клона репозитория
 ```
 
+По умолчанию шим берёт **сессию Firefox** (`--session firefox`): это профиль,
+который библиотека читает лучше всего, и его куки + TLS-отпечаток уходят в
+запросы, то есть Claude Code разговаривает с Arena как уже вошедший пользователь
+Firefox. Профиль можно указать явно, а лестницу поиска — вернуть:
+
+```bash
+arena-api --claude --session firefox:work   # конкретный профиль
+arena-api --claude --profile-root D:\Firefox\Profiles
+arena-api --claude --session auto           # обычный порядок: файл -> Firefox -> другие браузеры
+arena-api --claude --session storage        # только ./state/cookies.json
+```
+
 ```bash
 # 1. поднять шим (сессия берётся тем же zero-config путём, что и в CLI)
 arena-api --claude --port 8082
@@ -274,7 +286,14 @@ Arena отвечает обычным текстом, поэтому `tools` и�
 
 Все настройки дублируются переменными окружения: `ARENA_CLAUDE_HOST`,
 `ARENA_CLAUDE_PORT`, `ARENA_CLAUDE_ENGINE`, `ARENA_CLAUDE_MODEL`,
-`ARENA_CLAUDE_BASE_URL`, `ARENA_CLAUDE_TOOLS`, `ARENA_CLAUDE_MAX_PROMPT_CHARS`.
+`ARENA_CLAUDE_BASE_URL`, `ARENA_CLAUDE_TOOLS`, `ARENA_CLAUDE_MAX_PROMPT_CHARS`,
+`ARENA_CLAUDE_SESSION`, `ARENA_CLAUDE_PROFILE`, `ARENA_CLAUDE_PROFILE_ROOT`.
+
+Флаг `--session` есть и у самого CLI (`arena-api --session firefox --prompt ...`,
+`--status`, `--explain`): он пропускает лестницу поиска и берёт ровно указанный
+источник. Если в нём нет кук — это внятная ошибка, а не тихий откат на другой
+браузер. Тёплый демон при этом помнит сессию, с которой запущен: запрос с другим
+`--session`/`--profile` поднимет свой демон, а не переиспользует чужой.
 
 ### Ограничения, о которых надо знать
 

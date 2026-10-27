@@ -1012,3 +1012,170 @@ def test_version_reports_where_the_build_lives(
     assert "arena-api " in printed
     assert "module       :" in printed
     assert "anthropic shim: yes" in printed
+
+
+# --------------------------------------------------------------------------- #
+# Firefox by default
+# --------------------------------------------------------------------------- #
+
+
+def test_firefox_is_the_default_session() -> None:
+    assert shim.DEFAULT_SESSION == "firefox"
+    parser = shim._serve_parser()
+    parsed = parser.parse_args([])
+    assert parsed.session == "firefox"
+
+
+def test_session_argv_feeds_the_warm_daemon() -> None:
+    argv = shim._session_argv(
+        session="firefox", profile="work", profile_root="/profiles"
+    )
+    assert argv == ["--session", "firefox", "--profile", "work", "--profile-root", "/profiles"]
+    # "auto" is the absence of forcing, not a flag the daemon would reject.
+    assert shim._session_argv(session="auto") == []
+    assert shim._session_argv(session=None) == []
+
+
+def test_warm_engine_asks_for_the_firefox_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_api import warm
+
+    seen: dict[str, Any] = {}
+
+    def fake_ensure(**kwargs: Any) -> str:
+        seen.update(kwargs)
+        return "state"
+
+    monkeypatch.setattr(warm, "ensure_daemon", fake_ensure)
+    monkeypatch.setattr(
+        warm, "ask_stream", lambda prompt, *, state, model=None, **_: iter(["ok"])
+    )
+    engine = shim.ArenaEngine(engine="warm", base_url="https://example.test")
+    assert "".join(engine.answer("привет")) == "ok"
+    assert seen["payload"]["argv"] == ["--session", "firefox"]
+
+
+def test_http_engine_passes_the_session_to_the_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arena_api import auto
+
+    seen: dict[str, Any] = {}
+
+    class Client:
+        def stream(self, prompt: str, *, model: str | None = None) -> Iterator[Any]:
+            yield type("Chunk", (), {"delta": "ok"})()
+
+        def close(self) -> None:
+            return None
+
+    def fake_client(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return Client()
+
+    monkeypatch.setattr(auto, "auto_direct_client", fake_client)
+    engine = shim._HttpEngine(
+        base_url="https://example.test",
+        session="firefox",
+        profile="work",
+        profile_root="/profiles",
+    )
+    assert "".join(engine.answer("привет")) == "ok"
+    assert seen["session_source"] == "firefox"
+    assert seen["profile_name"] == "work"
+    assert seen["profiles_root"] == "/profiles"
+
+
+def test_http_engine_falls_back_when_firefox_has_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arena_api import auto
+    from arena_api.exceptions import AuthenticationError
+
+    seen: list[Any] = []
+
+    class Client:
+        def stream(self, prompt: str, *, model: str | None = None) -> Iterator[Any]:
+            yield type("Chunk", (), {"delta": "запасной"})()
+
+        def close(self) -> None:
+            return None
+
+    def fake_client(**kwargs: Any) -> Any:
+        seen.append(kwargs.get("session_source"))
+        if kwargs.get("session_source"):
+            raise AuthenticationError("Firefox profile not found")
+        return Client()
+
+    monkeypatch.setattr(auto, "auto_direct_client", fake_client)
+    notes: list[str] = []
+    engine = shim._HttpEngine(
+        base_url="https://example.test", session="firefox", log=notes.append
+    )
+    assert "".join(engine.answer("привет")) == "запасной"
+    assert seen == ["firefox", None]
+    assert any("firefox" in note for note in notes)
+
+
+def test_http_engine_does_not_swallow_errors_in_auto_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arena_api import auto
+    from arena_api.exceptions import AuthenticationError
+
+    def fake_client(**kwargs: Any) -> Any:
+        raise AuthenticationError("no session at all")
+
+    monkeypatch.setattr(auto, "auto_direct_client", fake_client)
+    engine = shim._HttpEngine(base_url="https://example.test", session="auto")
+    with pytest.raises(AuthenticationError):
+        list(engine.answer("привет"))
+
+
+def test_info_endpoint_reports_the_session(serve: Any) -> None:
+    server, _ = serve("ok")
+    server.engine.session = "firefox"
+    with urllib.request.urlopen(_url(server, "/"), timeout=10) as response:
+        payload = json.loads(response.read())
+    assert payload["session"] == "firefox"
+
+
+def test_banner_mentions_the_session(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    class FakeServer:
+        server_address = ("127.0.0.1", 1234)
+
+        class engine:
+            @staticmethod
+            def close() -> None:
+                return None
+
+        def serve_forever(self, poll_interval: float = 0.2) -> None:
+            raise KeyboardInterrupt
+
+        def shutdown(self) -> None:
+            return None
+
+        def server_close(self) -> None:
+            return None
+
+    captured: dict[str, Any] = {}
+
+    def fake_create(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return FakeServer()
+
+    monkeypatch.setattr(shim, "create_server", fake_create)
+    assert shim.main(["--claude"]) == 0
+    printed = capsys.readouterr().out
+    assert "session                  : firefox" in printed
+    assert captured["session"] == "firefox"
+
+
+def test_session_env_variable_is_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARENA_CLAUDE_SESSION", "storage")
+    assert shim._serve_parser().parse_args([]).session == "storage"
+
+
+def test_auto_source_helper() -> None:
+    assert shim._is_auto_source(None) is True
+    assert shim._is_auto_source("auto") is True
+    assert shim._is_auto_source("firefox") is False

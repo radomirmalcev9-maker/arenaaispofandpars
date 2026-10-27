@@ -350,6 +350,15 @@ class AutoOptions:
     profile_name: str | None = None
     cookie_database: str | Path | None = None
 
+    #: Force one discovery source instead of the ladder. ``"firefox"`` reads the
+    #: Firefox profile (``"firefox:work"`` pins a profile, ``"firefox:/path"`` a
+    #: profile root), ``"storage"`` the stored ``cookies.json``, ``"chrome"`` a
+    #: Chrome-family profile through ``rookiepy``. ``None``/``"auto"`` keeps the
+    #: default order (explicit cookies, environment, stored file, Firefox,
+    #: other browsers). Forcing a source that yields nothing is an error, not a
+    #: silent fallback: the caller asked for *that* session.
+    session_source: str | None = None
+
     #: Ask for Enter when the session must be refreshed by hand.
     interactive: bool = True
     prompt: Callable[[str], str] = input
@@ -663,6 +672,91 @@ def _flat_records(records: Any) -> dict[str, str]:
         return {}
 
 
+def _forced_source(
+    options: AutoOptions,
+) -> tuple[Callable[[AutoOptions], DiscoveredSession | None], AutoOptions] | None:
+    """Resolve ``session_source`` into a candidate and its options.
+
+    ``"firefox"`` / ``"firefox:<profile>"`` / ``"firefox:<profile-root>"``,
+    ``"storage"``, ``"chrome"``/``"edge"``/``"brave"``/``"chromium"`` (through
+    ``rookiepy``) and ``"auto"`` (no forcing) are understood.  ``None`` is
+    returned when nothing should be forced.
+    """
+    raw = options.session_source
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value or value.lower() in {"auto", "any", "default"}:
+        return None
+    kind, _, argument = value.partition(":")
+    kind = kind.strip().lower()
+    argument = argument.strip()
+    if kind in {"firefox", "ff"}:
+        forced = options
+        if argument:
+            # A directory is a profile root, anything else a profile name.
+            if Path(argument).expanduser().is_dir():
+                forced = replace(
+                    options,
+                    profiles_root=argument,
+                    profile_name=options.profile_name,
+                )
+            else:
+                forced = replace(options, profile_name=argument)
+        return _from_firefox, forced
+    if kind in {"storage", "file", "cookies"}:
+        forced = options
+        if argument:
+            forced = replace(options, storage_path=argument)
+        elif options.storage_path is None:
+            forced = replace(options, storage_path="state/cookies.json")
+        return _from_storage, forced
+    if kind in {"browser", "rookiepy"} or kind in _OTHER_BROWSER_HINTS:
+        name = argument or kind
+        forced = replace(options, use_browser_profiles=True)
+        return _from_named_browser(name), forced
+    raise AuthenticationError(
+        f"unknown session source {raw!r}; use firefox, firefox:<profile>, "
+        "storage, chrome (or another browser name) or auto"
+    )
+
+
+#: Browser keys ``rookiepy`` exposes that also work as a bare source name.
+_OTHER_BROWSER_HINTS = frozenset(
+    {"chrome", "edge", "brave", "chromium", "opera", "vivaldi", "safari"}
+)
+
+
+def _from_named_browser(name: str) -> Callable[[AutoOptions], DiscoveredSession | None]:
+    """A discovery candidate restricted to one ``rookiepy`` browser."""
+
+    def discover(options: AutoOptions) -> DiscoveredSession | None:
+        rookiepy = _rookiepy_module()
+        if rookiepy is None:
+            raise AuthenticationError(
+                f"reading the {name} profile needs rookiepy "
+                "(pip install 'arena-api[firefox]')"
+            )
+        read = getattr(rookiepy, name, None)
+        if not callable(read):
+            raise AuthenticationError(f"rookiepy cannot read {name} cookies")
+        try:
+            records = read(domains=_domains_for(options))
+        except Exception as exc:  # noqa: BLE001 - browser-specific failures
+            raise AuthenticationError(f"{name} cookies could not be read: {exc}") from exc
+        cookies = _flat_records(records)
+        if not cookies:
+            return None
+        return DiscoveredSession(
+            source=f"browser:{name}",
+            cookies=cookies,
+            headers={},
+            description=f"{name} profile via rookiepy ({len(cookies)} names)",
+        )
+
+    return discover
+
+
 def discover_session(options: AutoOptions | None = None) -> DiscoveredSession | None:
     """Return the first usable session, or ``None`` when there is none.
 
@@ -673,6 +767,16 @@ def discover_session(options: AutoOptions | None = None) -> DiscoveredSession | 
     precedence over an anonymous guest capture that holds no auth cookie.
     """
     options = options or AutoOptions()
+    forced = _forced_source(options)
+    if forced is not None:
+        candidate, forced_options = forced
+        found = candidate(forced_options)
+        if found is None:
+            raise AuthenticationError(
+                f"session source {options.session_source!r} has no cookies.\n  "
+                + "\n  ".join(explain_sources(forced_options))
+            )
+        return found
     for explicit in (_from_explicit_cookies, _from_environment):
         found = explicit(options)
         if found is not None:
@@ -709,15 +813,31 @@ def _report_line(label: str, value: str) -> str:
 def explain_sources(options: AutoOptions | None = None) -> list[str]:
     """Describe every source considered, for ``--explain`` and error messages."""
     options = options or AutoOptions()
-    report: list[str] = [
-        _report_line("cookies=", "set" if options.cookies is not None else "not given"),
-        _report_line(
-            "ARENA_COOKIE(S_FILE)",
-            "set"
-            if os.environ.get("ARENA_COOKIE") or os.environ.get("ARENA_COOKIES_FILE")
-            else "not set",
-        ),
-    ]
+    report: list[str] = []
+    if options.session_source and options.session_source.strip().lower() not in {
+        "auto",
+        "any",
+        "default",
+    }:
+        report.append(
+            _report_line(
+                "session source", f"{options.session_source} (forced, ladder skipped)"
+            )
+        )
+    report.extend(
+        [
+            _report_line(
+                "cookies=", "set" if options.cookies is not None else "not given"
+            ),
+            _report_line(
+                "ARENA_COOKIE(S_FILE)",
+                "set"
+                if os.environ.get("ARENA_COOKIE")
+                or os.environ.get("ARENA_COOKIES_FILE")
+                else "not set",
+            ),
+        ]
+    )
     path = _default_storage_path(options)
     if path is None:
         report.append(_report_line("stored cookies.json", "not configured"))
@@ -733,7 +853,7 @@ def explain_sources(options: AutoOptions | None = None) -> list[str]:
             if stored is not None and not has_session_cookie(stored.cookies):
                 note = "(exists, guest/anonymous -- skipped for signed-in profile)"
         report.append(_report_line("stored cookies.json", f"{path} {note}"))
-    if not options.use_browser_profiles:
+    if not options.use_browser_profiles and options.session_source is None:
         report.append(
             _report_line(
                 "browser profiles", "disabled by use_browser_profiles=False"
@@ -3774,6 +3894,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--session",
+        default=None,
+        metavar="SOURCE",
+        help=(
+            "force one session source instead of the discovery ladder: "
+            "firefox (default browser source anyway), firefox:<profile>, "
+            "firefox:<profile-root>, storage, chrome/edge/... or auto"
+        ),
+    )
+    parser.add_argument(
         "--profile-root",
         default=None,
         metavar="DIR",
@@ -3909,6 +4039,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         hide_automation=args.hide_automation,
         impersonate=args.impersonate,
         proxy=args.proxy,
+        session_source=getattr(args, "session", None),
         profiles_root=args.profile_root,
         profile_name=args.profile,
         show_browser=bool(getattr(args, "show_browser", False)),
