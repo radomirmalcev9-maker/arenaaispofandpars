@@ -100,6 +100,61 @@ def test_sync_direct_stream_uses_supplied_token_and_isolates_chat_id() -> None:
         client.close()
 
 
+def test_sync_direct_uuid_model_skips_the_catalog_request() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path != "/nextjs-api/stream/create-evaluation":
+            raise AssertionError(f"unexpected catalog/setup request: {request.url}")
+        payload = json.loads(request.content)
+        assert payload["modelAId"] == MODEL_ID
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/plain"},
+            content=b'a0:"fast"\nad:{"finishReason":"stop"}\n',
+        )
+
+    client = DirectArenaClient(
+        base_url="https://arena.test",
+        verification_token="caller-supplied-token",
+        http_transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert client.complete("Hi", model=MODEL_ID) == "fast"
+    finally:
+        client.close()
+    assert requests == ["/nextjs-api/stream/create-evaluation"]
+
+
+def test_async_direct_uuid_model_skips_the_catalog_request() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path != "/nextjs-api/stream/create-evaluation":
+            raise AssertionError(f"unexpected catalog/setup request: {request.url}")
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/plain"},
+            content=b'a0:"async fast"\nad:{"finishReason":"stop"}\n',
+        )
+
+    async def run() -> None:
+        client = AsyncDirectArenaClient(
+            base_url="https://arena.test",
+            verification_token="caller-supplied-token",
+            http_transport=AsyncMockTransport(handler),
+        )
+        async with client:
+            assert await client.acomplete("Hi", model=MODEL_ID) == "async fast"
+
+    asyncio.run(run())
+    assert requests == ["/nextjs-api/stream/create-evaluation"]
+
+
 def test_direct_stream_requires_a_completion_record() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/text/direct":

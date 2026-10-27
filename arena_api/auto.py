@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import concurrent.futures
 import io
 import json
 import os
@@ -1652,6 +1653,9 @@ class _WarmBrowserState:
     user_data_dir: str | Path | None
     loop: asyncio.AbstractEventLoop
     has_active_conversation: bool = False
+    direct_page_ready: bool = False
+    legacy_stream_callbacks_installed: bool = False
+    stream_queue: asyncio.Queue[tuple[str, Any]] | None = None
     seeded_cookies: dict[str, str] = field(default_factory=dict)
 
 
@@ -1747,6 +1751,8 @@ class DirectVerificationToken:
         self._bg_lock = threading.RLock()
         self._bg_loop: asyncio.AbstractEventLoop | None = None
         self._bg_thread: threading.Thread | None = None
+        self._prewarm_future: Any | None = None
+        self._prewarm_loop: asyncio.AbstractEventLoop | None = None
         base = solver or resolve_solver(self.options) or RecaptchaToolkitSolver(
             backend=self.options.captcha_backend
         )
@@ -1838,6 +1844,138 @@ class DirectVerificationToken:
             self._bg_loop = created[0]
             self._bg_thread = thread
             return self._bg_loop
+
+    def _prewarm_browser_mode(self) -> tuple[bool, bool, str | Path | None]:
+        """Return the same first-try browser mode used by a real stream."""
+        is_live_browser = BrowserEnvironment is _DEFAULT_BROWSER_ENVIRONMENT
+        profile_dir = (
+            _direct_browser_profile_dir(self.options) if is_live_browser else None
+        )
+        if is_live_browser:
+            return False, not bool(self.options.show_browser), profile_dir
+        return True, False, profile_dir
+
+    async def _prepare_warm_browser(self) -> _WarmBrowserState:
+        headless, hide_window, profile_dir = self._prewarm_browser_mode()
+        current = self._warm_state
+        running_loop = asyncio.get_running_loop()
+        if (
+            current is not None
+            and current.loop is running_loop
+            and current.headless == headless
+            and current.hide_window == hide_window
+            and _is_page_usable(current.page)
+        ):
+            return current
+        if current is not None:
+            await self._close_warm_state_async()
+        state = await self._create_browser_state(
+            headless=headless,
+            hide_window=hide_window,
+            user_data_dir=profile_dir,
+        )
+        self._warm_state = state
+        try:
+            raw_cookies = self._current_cookies()
+            seed_cookies = _seedable_browser_cookies(
+                raw_cookies, cookie_source=self.cookie_source
+            )
+            await _seed_direct_context_cookies(
+                getattr(state.page, "context", None),
+                seed_cookies,
+                self.options.base_url,
+            )
+            state.seeded_cookies = dict(seed_cookies)
+            await state.page.goto(self.page_url, wait_until="domcontentloaded")
+            state.direct_page_ready = True
+        except Exception:  # noqa: BLE001
+            # Navigation is retried by the real request, which has the normal
+            # challenge handling and headed-browser fallback.  A failed warm-up
+            # must not turn into a second hard failure before that logic runs.
+            state.direct_page_ready = False
+        return state
+
+    def prewarm(self) -> None:
+        """Start the verification browser in the background.
+
+        The next browser-backed stream awaits this same future instead of
+        launching a second browser.  This is most useful just before a session
+        probe or model-catalog request, which then overlaps Chromium startup.
+        """
+        if not self._should_keep_browser_alive():
+            return
+        self._check_stream_browser_ready()
+        loop = self._ensure_bg_loop()
+        with self._bg_lock:
+            if self._warm_state is not None and _is_page_usable(
+                self._warm_state.page
+            ):
+                return
+            pending = self._prewarm_future
+            if (
+                pending is not None
+                and self._prewarm_loop is loop
+                and not pending.done()
+            ):
+                return
+            self._prewarm_loop = loop
+            self._prewarm_future = asyncio.run_coroutine_threadsafe(
+                self._prepare_warm_browser(), loop
+            )
+
+    async def aprewarm(self) -> None:
+        """Async counterpart of :meth:`prewarm`; schedules and returns."""
+        if not self._should_keep_browser_alive():
+            return
+        self._check_stream_browser_ready()
+        loop = asyncio.get_running_loop()
+        with self._bg_lock:
+            if self._warm_state is not None and _is_page_usable(
+                self._warm_state.page
+            ):
+                return
+            pending = self._prewarm_future
+            if (
+                pending is not None
+                and self._prewarm_loop is loop
+                and not pending.done()
+            ):
+                return
+            task = loop.create_task(self._prepare_warm_browser())
+            # Retrieving the exception here only suppresses "never retrieved"
+            # warnings if a caller closes without streaming.  Awaiters still
+            # receive the original exception from the task itself.
+            task.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
+            self._prewarm_loop = loop
+            self._prewarm_future = task
+
+    async def _await_prewarm(self, loop: asyncio.AbstractEventLoop) -> None:
+        with self._bg_lock:
+            future = self._prewarm_future
+            if self._prewarm_loop is not loop:
+                future = None
+        if future is None:
+            return
+        try:
+            if isinstance(future, concurrent.futures.Future):
+                await asyncio.wrap_future(future)
+            else:
+                await future
+        finally:
+            with self._bg_lock:
+                if self._prewarm_future is future:
+                    self._prewarm_future = None
+                    self._prewarm_loop = None
+
+    def _cancel_prewarm(self) -> None:
+        with self._bg_lock:
+            future = self._prewarm_future
+            self._prewarm_future = None
+            self._prewarm_loop = None
+        if future is not None and not future.done():
+            future.cancel()
 
     def _check_solver_ready(self) -> None:
         self._require_a_token_solver()
@@ -2083,6 +2221,84 @@ class DirectVerificationToken:
             ) from last_missing_exc
         return environment, selected_channel
 
+    async def _create_browser_state(
+        self,
+        *,
+        headless: bool,
+        hide_window: bool,
+        user_data_dir: str | Path | None,
+    ) -> _WarmBrowserState:
+        """Launch and instrument a page without navigating or submitting yet.
+
+        Keeping this separate from the request state machine lets ``prewarm``
+        pay the browser-start cost while session verification or model lookup
+        is running elsewhere.
+        """
+        resolved_proxy = self._resolve_proxy()
+        cloaked_headful = (not headless) and bool(hide_window)
+        running_loop = asyncio.get_running_loop()
+        if user_data_dir is not None and not headless:
+            _prepare_profile_window_placement(user_data_dir, hidden=cloaked_headful)
+        win_cloaker = _WindowsBrowserCloaker(enabled=cloaked_headful)
+        win_cloaker.start()
+        try:
+            environment, selected_channel = (
+                await self._launch_verification_environment(
+                    headless=headless,
+                    cloaked_headful=cloaked_headful,
+                    resolved_proxy=resolved_proxy,
+                    user_data_dir=user_data_dir,
+                )
+            )
+        except BaseException:
+            win_cloaker.stop()
+            raise
+
+        ua_cdp_session: Any = None
+        cdp_pump: _CdpEvalStreamPump | None = None
+        try:
+            handler = getattr(environment, "challenge_handler", None)
+            if handler is not None:
+                handler.solve_on_detection = False
+            page = await environment.new_page()
+            context = getattr(page, "context", None)
+            if headless:
+                ua_cdp_session = await _sanitize_headless_page_cdp(
+                    context, page, channel=selected_channel
+                )
+            elif cloaked_headful:
+                await _hide_headed_page_window_cdp(context, page)
+                await _maybe_reset_headless_poisoned_cookies(context, user_data_dir)
+            cdp_pump = await _CdpEvalStreamPump.attach(
+                context, page, existing_cdp=ua_cdp_session
+            )
+        except BaseException:
+            win_cloaker.stop()
+            if cdp_pump is not None:
+                await cdp_pump.aclose()
+            if ua_cdp_session is not None:
+                detach_fn = getattr(ua_cdp_session, "detach", None)
+                if callable(detach_fn):
+                    try:
+                        await detach_fn()
+                    except Exception:  # noqa: BLE001
+                        pass
+            await environment.__aexit__(None, None, None)
+            raise
+
+        return _WarmBrowserState(
+            environment=environment,
+            page=page,
+            win_cloaker=win_cloaker,
+            ua_cdp_session=ua_cdp_session,
+            cdp_pump=cdp_pump,
+            selected_channel=selected_channel,
+            headless=headless,
+            hide_window=hide_window,
+            user_data_dir=user_data_dir,
+            loop=running_loop,
+        )
+
     @asynccontextmanager
     async def _attempt_browser_evaluation(
         self,
@@ -2100,10 +2316,11 @@ class DirectVerificationToken:
         hide_window: bool = False,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
         resolved_proxy = self._resolve_proxy()
-        cloaked_headful = (not headless) and bool(hide_window)
         window_visible = (not headless) and (not hide_window)
         keep_alive = self._should_keep_browser_alive()
         running_loop = asyncio.get_running_loop()
+        if keep_alive:
+            await self._await_prewarm(running_loop)
 
         state: _WarmBrowserState | None = None
         reused_warm_page = False
@@ -2121,70 +2338,10 @@ class DirectVerificationToken:
                 await self._close_warm_state_async()
 
         if state is None:
-            if user_data_dir is not None and not headless:
-                _prepare_profile_window_placement(
-                    user_data_dir, hidden=cloaked_headful
-                )
-            win_cloaker = _WindowsBrowserCloaker(enabled=cloaked_headful)
-            win_cloaker.start()
-            try:
-                environment, selected_channel = (
-                    await self._launch_verification_environment(
-                        headless=headless,
-                        cloaked_headful=cloaked_headful,
-                        resolved_proxy=resolved_proxy,
-                        user_data_dir=user_data_dir,
-                    )
-                )
-            except BaseException:
-                win_cloaker.stop()
-                raise
-
-            ua_cdp_session: Any = None
-            cdp_pump: _CdpEvalStreamPump | None = None
-            try:
-                handler = getattr(environment, "challenge_handler", None)
-                if handler is not None:
-                    handler.solve_on_detection = False
-                page = await environment.new_page()
-                context = getattr(page, "context", None)
-                if headless:
-                    ua_cdp_session = await _sanitize_headless_page_cdp(
-                        context, page, channel=selected_channel
-                    )
-                elif cloaked_headful:
-                    await _hide_headed_page_window_cdp(context, page)
-                    await _maybe_reset_headless_poisoned_cookies(
-                        context, user_data_dir
-                    )
-                cdp_pump = await _CdpEvalStreamPump.attach(
-                    context, page, existing_cdp=ua_cdp_session
-                )
-            except BaseException:
-                win_cloaker.stop()
-                if cdp_pump is not None:
-                    await cdp_pump.aclose()
-                if ua_cdp_session is not None:
-                    detach_fn = getattr(ua_cdp_session, "detach", None)
-                    if callable(detach_fn):
-                        try:
-                            await detach_fn()
-                        except Exception:  # noqa: BLE001
-                            pass
-                await environment.__aexit__(None, None, None)
-                raise
-
-            state = _WarmBrowserState(
-                environment=environment,
-                page=page,
-                win_cloaker=win_cloaker,
-                ua_cdp_session=ua_cdp_session,
-                cdp_pump=cdp_pump,
-                selected_channel=selected_channel,
+            state = await self._create_browser_state(
                 headless=headless,
                 hide_window=hide_window,
                 user_data_dir=user_data_dir,
-                loop=running_loop,
             )
             if keep_alive:
                 self._warm_state = state
@@ -2205,8 +2362,12 @@ class DirectVerificationToken:
                     context, seed_cookies, self.options.base_url
                 )
                 state.seeded_cookies = dict(seed_cookies)
+                # Cookies installed after a prewarmed navigation need a reload
+                # before the application can observe them.
+                state.direct_page_ready = False
 
             async_q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            state.stream_queue = async_q
             if cdp_pump is not None:
                 cdp_pump.bind_queue(async_q)
             on_fn = getattr(page, "on", None)
@@ -2312,33 +2473,40 @@ class DirectVerificationToken:
                 ):
                     on_fn(ev_name, cb)
                     registered_listeners.append((ev_name, cb))
-            elif not reused_warm_page:
+            elif not state.legacy_stream_callbacks_installed:
                 expose_fn = getattr(page, "expose_function", None)
                 if callable(expose_fn):
+                    def _legacy_put(kind: str, value: Any) -> None:
+                        # Exposed functions survive on a warm page.  Resolve the
+                        # queue at call time so later requests never write into
+                        # the completed first request's queue.
+                        current_q = state.stream_queue
+                        if current_q is not None:
+                            current_q.put_nowait((kind, value))
+
                     await expose_fn(
                         "__arenaDirectMeta",
-                        lambda ct: async_q.put_nowait(("meta", str(ct or ""))),
+                        lambda ct: _legacy_put("meta", str(ct or "")),
                     )
                     await expose_fn(
                         "__arenaDirectChunk",
-                        lambda piece: async_q.put_nowait(
-                            ("chunk", str(piece).encode("utf-8"))
+                        lambda piece: _legacy_put(
+                            "chunk", str(piece).encode("utf-8")
                         ),
                     )
                     await expose_fn(
                         "__arenaDirectEof",
-                        lambda: async_q.put_nowait(("eof", None)),
+                        lambda: _legacy_put("eof", None),
                     )
                     await expose_fn(
                         "__arenaDirectHttpError",
-                        lambda info: async_q.put_nowait(("http_error", info)),
+                        lambda info: _legacy_put("http_error", info),
                     )
                     await expose_fn(
                         "__arenaDirectStreamError",
-                        lambda err: async_q.put_nowait(
-                            ("stream_error", str(err or ""))
-                        ),
+                        lambda err: _legacy_put("stream_error", str(err or "")),
                     )
+                    state.legacy_stream_callbacks_installed = True
 
             wait_for_timeout = getattr(page, "wait_for_timeout", None)
             used_composer = False
@@ -2364,7 +2532,9 @@ class DirectVerificationToken:
 
             if not used_composer:
                 state.has_active_conversation = False
-                await page.goto(self.page_url, wait_until="domcontentloaded")
+                if not state.direct_page_ready:
+                    await page.goto(self.page_url, wait_until="domcontentloaded")
+                    state.direct_page_ready = True
                 skip_full_html_check = False
                 title_fn = getattr(page, "title", None)
                 if callable(title_fn):
@@ -2424,6 +2594,9 @@ class DirectVerificationToken:
                     except Exception:  # noqa: BLE001
                         pass
 
+                # From this point the fresh page is consumed by a submission or
+                # a direct fetch; the next independent prompt must navigate anew.
+                state.direct_page_ready = False
                 await _gentle_page_warmup(page)
 
                 if prompt is not None and not follow_up:
@@ -2761,6 +2934,8 @@ class DirectVerificationToken:
                 discard_state = True
             raise
         finally:
+            if state.stream_queue is async_q:
+                state.stream_queue = None
             if cdp_pump is not None:
                 cdp_pump.bind_queue(None)
             remove_fn = (
@@ -2996,6 +3171,7 @@ class DirectVerificationToken:
                 worker.join(timeout=5.0)
 
     def _shutdown_bg_loop(self) -> None:
+        self._cancel_prewarm()
         with self._bg_lock:
             loop = self._bg_loop
             thread = self._bg_thread
@@ -3030,6 +3206,7 @@ class DirectVerificationToken:
                     pass
 
     async def aclose(self) -> None:
+        self._cancel_prewarm()
         self._refreshed_cookies = None
         state = self._warm_state
         if state is not None:
@@ -3080,6 +3257,7 @@ def auto_direct_client(
     options: AutoOptions | None = None,
     *,
     verification_token: Any = None,
+    prewarm: bool = False,
     **overrides: Any,
 ) -> DirectArenaClient:
     """Return a :class:`~arena_api.DirectArenaClient` for your own session.
@@ -3087,7 +3265,8 @@ def auto_direct_client(
     ``verification_token`` accepts everything
     :class:`~arena_api.direct.DirectArenaClient` accepts, plus the string
     ``"auto"``: a :class:`DirectVerificationToken` is then built to intercept a
-    v3 assertion with the captcha solver.
+    v3 assertion with the captcha solver.  ``prewarm=True`` starts that browser
+    immediately, overlapping startup with the session verification probe.
     """
     options = _merge_options(options, overrides)
     prepared = _prepare(options)
@@ -3101,28 +3280,34 @@ def auto_direct_client(
             session_manager=manager,
             cookie_source=_cookie_source_for_manager(manager),
         )
-    return _verified(
-        DirectArenaClient(
-            base_url=options.base_url,
-            session_source=manager,
-            headers=options.headers,
-            timeout=options.timeout,
-            http2=options.http2,
-            verify=options.verify_tls,
-            proxy=options.proxy,
-            verification_token=verification_token,
-            http_transport=options.http_transport,
-            max_auth_refreshes=options.max_auth_refreshes,
-        ),
-        manager,
-        options,
+    client = DirectArenaClient(
+        base_url=options.base_url,
+        session_source=manager,
+        headers=options.headers,
+        timeout=options.timeout,
+        http2=options.http2,
+        verify=options.verify_tls,
+        proxy=options.proxy,
+        verification_token=verification_token,
+        http_transport=options.http_transport,
+        max_auth_refreshes=options.max_auth_refreshes,
     )
+    if prewarm:
+        start_prewarm = getattr(verification_token, "prewarm", None)
+        if callable(start_prewarm):
+            try:
+                start_prewarm()
+            except BaseException:
+                client.close()
+                raise
+    return _verified(client, manager, options)
 
 
 async def auto_async_direct_client(
     options: AutoOptions | None = None,
     *,
     verification_token: Any = None,
+    prewarm: bool = False,
     **overrides: Any,
 ) -> AsyncDirectArenaClient:
     """Async twin of :func:`auto_direct_client`."""
@@ -3138,22 +3323,27 @@ async def auto_async_direct_client(
             session_manager=manager,
             cookie_source=_cookie_source_for_manager(manager),
         )
-    return await _averified(
-        AsyncDirectArenaClient(
-            base_url=options.base_url,
-            session_source=manager,
-            headers=options.headers,
-            timeout=options.timeout,
-            http2=options.http2,
-            verify=options.verify_tls,
-            proxy=options.proxy,
-            verification_token=verification_token,
-            http_transport=options.http_transport,
-            max_auth_refreshes=options.max_auth_refreshes,
-        ),
-        manager,
-        options,
+    client = AsyncDirectArenaClient(
+        base_url=options.base_url,
+        session_source=manager,
+        headers=options.headers,
+        timeout=options.timeout,
+        http2=options.http2,
+        verify=options.verify_tls,
+        proxy=options.proxy,
+        verification_token=verification_token,
+        http_transport=options.http_transport,
+        max_auth_refreshes=options.max_auth_refreshes,
     )
+    if prewarm:
+        start_prewarm = getattr(verification_token, "aprewarm", None)
+        if callable(start_prewarm):
+            try:
+                await start_prewarm()
+            except BaseException:
+                await client.aclose()
+                raise
+    return await _averified(client, manager, options)
 
 
 # --------------------------------------------------------------------------- #
@@ -3627,8 +3817,6 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
         and auto_client is _DEFAULT_AUTO_CLIENT
         and probe is _DEFAULT_PROBE
         and options.http_transport is None
-        and args.verification_token is None
-        and not os.environ.get("ARENA_VERIFICATION_TOKEN")
         and _is_known_direct_chat_host(options.base_url)
     ):
         requested_model = args.model
@@ -3637,11 +3825,17 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
             and requested_model.strip().lower() == "auto"
         ):
             requested_model = None
+        resolved_vtoken = (
+            args.verification_token
+            or os.environ.get("ARENA_VERIFICATION_TOKEN")
+            or "auto"
+        )
         with auto_direct_client(
-            replace(options, verify=False), verification_token="auto"
+            replace(options, verify=False),
+            verification_token=resolved_vtoken,
+            prewarm=True,
         ) as direct:
             if requested_model is not None:
-                direct._resolve_model(requested_model, direct.get_models())
                 print(f"model             : {requested_model}")
             _stream_to_stdout(
                 direct.stream(args.prompt, model=requested_model)

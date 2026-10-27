@@ -42,6 +42,7 @@ from .transport import (
 VerificationToken = str | Callable[[], str]
 
 _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+_UUID_RE = re.compile(rf"^{_UUID}$")
 _FIELD_QUOTE = r"(?:\\+)?\""
 _ID_FIELD_RE = re.compile(
     rf"{_FIELD_QUOTE}(?:id|modelId|model_id){_FIELD_QUOTE}\s*:\s*"
@@ -648,6 +649,18 @@ class _DirectMixin:
 
     @staticmethod
     def _resolve_model(model: str | None, known: list[ModelInfo]) -> str:
+        if model is not None and _UUID_RE.fullmatch(model):
+            # A UUID is already the wire identifier.  Do not make callers fetch
+            # and parse the whole Direct Chat page just to prove that it is one.
+            # When a catalog is already cached, retain the availability check.
+            for item in known:
+                if model == item.id:
+                    if not item.available:
+                        raise ModelUnavailableError(
+                            f"Model {model!r} is currently unavailable."
+                        )
+                    return item.id
+            return model
         if model is None:
             available_all = [item for item in known if item.available]
             if not available_all:
@@ -818,11 +831,14 @@ class DirectArenaClient(_DirectMixin):
             verification_token,
             custom_http_transport=self.transport._custom_http_transport,
         )
-        explicit_model_id: str | None = (
-            self._resolve_model(model, self.get_models())
-            if model is not None
-            else None
-        )
+        explicit_model_id: str | None = None
+        if model is not None:
+            # Supplying the UUID itself is the zero-request fast path.  Names
+            # still need the catalog for their public-name -> UUID mapping.
+            if _UUID_RE.fullmatch(model):
+                explicit_model_id = self._resolve_model(model, self._models or [])
+            else:
+                explicit_model_id = self._resolve_model(model, self.get_models())
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
@@ -1130,11 +1146,14 @@ class AsyncDirectArenaClient(_DirectMixin):
             verification_token,
             custom_http_transport=self.transport._custom_http_transport,
         )
-        explicit_model_id: str | None = (
-            self._resolve_model(model, await self.get_models())
-            if model is not None
-            else None
-        )
+        explicit_model_id: str | None = None
+        if model is not None:
+            if _UUID_RE.fullmatch(model):
+                explicit_model_id = self._resolve_model(model, self._models or [])
+            else:
+                explicit_model_id = self._resolve_model(
+                    model, await self.get_models()
+                )
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
