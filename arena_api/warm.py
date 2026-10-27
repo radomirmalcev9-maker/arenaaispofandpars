@@ -474,18 +474,7 @@ def error_from_frame(message: Mapping[str, Any]) -> BaseException:
         "model": ModelUnavailableError,
         "usage": WarmDaemonUnavailable,
     }
-    error_type = mapping.get(kind, ArenaError)
-    if error_type is RateLimitError:
-        # Keep the server's own back-off hint across the socket, so a caller
-        # (or the benchmark) can honour exactly the same wait.
-        retry_after = message.get("retry_after")
-        wait = (
-            float(retry_after)
-            if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
-            else None
-        )
-        return RateLimitError(detail, retry_after=wait)
-    return error_type(detail)
+    return mapping.get(kind, ArenaError)(detail)
 
 
 def error_kind(exc: BaseException) -> str:
@@ -1112,12 +1101,11 @@ class _WarmServer:
         except BaseException as exc:  # noqa: BLE001 - reported to the caller
             detail = str(exc) or type(exc).__name__
             kind = error_kind(exc)
-            frame: dict[str, Any] = {"type": "error", "kind": kind, "message": detail}
-            wait = getattr(exc, "retry_after", None)
-            if isinstance(wait, (int, float)) and not isinstance(wait, bool):
-                frame["retry_after"] = float(wait)
             with contextlib.suppress(Exception):
-                await self._write(writer, frame)
+                await self._write(
+                    writer,
+                    {"type": "error", "kind": kind, "message": detail},
+                )
             if kind == "auth" and not self._answered:
                 # Nothing ever worked with this session: do not linger for the
                 # whole idle timeout with a browser nobody can use.  The caller

@@ -183,17 +183,6 @@ def test_error_frames_map_to_library_exceptions(tmp_path: Path) -> None:
             list(warm.ask_stream("hi", state=thread.published))
 
 
-def test_rate_limit_hint_survives_the_socket(tmp_path: Path) -> None:
-    from arena_api.exceptions import RateLimitError
-
-    session = FakeSession(error=RateLimitError("slow down", retry_after=42.0))
-    with ServerThread(session, tmp_path / "state.json") as thread:
-        with pytest.raises(RateLimitError) as raised:
-            list(warm.ask_stream("hi", state=thread.published))
-    assert raised.value.retry_after == 42.0
-    assert "slow down" in str(raised.value)
-
-
 def test_protocol_errors_are_preserved(tmp_path: Path) -> None:
     session = FakeSession(error=ProtocolError("bad stream"))
     with ServerThread(session, tmp_path / "state.json") as thread:
