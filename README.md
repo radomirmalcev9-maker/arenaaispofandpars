@@ -73,12 +73,21 @@ python -m arena_api --show-browser --prompt "Тест с видимым окно
 import sys
 from arena_api import AutoOptions, auto_direct_client
 
-with auto_direct_client(AutoOptions(), verification_token="auto") as client:
-    for event in client.stream("Привет! Напиши 3 коротких совета по Python."):
-        if event.kind == "text" and event.text:
-            sys.stdout.write(event.text)
+with auto_direct_client(
+    AutoOptions(), verification_token="auto", prewarm=True
+) as client:
+    for chunk in client.stream("Привет! Напиши 3 коротких совета по Python."):
+        if chunk.delta:
+            sys.stdout.write(chunk.delta)
             sys.stdout.flush()
 ```
+
+`prewarm=True` заранее запускает браузер, устанавливает cookie и загружает
+Direct Chat-страницу параллельно с проверкой сессии. В быстром CLI-пути этот
+прогрев включён автоматически. Если в `--model` / `model=` передан готовый UUID
+модели, клиент отправляет его сразу, без дополнительного GET-запроса за
+каталогом моделей; разрешение человекочитаемого имени по-прежнему использует
+каталог.
 
 ### Асинхронный Direct Chat
 
@@ -88,7 +97,7 @@ from arena_api import AutoOptions, auto_async_direct_client
 
 async def main() -> None:
     async with await auto_async_direct_client(
-        AutoOptions(), verification_token="auto"
+        AutoOptions(), verification_token="auto", prewarm=True
     ) as client:
         answer = await client.acomplete("Коротко сравни SQLite и PostgreSQL.")
         print(answer)

@@ -67,7 +67,7 @@ from arena_api.auto import (
 )
 from arena_api.constants import CONFIG_PATH, DEFAULT_BASE_URL, DIRECT_PAGE_PATH
 from arena_api.exceptions import AuthenticationError
-from arena_api.models import ModelInfo
+from arena_api.models import GenerationConfig, ModelInfo
 
 import arena_api.auto as auto_module
 
@@ -1450,6 +1450,57 @@ def test_verification_token_auto_selects_the_factory(tmp_path) -> None:
     client = auto_direct_client(options, verification_token="auto")
     assert isinstance(client.verification_token, DirectVerificationToken)
     client.close()
+
+
+def test_auto_direct_prewarm_starts_before_the_verification_probe(
+    tmp_path, monkeypatch
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        DirectVerificationToken,
+        "prewarm",
+        lambda self: events.append("prewarm"),
+    )
+
+    def fake_probe(client, path=CONFIG_PATH):
+        events.append("probe")
+        return ProbeResult(True, "session accepted")
+
+    monkeypatch.setattr(auto_module, "probe", fake_probe)
+    options = isolated_options(tmp_path, cookies="session=abc")
+    client = auto_direct_client(
+        options, verification_token="auto", prewarm=True
+    )
+    try:
+        assert events == ["prewarm", "probe"]
+    finally:
+        client.close()
+
+
+def test_async_auto_direct_prewarm_starts_before_the_verification_probe(
+    tmp_path, monkeypatch
+) -> None:
+    events: list[str] = []
+
+    async def fake_prewarm(self) -> None:
+        events.append("prewarm")
+
+    async def fake_probe(client, path=CONFIG_PATH):
+        events.append("probe")
+        return ProbeResult(True, "session accepted")
+
+    monkeypatch.setattr(DirectVerificationToken, "aprewarm", fake_prewarm)
+    monkeypatch.setattr(auto_module, "aprobe", fake_probe)
+    options = isolated_options(tmp_path, cookies="session=abc")
+
+    async def run() -> None:
+        client = await auto_module.auto_async_direct_client(
+            options, verification_token="auto", prewarm=True
+        )
+        await client.aclose()
+
+    asyncio.run(run())
+    assert events == ["prewarm", "probe"]
 
 
 def test_explicit_verification_token_is_kept(tmp_path) -> None:
@@ -4706,6 +4757,7 @@ def test_warm_browser_keep_alive_reuses_environment_and_follow_up_skips_goto(
         session_cookies={"arena-auth-prod-v1.0": "jwt"},
         keep_browser_alive=True,
     )
+    tok.prewarm()
     with auto_module.DirectArenaClient(
         base_url="https://arena.ai",
         cookies={"arena-auth-prod-v1.0": "jwt"},
@@ -4739,6 +4791,89 @@ def test_warm_browser_keep_alive_reuses_environment_and_follow_up_skips_goto(
     assert env_exits == 1
     assert tok._warm_state is None
     assert tok._bg_thread is None
+
+
+def test_prewarmed_legacy_stream_callbacks_follow_the_current_request_queue(
+    tmp_path, monkeypatch
+) -> None:
+    """A prewarmed page must also stream its second request without CDP events."""
+    launches = 0
+    environments: list[object] = []
+
+    class LegacyPage:
+        def __init__(self) -> None:
+            self._exposed: dict[str, object] = {}
+            self.context = type(
+                "C", (), {"add_cookies": self._noop, "cookies": self._cookies}
+            )()
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def _noop(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        async def _cookies(self, urls: object = None) -> list[object]:
+            return []
+
+        async def expose_function(self, name: str, fn: object) -> None:
+            self._exposed[name] = fn
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def title(self) -> str:
+            return "Arena"
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def evaluate(self, script: str) -> object:
+            if "chat_submit" in script:
+                return "v3-token"
+            if "window.fetch" in script:
+                meta = self._exposed["__arenaDirectMeta"]
+                chunk = self._exposed["__arenaDirectChunk"]
+                assert callable(meta) and callable(chunk)
+                meta("text/plain")
+                chunk('a0:"legacy ok"\nad:{"finishReason":"stop"}\n')
+                return {"ok": True, "status": 200, "contentType": "text/plain"}
+            return None
+
+    class LegacyEnv:
+        def __init__(self, options: object) -> None:
+            nonlocal launches
+            launches += 1
+            self.page = LegacyPage()
+            self.challenge_handler = type(
+                "H", (), {"solve_on_detection": True}
+            )()
+
+        async def __aenter__(self) -> "LegacyEnv":
+            environments.append(self)
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def new_page(self) -> LegacyPage:
+            return self.page
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", LegacyEnv)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=False),
+        keep_browser_alive=True,
+    )
+    tok.prewarm()
+    config = GenerationConfig(queue_timeout=1.0)
+    with auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        verification_token=tok,
+    ) as client:
+        assert client.complete("One", config=config) == "legacy ok"
+        assert client.complete("Two", config=config) == "legacy ok"
+    assert launches == 1
 
 
 def test_warm_browser_self_heals_if_cached_page_crashed(
@@ -4875,6 +5010,45 @@ def test_cli_prompt_on_arena_ai_skips_gradio_config_probes(
     assert probe_calls == []
     assert len(direct_calls) == 1
     assert spy_probe is not None
+
+
+def test_cli_prompt_with_explicit_token_goes_straight_to_direct_chat(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A supplied assertion must not trigger a doomed Gradio attempt first."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_COOKIE", "arena-auth-prod-v1.0=jwt")
+    monkeypatch.setenv("ARENA_VERIFICATION_TOKEN", "env-v3-token")
+    calls: list[dict[str, object]] = []
+
+    class FakeDirectClient:
+        def __enter__(self) -> "FakeDirectClient":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def stream(self, prompt: str, *, model: str | None = None):
+            calls.append({"prompt": prompt, "model": model})
+            yield StreamChunk(
+                text="direct",
+                delta="direct",
+                event="text",
+                finished=True,
+            )
+
+    def fake_auto_direct_client(options=None, *, verification_token=None, **kw):
+        assert options is not None and options.verify is False
+        calls.append({"token": verification_token})
+        return FakeDirectClient()
+
+    monkeypatch.setattr(auto_module, "auto_direct_client", fake_auto_direct_client)
+    assert main(["--prompt", "Hi", "--no-browser-profiles"]) == 0
+    assert calls == [
+        {"token": "env-v3-token"},
+        {"prompt": "Hi", "model": None},
+    ]
+    assert "answer            : direct" in capsys.readouterr().out
 
 
 def test_firefox_cookie_snapshot_and_sessionstore_caches_invalidate_on_write(
