@@ -12,6 +12,8 @@ import asyncio
 import base64
 import json
 import os
+import shutil
+import sys
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -154,6 +156,35 @@ def _direct_browser_profile_dir(options: Any) -> Path:
         else Path(DEFAULT_STATE_PATH)
     )
     return base_state.parent / "direct_browser_profile"
+
+
+def _maybe_reset_browser_profile(options: Any, profile_dir: Path) -> None:
+    """Honour ``--fresh-profile`` exactly once per process.
+
+    Deleting the directory is enough: :class:`~arena_api.auth.BrowserEnvironment`
+    recreates it, and every cookie the library needs is seeded from the
+    discovered session anyway.
+    """
+    if not getattr(options, "reset_profile", False):
+        return
+    marker = f"_profile_reset_{profile_dir}"
+    if getattr(options, marker, False):
+        return
+    try:
+        setattr(options, marker, True)
+    except Exception:  # noqa: BLE001 - frozen/foreign options object
+        pass
+    if not profile_dir.exists():
+        return
+    try:
+        shutil.rmtree(profile_dir)
+    except OSError as exc:
+        print(
+            f"[arena-api] --fresh-profile: could not remove {profile_dir}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    print(f"[arena-api] --fresh-profile: removed {profile_dir}", file=sys.stderr)
 
 
 async def _seed_direct_context_cookies(

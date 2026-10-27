@@ -92,6 +92,7 @@ from ._direct_page import (
     _default_recaptcha_site_key,
     _detect_post_submit_challenge,
     _direct_browser_profile_dir,
+    _maybe_reset_browser_profile,
     _gentle_page_warmup,
     _is_eval_stream_url,
     _reclick_send_button_if_unsent,
@@ -394,6 +395,11 @@ class AutoOptions:
     #: guessing the browser would mismatch the headers we send. Pass ``"off"``
     #: to disable, or a profile name (``"firefox147"``) to force one.
     impersonate: str | None = "auto"
+
+    #: Delete the persistent Chromium profile before the first launch (fixes a
+    #: profile a crash or an old build left unusable; session cookies are
+    #: re-seeded from your browser anyway).
+    reset_profile: bool = False
 
     #: Archive the conversation once the answer has been fully received
     #: (conversation row -> menu -> Archive). Off by default: it is a UI action
@@ -2152,6 +2158,8 @@ class DirectVerificationToken:
         profile_dir = (
             _direct_browser_profile_dir(self.options) if is_live_browser else None
         )
+        if is_live_browser and profile_dir is not None:
+            _maybe_reset_browser_profile(self.options, profile_dir)
         if is_live_browser:
             return False, not bool(self.options.show_browser), profile_dir
         return True, False, profile_dir
@@ -3435,6 +3443,8 @@ class DirectVerificationToken:
         profile_dir = (
             _direct_browser_profile_dir(self.options) if is_live_browser else None
         )
+        if profile_dir is not None:
+            _maybe_reset_browser_profile(self.options, profile_dir)
         had_warm_before = self._warm_state is not None
 
         if is_live_browser:
@@ -3950,6 +3960,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fresh-profile",
+        action="store_true",
+        help=(
+            "delete the persistent browser profile before launching (fixes a "
+            "profile that a crash or an old build left unusable; the session "
+            "cookies are re-seeded from your browser)"
+        ),
+    )
+    parser.add_argument(
         "--archive-after-answer",
         action="store_true",
         default=False,
@@ -4106,6 +4125,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         proxy=args.proxy,
         session_source=getattr(args, "session", None),
         archive_after_answer=bool(getattr(args, "archive_after_answer", False)),
+        reset_profile=bool(getattr(args, "fresh_profile", False)),
         profiles_root=args.profile_root,
         profile_name=args.profile,
         show_browser=bool(getattr(args, "show_browser", False)),

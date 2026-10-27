@@ -1,35 +1,10 @@
-"""Async Playwright wrapper with reproducible, CI-ready browser contexts.
-
-This is the browser half of the ``arena_api.auth`` package. It owns three
-things and nothing else:
-
-1. **Context normalisation** -- locale, timezone, viewport, colour scheme and
-   reduced-motion are Playwright's own supported knobs, and they are the
-   correct way to make a headless run match a reference run. Setting them here
-   means every test in a suite shares one configuration instead of each test
-   inventing its own.
-2. **Determinism injection** -- the init script from
-   :mod:`arena_api.auth.environment` is installed on every page.
-3. **Artefact capture** -- traces, HARs and screenshots land in one directory
-   so a CI failure is diagnosable after the runner is gone.
-
-It does **not** install stealth/fingerprint patches. See
-:mod:`arena_api.auth.environment` for the reasoning; the short version is that
-a synthetic monitor should be identifiable, not camouflaged. The one opt-in
-exception is challenge *solving*: ``BrowserEnvironmentOptions.solve_challenges``
-plus a ``captcha_solver`` installs a
-:class:`~arena_api.auth.challenge.ChallengeHandler` on every page, and
-:meth:`BrowserEnvironmentOptions.with_captcha_solving` additionally drops the
-synthetic-monitor announcement, since masking automation while announcing it
-would be self-contradictory.
-
-Playwright is imported lazily, so importing this module never requires the
-package (or a downloaded browser binary) to be present.
-"""
-
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import sys
+import tempfile
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as _distribution_version
@@ -279,6 +254,147 @@ def _is_profile_in_use_error(exc: BaseException) -> bool:
     )
 
 
+#: Playwright's generic message when the browser dies right after ``launch``.
+#: Chromium reports the real reason (a busy profile, a stale ``SingletonLock``,
+#: an old Chrome that no longer speaks the protocol) on its own stderr, so the
+#: only thing to do here is recognise the shape.
+_CLOSED_BROWSER_MARKERS = (
+    "target page, context or browser has been closed",
+    "target closed",
+    "browser has been closed",
+    "browser closed",
+    "failed to launch",
+    "browser was not found",
+    "process did exit",
+)
+
+
+def _is_closed_browser_error(exc: BaseException) -> bool:
+    """True for "the browser never came up", whatever the real cause was."""
+    message = str(exc).lower()
+    return any(marker in message for marker in _CLOSED_BROWSER_MARKERS)
+
+
+#: Files Chromium leaves in a profile to keep a second instance out.
+_PROFILE_LOCKS = ("SingletonLock", "SingletonCookie", "SingletonSocket")
+
+#: Windows also keeps a "this profile is open" marker per user.
+_PROFILE_LOCK_FILES = ("lockfile", "parent.lock")
+
+
+def _lock_owner_pid(path: Path) -> int | None:
+    """Read the pid a Chromium ``SingletonLock`` points at, if any.
+
+    On POSIX the lock is a symlink named ``<host>-<pid>``; on Windows it is a
+    regular file holding the same text.  ``None`` means "cannot tell".
+    """
+    try:
+        if path.is_symlink():
+            target = os.readlink(path)
+        elif path.is_file():
+            target = path.read_text(encoding="utf-8", errors="replace").strip()
+        else:
+            return None
+    except OSError:
+        return None
+    tail = str(target).rsplit("-", 1)[-1].strip()
+    try:
+        pid = int(tail)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":  # pragma: no cover - exercised on Windows only
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True  # cannot tell: assume the worst, keep the lock
+        return str(pid) in result.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def heal_profile_locks(profile_dir: Path) -> list[str]:
+    """Remove stale Chromium locks that make a launch fail.
+
+    A crashed run leaves ``SingletonLock``/``SingletonCookie``/``SingletonSocket``
+    behind, and the next launch dies with "Target page, context or browser has
+    been closed" (Chromium refuses to reuse a profile it believes is open).
+    A lock whose owning process is gone is safe to delete; a live one is not,
+    and the caller should then use a throwaway profile instead.
+
+    Returns the names that were removed.
+    """
+    removed: list[str] = []
+    for name in _PROFILE_LOCKS:
+        path = profile_dir / name
+        if not path.exists() and not path.is_symlink():
+            continue
+        owner = _lock_owner_pid(path)
+        if owner is not None and _pid_alive(owner):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(name)
+    for name in _PROFILE_LOCK_FILES:
+        path = profile_dir / name
+        # Windows' "lockfile" is created by Chromium itself and is harmless
+        # once the process is gone; a stale one is the same kind of debris.
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(name)
+    return removed
+
+
+def profile_is_locked(profile_dir: Path) -> bool:
+    """True when a *live* process holds this profile."""
+    for name in _PROFILE_LOCKS:
+        path = profile_dir / name
+        if not path.exists() and not path.is_symlink():
+            continue
+        owner = _lock_owner_pid(path)
+        if owner is None or _pid_alive(owner):
+            return True
+    return False
+
+
+def profile_launch_hint(profile_dir: Path | str) -> str:
+    """Actionable text for a failed browser launch on a persistent profile."""
+    return (
+        f"Chromium did not start with the profile {profile_dir}. Most often a "
+        "leftover browser process still holds it: close every chrome.exe/"
+        "msedge.exe window (or end them in Task Manager), then run again. "
+        "A crash can also leave stale Singleton locks in the profile — those "
+        "are removed automatically next run. To start from a clean profile, "
+        "use --fresh-profile (the session cookies are re-seeded from your "
+        "browser anyway)."
+    )
+
+
 def _playwright_proxy_settings(proxy_url: str) -> dict[str, str]:
     """Convert a URL string into Playwright's ``ProxySettings`` dictionary.
 
@@ -335,6 +451,10 @@ class BrowserEnvironment:
         self._playwright: Any = None
         self._browser: Any = None
         self._persistent_context: Any = None
+        #: Locks dropped because their owner was gone (reported by ``--diagnose``).
+        self._healed_locks: list[str] = []
+        #: Throwaway profile used when the persistent one was busy.
+        self._scratch_profile_dir: Path | None = None
         self._claimed_initial_page: bool = False
         self._contexts: list[Any] = []
         self._started = False
@@ -402,6 +522,10 @@ class BrowserEnvironment:
             if self.options.user_data_dir is not None:
                 profile_dir = Path(self.options.user_data_dir).expanduser()
                 profile_dir.mkdir(parents=True, exist_ok=True)
+                # A crashed run leaves Singleton locks behind and Chromium then
+                # refuses the profile ("Target page, context or browser has been
+                # closed").  Locks whose owner is gone are safe to drop.
+                self._healed_locks = heal_profile_locks(profile_dir)
                 p_kwargs = self.options.persistent_context_kwargs()
                 if self.options.record_har:
                     p_kwargs["record_har_path"] = str(
@@ -415,12 +539,9 @@ class BrowserEnvironment:
                         )
                     )
                 except Exception as exc:
-                    if _is_profile_in_use_error(exc):
-                        self._browser = await self._playwright.chromium.launch(
-                            **self.options.launch_kwargs()
-                        )
-                    else:
-                        raise
+                    self._persistent_context = await self._recover_profile(
+                        exc, profile_dir, p_kwargs
+                    )
             else:
                 self._browser = await self._playwright.chromium.launch(
                     **self.options.launch_kwargs()
@@ -434,6 +555,79 @@ class BrowserEnvironment:
             raise
         self._started = True
         return self
+
+    async def _recover_profile(
+        self, exc: BaseException, profile_dir: Path, p_kwargs: dict[str, Any]
+    ) -> Any:
+        """Get a browser up when the persistent profile cannot be opened.
+
+        Three escalating attempts, each cheaper to explain than the last:
+
+        1. the profile looks busy but its owner is gone -> drop the locks and
+           retry the same profile (trust cookies survive);
+        2. still busy (a real browser is on it) -> keep the profile aside and
+           launch with a throwaway one: the session is seeded from Firefox or
+           ``cookies.json`` anyway, so the request still works.  If even that
+           fails, an ephemeral browser (no profile) is launched;
+        3. Chromium dies for any other reason -> same throwaway profile, but the
+           error raised at the end explains what to do (close the browser, use
+           ``--fresh-profile``).
+        """
+        in_use = _is_profile_in_use_error(exc) or _is_closed_browser_error(exc)
+        removed = heal_profile_locks(profile_dir)
+        retry_same = bool(removed) or (in_use and not profile_is_locked(profile_dir))
+        if retry_same:
+            self._healed_locks = list(self._healed_locks) + list(removed)
+            try:
+                note = (
+                    "removed stale browser profile locks "
+                    f"({', '.join(removed)})"
+                    if removed
+                    else "the browser did not start on its profile"
+                )
+                print(f"[arena-api] {note}; retrying {profile_dir}", file=sys.stderr)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                return await self._playwright.chromium.launch_persistent_context(
+                    str(profile_dir), **p_kwargs
+                )
+            except Exception as retry_exc:  # noqa: BLE001 - escalate below
+                exc = retry_exc
+                in_use = in_use or _is_profile_in_use_error(retry_exc)
+        if profile_is_locked(profile_dir) or in_use:
+            scratch = Path(tempfile.mkdtemp(prefix="arena-profile-"))
+            self._scratch_profile_dir = scratch
+            try:
+                print(
+                    "[arena-api] the browser profile "
+                    f"{profile_dir} is in use by another browser; using a "
+                    f"temporary profile for this run ({scratch}). Close the "
+                    "other window to reuse your cookies from it.",
+                    file=sys.stderr,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                return await self._playwright.chromium.launch_persistent_context(
+                    str(scratch), **p_kwargs
+                )
+            except Exception:  # noqa: BLE001 - maybe a non-profile failure
+                shutil.rmtree(scratch, ignore_errors=True)
+                self._scratch_profile_dir = None
+            # Last resort: an ephemeral context (no profile at all). The library
+            # seeds cookies itself, so a request still works.
+            launch_fn = getattr(self._playwright.chromium, "launch", None)
+            if callable(launch_fn):
+                try:
+                    self._browser = await launch_fn(
+                        **self.options.launch_kwargs()
+                    )
+                    return None
+                except Exception:  # noqa: BLE001 - reported below
+                    pass
+        hint = profile_launch_hint(profile_dir)
+        raise RuntimeError(f"{hint} (original error: {exc})") from exc
 
     async def close(self) -> None:
         """Close every context, then the browser and Playwright."""
@@ -449,6 +643,9 @@ class BrowserEnvironment:
         self._contexts.clear()
         self._persistent_context = None
         self._claimed_initial_page = False
+        scratch, self._scratch_profile_dir = self._scratch_profile_dir, None
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
         if self._browser is not None:
             try:
                 await self._browser.close()

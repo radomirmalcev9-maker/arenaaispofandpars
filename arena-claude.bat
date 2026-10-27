@@ -29,6 +29,8 @@ rem                                     storage, chrome, auto
 rem    ARENA_CLAUDE_ENGINE=warm         warm (daemon), http, echo
 rem    ARENA_CLAUDE_VERBOSE=1           log every request in the shim log
 rem    ARENA_CLAUDE_ARCHIVE=0           keep answered chats (default: archive them)
+rem    ARENA_CLAUDE_FRESH_PROFILE=1      delete the browser profile first; use it
+rem                                     when Chrome refuses to start on it
 rem
 rem  The output of this file is deliberately ASCII: cmd reads a script in the
 rem  console codepage, so Cyrillic here turns into garbage.  Russian
@@ -53,6 +55,9 @@ if "%ARENA_CLAUDE_VERBOSE%"=="1" set "EXTRA=--verbose"
 set "ARCHIVE_NOTE=after the answer is complete"
 if "%ARENA_CLAUDE_ARCHIVE%"=="0" set "EXTRA=%EXTRA% --no-archive"
 if "%ARENA_CLAUDE_ARCHIVE%"=="0" set "ARCHIVE_NOTE=no (chats are kept)"
+set "PROFILE_NOTE=reused (stale locks are healed)"
+if "%ARENA_CLAUDE_FRESH_PROFILE%"=="1" set "EXTRA=%EXTRA% --fresh-profile"
+if "%ARENA_CLAUDE_FRESH_PROFILE%"=="1" set "PROFILE_NOTE=recreated (--fresh-profile)"
 
 set "SHIMPID="
 set "STARTED_SHIM="
@@ -172,6 +177,7 @@ echo   model              = %MODEL%
 echo   session            = %SESSION%
 echo   engine             = %ENGINE%
 echo   archive chat       = %ARCHIVE_NOTE%
+echo   browser profile    = %PROFILE_NOTE%
 echo.
 if not defined STARTED_SHIM echo [arena] port %SHIM_PORT% was already served - reusing it, not stopping it.
 

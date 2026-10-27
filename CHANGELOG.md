@@ -5,6 +5,30 @@
 
 ## Unreleased
 
+### Запуск браузера переживает занятый/битый профиль
+
+Симптом: `BrowserType.launch_persistent_context: Target page, context or browser
+has been closed`, в выводе Chrome — сообщение о профиле. Это не ошибка Arena:
+Chromium отказался открыть `state/direct_browser_profile` (живой `chrome.exe`
+или замки `SingletonLock`/`SingletonCookie` после аварийного завершения).
+
+- **Снятие «мёртвых» замков**: `heal_profile_locks()` читает pid из
+  `SingletonLock` (файл на Windows, симлинк на POSIX) и удаляет замок, если
+  процесс уже не жив; живой замок не трогается (`profile_is_locked()`).
+- **Откат на временный профиль**: если профиль занят живым процессом,
+  `BrowserEnvironment` поднимает браузер с одноразовым профилем (сессия и так
+  подсеивается из Firefox/`cookies.json`), пишет это в stderr и удаляет
+  каталог при закрытии. Транзиентный отказ без замков — один повтор с тем же
+  профилем.
+- **Внятная ошибка вместо простыни Playwright**: `profile_launch_hint()`
+  говорит закрыть окна `chrome.exe`/`msedge.exe`, что замки чистятся
+  автоматически и что есть `--fresh-profile`.
+- **`--fresh-profile` / `AutoOptions.reset_profile` /
+  `ARENA_CLAUDE_FRESH_PROFILE=1`**: удалить профиль перед запуском (один раз за
+  процесс), когда он уже неисправим.
+- **`arena-api --claude --doctor`**: новый шаг «5. Профиль браузера» — путь,
+  число файлов, занят ли профиль живым процессом и какие замки сняты.
+
 ### Батник переживает сломанную установку
 
 - **`arena-claude.bat` теперь умеет запускать пакет прямо из клона**: если
