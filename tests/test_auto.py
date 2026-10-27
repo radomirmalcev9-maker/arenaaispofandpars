@@ -66,7 +66,11 @@ from arena_api.auto import (
     solver_dependencies_available,
 )
 from arena_api.constants import CONFIG_PATH, DEFAULT_BASE_URL, DIRECT_PAGE_PATH
-from arena_api.exceptions import AuthenticationError
+from arena_api.exceptions import (
+    AuthenticationError,
+    ChallengeRequiredError,
+    RateLimitError,
+)
 from arena_api.models import GenerationConfig, ModelInfo
 
 import arena_api.auto as auto_module
@@ -3668,6 +3672,244 @@ def test_post_submit_bframe_skips_audio_without_ffmpeg_and_resends_after_human_s
     assert "после отправки появилась капча" in stderr
     assert brought_to_front >= 1
     assert send_clicks == 2
+
+
+def test_opaque_429_is_solved_as_a_captcha_and_the_prompt_is_resent(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(auto_module.shutil, "which", lambda cmd: None)
+    monkeypatch.setattr(auto_module, "solver_dependencies_available", lambda _: True)
+    audio_solver = RecaptchaToolkitSolver(backend="audio")
+    assert auto_module._can_auto_solve_bframe(audio_solver) is False
+
+    send_clicks = 0
+    brought_to_front = 0
+
+    class FakeRequest:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.method = "POST"
+
+    class FakeResponse:
+        def __init__(self, url: str, status: int, body: str, content_type: str) -> None:
+            self.url = url
+            self.status = status
+            self._body = body
+            self.headers = {"content-type": content_type}
+            self.request = FakeRequest(url)
+
+        async def text(self) -> str:
+            return self._body
+
+    class FakeLocator:
+        def __init__(self, selector: str, page: "BframePage") -> None:
+            self.selector = selector
+            self._page = page
+
+        @property
+        def first(self) -> "FakeLocator":
+            return self
+
+        async def click(self) -> None:
+            nonlocal send_clicks
+            if "data-arena-send" in self.selector:
+                send_clicks += 1
+                self._page._on_send(send_clicks)
+
+        async def fill(self, value: str) -> None:
+            return None
+
+    class FakeKeyboard:
+        async def type(self, text: str, delay: int = 0) -> None:
+            return None
+
+    class FakeMouse:
+        async def move(self, x: float, y: float, steps: int = 1) -> None:
+            return None
+
+    class FakeContext:
+        async def cookies(self, urls=None):
+            return []
+
+        async def add_cookies(self, cookies) -> None:
+            return None
+
+    class BframePage:
+        def __init__(self) -> None:
+            self.context = FakeContext()
+            self.keyboard = FakeKeyboard()
+            self.mouse = FakeMouse()
+            self._listeners: dict[str, list[object]] = {}
+            self._bframe_checks = 0
+            self._composer_has_text = True
+
+        def on(self, event: str, cb: object) -> None:
+            self._listeners.setdefault(event, []).append(cb)
+
+        def remove_listener(self, event: str, cb: object) -> None:
+            return None
+
+        async def bring_to_front(self) -> None:
+            nonlocal brought_to_front
+            brought_to_front += 1
+
+        def _emit(self, event: str, payload: object) -> None:
+            for cb in list(self._listeners.get(event, ())):
+                assert callable(cb)
+                cb(payload)
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator(selector, self)
+
+        async def goto(self, url: str, **kwargs: object) -> None:
+            return None
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def content(self) -> str:
+            return "<html><body><form><textarea></textarea><button type='submit'>Send</button></form></body></html>"
+
+        def _on_send(self, attempt_no: int) -> None:
+            url = "https://arena.ai/nextjs-api/stream/create-evaluation"
+            self._emit("request", FakeRequest(url))
+            if attempt_no == 1:
+                self._emit(
+                    "response",
+                    FakeResponse(
+                        url,
+                        # Arena's edge answers a re-required captcha with an
+                        # opaque 429: no marker in the body, no cf-mitigated
+                        # header.  It must be inspected in the page, not
+                        # reported as a rate limit.
+                        429,
+                        '{"error":"too many requests"}',
+                        "application/json",
+                    ),
+                )
+            else:
+                self._composer_has_text = False
+                self._emit(
+                    "response",
+                    FakeResponse(
+                        url,
+                        200,
+                        'a0:"Ответ после ручной капчи"\nad:{"finishReason":"stop"}\n',
+                        "text/plain; charset=utf-8",
+                    ),
+                )
+
+        async def evaluate(self, script: str) -> object:
+            if "arena_cleanup_marks" in script:
+                return None
+            if "composer_nonempty" in script:
+                return self._composer_has_text
+            if "data-arena-composer" in script and "data-arena-send" not in script:
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {
+                    "found": True,
+                    "confidence": "explicit",
+                    "x": 650,
+                    "y": 700,
+                }
+            if "recaptcha_anchor" in script:
+                self._bframe_checks += 1
+                if self._bframe_checks <= 2:
+                    return {
+                        "kind": "recaptcha_bframe",
+                        "x": 500,
+                        "y": 400,
+                        "width": 400,
+                        "height": 580,
+                    }
+                return {"kind": None}
+            raise AssertionError(f"unexpected evaluate script: {script[:80]}")
+
+    class FakeEnv:
+        def __init__(self, options) -> None:
+            self.options = options
+
+        async def __aenter__(self):
+            if self.options.headless:
+                raise auto_module._RetryInHeadedBrowser("skip headless in test")
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+        async def new_page(self):
+            return BframePage()
+
+    monkeypatch.setattr(auto_module, "BrowserEnvironment", FakeEnv)
+
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=audio_solver,
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+    )
+    client = auto_module.DirectArenaClient(
+        base_url="https://arena.ai",
+        cookies={"arena-auth-prod-v1.0": "jwt"},
+        verification_token=tok,
+        timeout=10.0,
+    )
+    try:
+        answer = client.complete("Тест капчи")
+    finally:
+        client.close()
+
+    stderr = capsys.readouterr().err
+    assert answer == "Ответ после ручной капчи"
+    assert "после отправки появилась капча" in stderr
+    assert brought_to_front >= 1
+    assert send_clicks == 2
+
+def test_status_means_challenge_prefers_the_page_over_the_body() -> None:
+    opaque = '{"error":"too many requests"}'
+
+    # A 429 with an opaque body is how a re-required captcha arrives, so a
+    # solver must get a chance to look at the page.
+    assert auto_module._status_means_challenge(
+        429, opaque, {"content-type": "application/json"}, solver_ready=True
+    )
+    # Without any solver there is nothing to solve: keep it a plain limit.
+    assert not auto_module._status_means_challenge(
+        429, opaque, {"content-type": "application/json"}, solver_ready=False
+    )
+    # Explicit challenge markers still win, solver or not.
+    assert auto_module._status_means_challenge(
+        429, "", {"cf-mitigated": "challenge"}, solver_ready=False
+    )
+    assert auto_module._status_means_challenge(
+        403, '{"error":"recaptcha validation failed"}', {}, solver_ready=False
+    )
+    # Other statuses are unaffected.
+    assert not auto_module._status_means_challenge(500, "boom", {}, solver_ready=True)
+    assert not auto_module._status_means_challenge(429, "boom", {}, solver_ready=False)
+
+
+def test_browser_429_raises_a_rate_limit_that_names_the_captcha_check(tmp_path) -> None:
+    tok = DirectVerificationToken(
+        isolated_options(tmp_path, base_url="https://arena.ai", interactive=True),
+        solver=RecaptchaToolkitSolver(),
+        session_cookies={"arena-auth-prod-v1.0": "jwt"},
+    )
+    with pytest.raises(RateLimitError) as raised:
+        tok._raise_browser_http_error(
+            429,
+            '{"error":"too many requests"}',
+            {"content-type": "application/json", "retry-after": "7"},
+        )
+    message = str(raised.value)
+    assert "challenge" in message.lower()
+    assert "captcha solving" in message
+    assert raised.value.retry_after == 7
+
+    with pytest.raises(ChallengeRequiredError):
+        tok._raise_browser_http_error(429, "", {"cf-mitigated": "challenge"})
+    tok.close()
+
 
 
 def test_seed_direct_context_cookies_preserves_existing_trust_cookies() -> None:
