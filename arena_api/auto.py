@@ -70,7 +70,7 @@ import threading
 import time
 import weakref
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from importlib.util import find_spec
 from pathlib import Path
@@ -150,6 +150,7 @@ from .auth.firefox_session import (
 from .auth.session import BrowserSessionManager, FormLoginFlow, LoginFlow
 from .client import ArenaClient, AsyncArenaClient
 from .constants import CONFIG_PATH, DEFAULT_BASE_URL, DEFAULT_TIMEOUT
+from .latency import mark as _latency_mark
 from .direct import (
     DIRECT_PAGE_PATH,
     AsyncDirectArenaClient,
@@ -1534,7 +1535,9 @@ def _prepare(
     options: AutoOptions, *, require_session: bool = True
 ) -> tuple[AutoSessionManager, DiscoveredSession] | None:
     """Discover (or wait for) a session and build its manager."""
+    _latency_mark("session.discover.start")
     discovered = discover_session(options)
+    _latency_mark("session.discover.end")
     if discovered is None and require_session:
         if not _wait_for_login(options):
             raise AuthenticationError(
@@ -2269,6 +2272,7 @@ class DirectVerificationToken:
             _prepare_profile_window_placement(user_data_dir, hidden=cloaked_headful)
         win_cloaker = _WindowsBrowserCloaker(enabled=cloaked_headful)
         win_cloaker.start()
+        _latency_mark("browser.launch.start")
         try:
             environment, selected_channel = (
                 await self._launch_verification_environment(
@@ -2278,6 +2282,7 @@ class DirectVerificationToken:
                     user_data_dir=user_data_dir,
                 )
             )
+            _latency_mark("browser.launch.end")
         except BaseException:
             win_cloaker.stop()
             raise
@@ -2289,6 +2294,7 @@ class DirectVerificationToken:
             if handler is not None:
                 handler.solve_on_detection = False
             page = await environment.new_page()
+            _latency_mark("browser.page")
             context = getattr(page, "context", None)
             if headless:
                 ua_cdp_session = await _sanitize_headless_page_cdp(
@@ -2300,6 +2306,7 @@ class DirectVerificationToken:
             cdp_pump = await _CdpEvalStreamPump.attach(
                 context, page, existing_cdp=ua_cdp_session
             )
+            _latency_mark("browser.stream.ready")
         except BaseException:
             win_cloaker.stop()
             if cdp_pump is not None:
@@ -2349,7 +2356,9 @@ class DirectVerificationToken:
         keep_alive = self._should_keep_browser_alive()
         running_loop = asyncio.get_running_loop()
         if keep_alive:
+            _latency_mark("warm.prewarm.wait")
             await self._await_prewarm(running_loop)
+            _latency_mark("warm.prewarm.ready")
 
         state: _WarmBrowserState | None = None
         reused_warm_page = False
@@ -2561,6 +2570,7 @@ class DirectVerificationToken:
                 )
 
             if not used_composer:
+                _latency_mark("page.prepare.start")
                 state.has_active_conversation = False
                 if not state.direct_page_ready:
                     # A background prefetch (started right after the previous
@@ -2646,6 +2656,9 @@ class DirectVerificationToken:
                         install_legacy_tap_flags=not has_network_events,
                     )
 
+            if not used_composer:
+                _latency_mark("page.prepare.end")
+            _latency_mark("submit.start")
             eval_task: asyncio.Task[Any] | None = None
             if not used_composer:
                 token = await self._mint_token_on_page(page)
@@ -2696,6 +2709,7 @@ class DirectVerificationToken:
 
                 if got_event:
                     if ev_kind != "http_error":
+                        _latency_mark("first_byte")
                         first_kind, first_val = ev_kind, ev_val
                         break
                     err_map = ev_val if isinstance(ev_val, Mapping) else {}
@@ -3629,6 +3643,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="show the Direct Chat browser window instead of running invisibly in the background",
     )
     parser.add_argument("--prompt", default=None, help="send one prompt and print the answer")
+    parser.add_argument(
+        "--warm",
+        dest="warm",
+        action="store_true",
+        default=None,
+        help=(
+            "answer --prompt through the warm background daemon (default when "
+            "no explicit verification token is given; ARENA_WARM=0 turns it off)"
+        ),
+    )
+    parser.add_argument(
+        "--no-warm",
+        dest="warm",
+        action="store_false",
+        help="always launch a browser for this prompt and never use the daemon",
+    )
+    parser.add_argument(
+        "--warm-idle",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "how long the warm daemon may stay idle before it exits "
+            f"(default {900:g}s, also ARENA_WARM_IDLE)"
+        ),
+    )
+    parser.add_argument(
+        "--warm-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="how long to wait for the warm daemon to start (also ARENA_WARM_TIMEOUT)",
+    )
+    parser.add_argument(
+        "--warm-state",
+        default=None,
+        metavar="PATH",
+        help=(
+            "state file the daemon publishes "
+            "(default ./state/warm-daemon.json, also ARENA_WARM_STATE)"
+        ),
+    )
+    parser.add_argument(
+        "--warm-stop",
+        action="store_true",
+        help="stop the background warm daemon and exit",
+    )
+    parser.add_argument(
+        "--warm-status",
+        action="store_true",
+        help="report whether the background warm daemon is running and exit",
+    )
     return parser
 
 
@@ -3677,8 +3743,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     Exit codes: ``0`` everything worked, ``1`` no usable session (or another
     library error), ``2`` a session was found but the server rejected it.
     """
+    raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    _latency_mark("cli.start")
+    try:
+        return _main(raw_argv)
+    finally:
+        # The report itself is emitted once at process exit (see arena_api.latency).
+        _latency_mark("cli.exit")
+
+
+def _main(argv: Sequence[str]) -> int:
+    """The body of :func:`main` (split so the timing report always runs)."""
     _ensure_utf8_stdio()
-    args = build_arg_parser().parse_args(argv)
+    args = build_arg_parser().parse_args(list(argv))
+    args._raw_argv = list(argv)  # noqa: SLF001 - used by the warm fast path
+    _latency_mark("cli.args")
+    if getattr(args, "warm_stop", False) or getattr(args, "warm_status", False):
+        from .warm import status_main, stop_main
+
+        return stop_main(argv) if args.warm_stop else status_main(argv)
     try:
         options = _options_from_args(args)
     except ValueError as exc:
@@ -3860,6 +3943,80 @@ def _cached_config_probe_error(
     return err if isinstance(err, ArenaError) else None
 
 
+def _run_warm_prompt(
+    args: argparse.Namespace, options: AutoOptions, requested_model: str | None
+) -> int | None:
+    """Answer a one-shot prompt through the warm daemon.
+
+    Returns the exit code when the daemon answered, or ``None`` to fall through
+    to the in-process path (nothing has been printed at that point).
+    """
+    from . import warm
+
+    if warm.skip_for_process():
+        return None
+    raw = getattr(args, "_raw_argv", None) or []
+    parsed = warm.scan_argv(raw)
+    if parsed.force is False:
+        # Free the shared Chromium profile the daemon holds, then run locally.
+        with suppress(Exception):
+            warm.stop_daemon(parsed.state_file)
+        return None
+    if getattr(args, "warm", None) is False or not parsed.usable:
+        return None
+    if parsed.force is not True and not warm.warm_enabled():
+        return None
+    if parsed.force is not True and warm.supplied_verification_token():
+        return None
+    payload = {"argv": parsed.rest, "base_url": options.base_url}
+    _latency_mark("warm.ensure")
+    try:
+        state = warm.ensure_daemon(
+            payload=payload,
+            base_url=options.base_url,
+            state_file=parsed.state_file or getattr(args, "warm_state", None),
+            idle_timeout=parsed.idle_timeout,
+            start_timeout=parsed.start_timeout,
+        )
+    except warm.WarmDaemonUnavailable as exc:
+        _emit(
+            options,
+            f"[arena-api] warm daemon unavailable ({exc}); using the one-shot path",
+        )
+        return None
+    _latency_mark("warm.ready")
+    stream = warm.ask_stream(args.prompt, state=state, model=requested_model)
+    try:
+        # The connection is opened here: if the daemon vanished we can still
+        # fall back cleanly, because nothing has been printed yet.
+        first = next(stream)
+    except StopIteration:
+        first = ""
+    except (warm.WarmDaemonUnavailable, AuthenticationError) as exc:
+        if isinstance(exc, AuthenticationError):
+            reason = "no usable session"
+        else:
+            reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        _emit(
+            options,
+            f"[arena-api] warm daemon could not start the answer ({reason}); "
+            "using the one-shot path",
+        )
+        stream.close()
+        return None
+    _latency_mark("first_delta")
+    if requested_model is not None:
+        print(f"model             : {requested_model}")
+    print("answer            : ", end="", flush=True)
+    if first:
+        _safe_stdout_write(first)
+    for delta in stream:
+        _safe_stdout_write(delta)
+    print()
+    _latency_mark("answer.end")
+    return 0
+
+
 def _run(args: argparse.Namespace, options: AutoOptions) -> int:
     """The part of :func:`main` that needs a session."""
     if args.status and not (args.models or args.prompt):
@@ -3939,6 +4096,9 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
             and requested_model.strip().lower() == "auto"
         ):
             requested_model = None
+        warm_code = _run_warm_prompt(args, options, requested_model)
+        if warm_code is not None:
+            return warm_code
         resolved_vtoken = (
             args.verification_token
             or os.environ.get("ARENA_VERIFICATION_TOKEN")

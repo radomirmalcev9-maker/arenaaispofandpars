@@ -1,0 +1,1484 @@
+"""A persistent warm browser behind one-shot Direct Chat CLI calls.
+
+Nearly all of the wall-clock time between ``arena-api --prompt ...`` and the
+first streamed token is spent on work that is *identical for every prompt*:
+reading the browser session, launching a browser, loading the Direct Chat page,
+warming the composer and minting a reCAPTCHA v3 assertion.  Repeating that from
+scratch for each invocation costs seconds; the answer itself usually starts
+much sooner than that.
+
+This module keeps that state alive in a small local daemon:
+
+* :func:`ensure_daemon` starts ``python -m arena_api.warm`` on first use (a
+  detached process with its own warm browser) and returns its address;
+* :func:`ask_stream` sends one prompt over a loopback socket and yields the
+  answer deltas exactly as the in-process client would;
+* :func:`stop_daemon` / :func:`describe_daemon` manage and inspect it;
+* ``python -m arena_api.warm`` is the daemon itself.
+
+Everything is bound to ``127.0.0.1`` and gated by a random token written to a
+``0600`` state file, so nothing is exposed to the network.  The daemon exits by
+itself once it has been idle (default 15 minutes).  If it cannot be started —
+no browser, a locked profile, a stale state file — the caller falls back to the
+existing in-process path, which is exactly as fast (or as slow) as before.
+
+The module imports only the standard library at import time; the heavy client
+machinery is imported lazily inside the daemon, and the one-shot fast path
+(:func:`fast_prompt_main`) never imports :mod:`arena_api.auto` at all.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import hmac
+import json
+import os
+import secrets
+import signal
+import socket
+import subprocess
+import sys
+import time
+from collections.abc import AsyncIterator, Generator, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+from . import latency
+from .constants import DEFAULT_BASE_URL
+from .exceptions import AuthenticationError
+
+#: Bumped whenever the wire protocol changes; a daemon of another version is
+#: replaced instead of being talked to.
+PROTOCOL_VERSION = 1
+
+DEFAULT_IDLE_TIMEOUT = 900.0
+DEFAULT_START_TIMEOUT = 90.0
+DEFAULT_ASK_TIMEOUT = 900.0
+DEFAULT_STATE_NAME = "warm-daemon.json"
+
+_WARM_ENV = "ARENA_WARM"
+_STATE_ENV = "ARENA_WARM_STATE"
+_IDLE_ENV = "ARENA_WARM_IDLE"
+_START_ENV = "ARENA_WARM_TIMEOUT"
+_DEBUG_ENV = "ARENA_WARM_DEBUG"
+_SKIP_ENV = "ARENA_WARM_SKIP"
+
+_FALSE = {"0", "false", "no", "off", "disable", "disabled", "none", ""}
+
+
+# --------------------------------------------------------------------------- #
+# Configuration helpers
+# --------------------------------------------------------------------------- #
+
+
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() not in _FALSE
+
+
+def warm_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the warm daemon may be used at all (``ARENA_WARM=0`` opts out)."""
+    env = os.environ if environ is None else environ
+    return _truthy(env.get(_WARM_ENV, "1"))
+
+
+def skip_for_process() -> bool:
+    """``True`` once this process has already tried and lost the daemon.
+
+    The light CLI front-end falls back to :func:`arena_api.auto.main` in the
+    very same process; without this marker the heavy path would start (and
+    fail) a second daemon for the same prompt.
+    """
+    return _truthy(os.environ.get(_SKIP_ENV, "0"))
+
+
+def _mark_skipped() -> None:
+    os.environ[_SKIP_ENV] = "1"
+
+
+def supplied_verification_token(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether ``ARENA_VERIFICATION_TOKEN`` holds a token the daemon cannot mint.
+
+    The daemon always mints its own assertion; a fixed token supplied by the
+    caller must keep taking the ordinary path where it is actually used.
+    """
+    env = os.environ if environ is None else environ
+    value = str(env.get("ARENA_VERIFICATION_TOKEN", "") or "").strip()
+    return bool(value) and value.lower() != "auto"
+
+
+def _debug(environ: Mapping[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    return _truthy(env.get(_DEBUG_ENV, "0"))
+
+
+def log(message: str) -> None:
+    """Write one ``[arena-api]`` line to stderr (daemon log when detached)."""
+    try:
+        sys.stderr.write(f"[arena-api] {message}\n")
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 - logging must never raise
+        pass
+
+
+def _abs_path(value: str | Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(value))))
+
+
+def state_path(explicit: str | Path | None = None) -> Path:
+    """Where the daemon publishes how to reach it (``state/warm-daemon.json``)."""
+    if explicit:
+        return _abs_path(explicit)
+    env = os.environ.get(_STATE_ENV)
+    if env:
+        return _abs_path(env)
+    return _abs_path(Path("state") / DEFAULT_STATE_NAME)
+
+
+def _idle_timeout(value: float | None = None) -> float:
+    if value is not None:
+        return float(value)
+    env = os.environ.get(_IDLE_ENV)
+    if env:
+        try:
+            parsed = float(env)
+        except ValueError:
+            parsed = DEFAULT_IDLE_TIMEOUT
+        if parsed > 0:
+            return parsed
+    return DEFAULT_IDLE_TIMEOUT
+
+
+def _start_timeout(value: float | None = None) -> float:
+    if value is not None:
+        return float(value)
+    env = os.environ.get(_START_ENV)
+    if env:
+        try:
+            parsed = float(env)
+        except ValueError:
+            parsed = DEFAULT_START_TIMEOUT
+        if parsed > 0:
+            return parsed
+    return DEFAULT_START_TIMEOUT
+
+
+_API_VERSION: str | None = None
+
+
+def api_version() -> str:
+    """Installed ``arena-api`` version, used to retire an older daemon."""
+    global _API_VERSION
+    if _API_VERSION is None:
+        try:
+            from importlib.metadata import version
+
+            _API_VERSION = version("arena-api")
+        except Exception:  # noqa: BLE001 - running from a plain checkout
+            _API_VERSION = "unknown"
+    return _API_VERSION
+
+
+# --------------------------------------------------------------------------- #
+# Errors
+# --------------------------------------------------------------------------- #
+
+
+class WarmDaemonUnavailable(RuntimeError):
+    """The daemon could not be reached, started or stayed usable.
+
+    Callers treat this as "use the ordinary in-process path" rather than as a
+    failure of the request itself.
+    """
+
+
+# --------------------------------------------------------------------------- #
+# State file
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class DaemonState:
+    """How to reach one running daemon (never logged, never world-readable)."""
+
+    pid: int
+    port: int
+    token: str
+    host: str = "127.0.0.1"
+    started: float = 0.0
+    protocol: int = PROTOCOL_VERSION
+    api_version: str = ""
+    base_url: str = DEFAULT_BASE_URL
+    idle_timeout: float = DEFAULT_IDLE_TIMEOUT
+    python: str = ""
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "port": self.port,
+            "token": self.token,
+            "host": self.host,
+            "started": self.started,
+            "protocol": self.protocol,
+            "api_version": self.api_version,
+            "base_url": self.base_url,
+            "idle_timeout": self.idle_timeout,
+            "python": self.python,
+        }
+
+    @classmethod
+    def from_json(cls, payload: Any) -> DaemonState | None:
+        if not isinstance(payload, Mapping):
+            return None
+        try:
+            pid = int(payload["pid"])
+            port = int(payload["port"])
+            token = str(payload["token"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if pid <= 0 or not 0 < port < 65536 or not token:
+            return None
+        try:
+            protocol = int(payload.get("protocol", PROTOCOL_VERSION))
+        except (TypeError, ValueError):
+            return None
+        try:
+            started = float(payload.get("started") or 0.0)
+        except (TypeError, ValueError):
+            started = 0.0
+        try:
+            idle_timeout = float(payload.get("idle_timeout") or DEFAULT_IDLE_TIMEOUT)
+        except (TypeError, ValueError):
+            idle_timeout = DEFAULT_IDLE_TIMEOUT
+        return cls(
+            pid=pid,
+            port=port,
+            token=token,
+            host=str(payload.get("host") or "127.0.0.1"),
+            started=started,
+            protocol=protocol,
+            api_version=str(payload.get("api_version") or ""),
+            base_url=str(payload.get("base_url") or DEFAULT_BASE_URL),
+            idle_timeout=idle_timeout,
+            python=str(payload.get("python") or ""),
+        )
+
+    def write(self, path: Path) -> None:
+        _write_private_json(path, self.to_json())
+
+    @classmethod
+    def read(cls, path: Path) -> DaemonState | None:
+        try:
+            raw = path.read_text(encoding="utf-8")
+            return cls.from_json(json.loads(raw))
+        except (OSError, ValueError, TypeError):
+            return None
+
+
+def _write_private_json(path: Path, payload: Any) -> None:
+    """Atomically write ``payload`` so only the current user can read it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+
+
+# --------------------------------------------------------------------------- #
+# Wire protocol (newline-delimited JSON over loopback TCP)
+# --------------------------------------------------------------------------- #
+
+
+def _send(sock: socket.socket, payload: Mapping[str, Any]) -> None:
+    sock.sendall(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
+
+
+def _read_message(reader: Any, timeout: float) -> dict[str, Any]:
+    """Read one JSON object; raises :class:`WarmDaemonUnavailable` on EOF."""
+    try:
+        line = reader.readline()
+    except (socket.timeout, TimeoutError) as exc:
+        raise WarmDaemonUnavailable("warm daemon did not answer in time") from exc
+    except OSError as exc:
+        raise WarmDaemonUnavailable(f"warm daemon connection failed: {exc}") from exc
+    if not line:
+        raise WarmDaemonUnavailable("warm daemon closed the connection")
+    try:
+        message = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WarmDaemonUnavailable("warm daemon sent a malformed frame") from exc
+    if not isinstance(message, dict):
+        raise WarmDaemonUnavailable("warm daemon sent a malformed frame")
+    return message
+
+
+def _open(
+    state: DaemonState, *, timeout: float, handshake_timeout: float | None = None
+) -> tuple[socket.socket, Any]:
+    handshake = handshake_timeout if handshake_timeout is not None else timeout
+    try:
+        sock = socket.create_connection((state.host, state.port), timeout=handshake)
+    except OSError as exc:
+        raise WarmDaemonUnavailable(f"cannot reach {state.host}:{state.port}: {exc}") from exc
+    reader = sock.makefile("rb")
+    try:
+        _send(
+            sock,
+            {
+                "op": "hello",
+                "token": state.token,
+                "protocol": PROTOCOL_VERSION,
+                "version": api_version(),
+            },
+        )
+        reply = _read_message(reader, handshake)
+        if reply.get("type") != "hello":
+            message = str(reply.get("message") or reply.get("type") or "handshake failed")
+            raise WarmDaemonUnavailable(message)
+        sock.settimeout(timeout)
+        return sock, reader
+    except BaseException:
+        with contextlib.suppress(Exception):
+            reader.close()
+        with contextlib.suppress(Exception):
+            sock.close()
+        raise
+
+
+def ping(state: DaemonState, *, timeout: float = 1.0) -> bool:
+    """``True`` when the daemon answers on its published port."""
+    try:
+        sock, reader = _open(state, timeout=timeout, handshake_timeout=timeout)
+    except WarmDaemonUnavailable:
+        return False
+    try:
+        _send(sock, {"op": "ping"})
+        return _read_message(reader, timeout).get("type") == "pong"
+    except (WarmDaemonUnavailable, OSError):
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            reader.close()
+        with contextlib.suppress(Exception):
+            sock.close()
+
+
+def describe_daemon(
+    state_path_value: str | Path | None = None, *, timeout: float = 2.0
+) -> dict[str, Any] | None:
+    """Return the daemon's own status payload, or ``None`` when it is not up."""
+    path = state_path(state_path_value)
+    state = DaemonState.read(path)
+    if state is None:
+        return None
+    try:
+        sock, reader = _open(state, timeout=timeout, handshake_timeout=timeout)
+    except WarmDaemonUnavailable:
+        return None
+    try:
+        _send(sock, {"op": "status"})
+        reply = _read_message(reader, timeout)
+        if reply.get("type") != "status":
+            return None
+        reply.setdefault("pid", state.pid)
+        reply.setdefault("state_file", str(path))
+        return reply
+    except (WarmDaemonUnavailable, OSError):
+        return None
+    finally:
+        with contextlib.suppress(Exception):
+            reader.close()
+        with contextlib.suppress(Exception):
+            sock.close()
+
+
+def ask_stream(
+    prompt: str,
+    *,
+    state: DaemonState,
+    model: str | None = None,
+    timeout: float = DEFAULT_ASK_TIMEOUT,
+) -> Generator[str, None, None]:
+    """Yield answer deltas for ``prompt`` from the warm daemon.
+
+    The connection is opened eagerly, so a dead daemon surfaces as
+    :class:`WarmDaemonUnavailable` on the first :func:`next` call — before the
+    caller has printed anything and can still fall back cleanly.
+    """
+    sock, reader = _open(state, timeout=timeout, handshake_timeout=min(timeout, 10.0))
+    finished = False
+    try:
+        _send(sock, {"op": "ask", "prompt": prompt, "model": model})
+        while True:
+            message = _read_message(reader, timeout)
+            kind = message.get("type")
+            if kind == "delta":
+                text = message.get("text")
+                if isinstance(text, str) and text:
+                    yield text
+            elif kind == "done":
+                finished = True
+                return
+            elif kind == "start":
+                continue
+            elif kind == "error":
+                raise error_from_frame(message)
+            else:
+                raise WarmDaemonUnavailable(
+                    f"unexpected frame {kind!r} from the warm daemon"
+                )
+    finally:
+        if not finished:
+            # Let the daemon stop generating as soon as the caller walks away.
+            with contextlib.suppress(Exception):
+                _send(sock, {"op": "cancel"})
+        with contextlib.suppress(Exception):
+            reader.close()
+        with contextlib.suppress(Exception):
+            sock.close()
+
+
+def error_from_frame(message: Mapping[str, Any]) -> BaseException:
+    """Map a daemon ``error`` frame onto the library's exception type."""
+    detail = str(message.get("message") or "warm daemon error")
+    kind = str(message.get("kind") or "")
+    try:
+        from .exceptions import (
+            ArenaError,
+            AuthenticationError,
+            ChallengeRequiredError,
+            ModelUnavailableError,
+            ProtocolError,
+            QueueTimeoutError,
+            RateLimitError,
+        )
+    except Exception:  # noqa: BLE001 - keep the daemon self-contained
+        return WarmDaemonUnavailable(detail)
+    mapping: dict[str, type[Exception]] = {
+        "auth": AuthenticationError,
+        "challenge": ChallengeRequiredError,
+        "protocol": ProtocolError,
+        "rate_limit": RateLimitError,
+        "timeout": QueueTimeoutError,
+        "model": ModelUnavailableError,
+        "usage": WarmDaemonUnavailable,
+    }
+    return mapping.get(kind, ArenaError)(detail)
+
+
+def error_kind(exc: BaseException) -> str:
+    """Classify an exception for the wire (``error_from_frame`` reverses it)."""
+    try:
+        from .exceptions import (
+            AuthenticationError,
+            ChallengeRequiredError,
+            ModelUnavailableError,
+            ProtocolError,
+            QueueTimeoutError,
+            RateLimitError,
+        )
+    except Exception:  # noqa: BLE001
+        return "other"
+    if isinstance(exc, AuthenticationError):
+        return "auth"
+    if isinstance(exc, ChallengeRequiredError):
+        return "challenge"
+    if isinstance(exc, RateLimitError):
+        return "rate_limit"
+    if isinstance(exc, QueueTimeoutError):
+        return "timeout"
+    if isinstance(exc, ModelUnavailableError):
+        return "model"
+    if isinstance(exc, ProtocolError):
+        return "protocol"
+    if isinstance(exc, UsageError):
+        return "usage"
+    return "other"
+
+
+class UsageError(RuntimeError):
+    """The daemon could not make sense of the arguments it was given."""
+
+
+# --------------------------------------------------------------------------- #
+# Starting, stopping and reusing the daemon
+# --------------------------------------------------------------------------- #
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _options_path(path: Path) -> Path:
+    return path.with_name(path.name + ".options.json")
+
+
+def _log_path(path: Path) -> Path:
+    return path.with_name(path.name + ".log")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check; ``False`` means "do not trust the state"."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # os.kill(pid, 0) terminates the process on Windows -- never call it.
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def _spawn_lock(path: Path, *, stale_after: float) -> Iterator[bool]:
+    """Serialise first starts so two parallel CLI calls launch one browser."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age > stale_after:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        yield False
+        return
+    try:
+        with contextlib.suppress(OSError):
+            os.write(fd, str(os.getpid()).encode("ascii"))
+        yield True
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def _child_env() -> dict[str, str]:
+    env = dict(os.environ)
+    root = str(Path(__file__).resolve().parent.parent)
+    existing = env.get("PYTHONPATH")
+    parts = [root]
+    if existing:
+        parts.extend(part for part in existing.split(os.pathsep) if part)
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(parts))
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
+
+
+def spawn_daemon(
+    *,
+    state_file: Path,
+    payload: Mapping[str, Any],
+    idle_timeout: float,
+) -> subprocess.Popen[bytes]:
+    """Launch ``python -m arena_api.warm`` detached from this process."""
+    options_file = _options_path(state_file)
+    _write_private_json(options_file, payload)
+    log_file = _log_path(state_file)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "arena_api.warm",
+        "--state",
+        str(state_file),
+        "--options-file",
+        str(options_file),
+        "--idle-timeout",
+        repr(float(idle_timeout)),
+    ]
+    handle = open(log_file, "ab", buffering=0)  # noqa: SIM115 - handed to the child
+    kwargs: dict[str, Any] = {
+        "cwd": os.getcwd(),
+        "env": _child_env(),
+        "stdin": subprocess.DEVNULL,
+        "stdout": handle,
+        "stderr": handle,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        creationflags = 0
+        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+            creationflags |= int(getattr(subprocess, name, 0))
+        kwargs["creationflags"] = creationflags
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        return subprocess.Popen(command, **kwargs)  # noqa: S603 - fixed argv
+    finally:
+        handle.close()
+
+
+def _compatible(state: DaemonState, *, base_url: str) -> bool:
+    return (
+        state.protocol == PROTOCOL_VERSION
+        and state.api_version == api_version()
+        and (not base_url or state.base_url == base_url)
+    )
+
+
+def _tail(path: Path, limit: int = 800) -> str:
+    try:
+        data = path.read_bytes()[-limit:]
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace").strip()
+
+
+def ensure_daemon(
+    *,
+    payload: Mapping[str, Any],
+    base_url: str = DEFAULT_BASE_URL,
+    state_file: str | Path | None = None,
+    idle_timeout: float | None = None,
+    start_timeout: float | None = None,
+) -> DaemonState:
+    """Return a reachable daemon, starting one when necessary.
+
+    ``payload`` is forwarded to the daemon verbatim (the current CLI
+    arguments), so the daemon builds its options with the very same parser the
+    caller would have used.
+    """
+    path = state_path(state_file)
+    idle = _idle_timeout(idle_timeout)
+    budget = _start_timeout(start_timeout)
+
+    current = DaemonState.read(path)
+    if current is not None:
+        if _compatible(current, base_url=base_url) and ping(current):
+            latency.mark("warm.reuse")
+            return current
+        if current.pid and _pid_alive(current.pid):
+            # Something answered with incompatible settings: retire it.
+            with contextlib.suppress(WarmDaemonUnavailable):
+                stop_daemon(path, timeout=5.0)
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+    deadline = time.monotonic() + budget
+    spawned: subprocess.Popen[bytes] | None = None
+    while time.monotonic() < deadline:
+        candidate = DaemonState.read(path)
+        if candidate is not None and _compatible(candidate, base_url=base_url):
+            if ping(candidate):
+                latency.mark("warm.started")
+                return candidate
+        if spawned is not None and spawned.poll() is not None:
+            detail = _tail(_log_path(path))
+            suffix = f": {detail.splitlines()[-1]}" if detail else ""
+            with contextlib.suppress(OSError):
+                _options_path(path).unlink()
+            raise WarmDaemonUnavailable(
+                f"the warm daemon exited with code {spawned.returncode}{suffix}"
+            )
+        if spawned is None:
+            with _spawn_lock(_lock_path(path), stale_after=budget) as won:
+                if won:
+                    # Re-check under the lock: a parallel caller may have won.
+                    candidate = DaemonState.read(path)
+                    if candidate is not None and ping(candidate):
+                        return candidate
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                    spawned = spawn_daemon(
+                        state_file=path, payload=payload, idle_timeout=idle
+                    )
+        time.sleep(0.03)
+    detail = _tail(_log_path(path))
+    suffix = f" (log: {detail.splitlines()[-1]})" if detail else ""
+    raise WarmDaemonUnavailable(
+        f"the warm daemon did not become ready in {budget:g}s{suffix}"
+    )
+
+
+def _close_quietly(reader: Any, sock: socket.socket) -> None:
+    with contextlib.suppress(Exception):
+        reader.close()
+    with contextlib.suppress(Exception):
+        sock.close()
+
+
+def stop_daemon(
+    state_file: str | Path | None = None, *, timeout: float = 10.0
+) -> bool:
+    """Ask the daemon to shut down; ``True`` when one was running."""
+    path = state_path(state_file)
+    state = DaemonState.read(path)
+    stopped = False
+    if state is not None:
+        try:
+            sock, reader = _open(state, timeout=2.0, handshake_timeout=2.0)
+        except WarmDaemonUnavailable:
+            sock = None
+        if sock is not None:
+            try:
+                _send(sock, {"op": "shutdown"})
+                _read_message(reader, 2.0)
+                stopped = True
+            except (WarmDaemonUnavailable, OSError):
+                stopped = True
+            finally:
+                _close_quietly(reader, sock)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and _pid_alive(state.pid) and ping(state, timeout=0.2):
+            time.sleep(0.05)
+    for path_to_remove in (
+        path,
+        _options_path(path),
+        _lock_path(path),
+    ):
+        with contextlib.suppress(OSError):
+            path_to_remove.unlink()
+    return stopped
+
+
+# --------------------------------------------------------------------------- #
+# Daemon: a browser kept warm by a local session wrapper
+# --------------------------------------------------------------------------- #
+
+
+class WarmSession:
+    """Owns one warm :class:`AsyncDirectArenaClient` and serialises prompts."""
+
+    def __init__(self, options: Any) -> None:
+        self.options = options
+        self._client: Any | None = None
+        self._lock = asyncio.Lock()
+        self._last_error: str | None = None
+
+    async def _client_or_create(self) -> Any:
+        if self._client is not None:
+            return self._client
+        from .auto import auto_async_direct_client
+
+        with latency.span("warm.session.open"):
+            client = await auto_async_direct_client(
+                self.options, verification_token="auto", prewarm=True
+            )
+        self._client = client
+        return client
+
+    async def prepare(self) -> None:
+        """Start the browser before the first prompt arrives."""
+        async with self._lock:
+            with contextlib.suppress(Exception):
+                await self._client_or_create()
+
+    async def _reset(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+    async def ask(self, prompt: str, model: str | None = None) -> AsyncIterator[str]:
+        from .exceptions import ArenaError, AuthenticationError, ChallengeRequiredError
+
+        async with self._lock:
+            for attempt in range(2):
+                try:
+                    client = await self._client_or_create()
+                    with latency.span("warm.ask"):
+                        async for chunk in client.astream(prompt, model=model):
+                            if chunk.delta:
+                                yield chunk.delta
+                    self._last_error = None
+                    return
+                except (AuthenticationError, ChallengeRequiredError) as exc:
+                    self._last_error = str(exc)
+                    await self._reset()
+                    if attempt:
+                        raise
+                except ArenaError:
+                    raise
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "warm": self._client is not None,
+            "last_error": self._last_error,
+        }
+
+    async def aclose(self) -> None:
+        await self._reset()
+
+
+class _WarmServer:
+    """Loopback JSON-lines server around a *session* object.
+
+    ``session`` only needs ``ask(prompt, model)`` (an async iterator),
+    ``aclose()``, and optionally ``prepare()``/``describe()``; the tests pass a
+    fake, the daemon passes :class:`WarmSession`.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        *,
+        state_file: Path,
+        token: str,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        base_url: str = DEFAULT_BASE_URL,
+        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+    ) -> None:
+        self.session = session
+        self.state_file = state_file
+        self.token = token
+        self.host = host
+        self.port = port
+        self.base_url = base_url
+        self.idle_timeout = idle_timeout
+        self._server: asyncio.AbstractServer | None = None
+        self._stop = asyncio.Event()
+        self._active = 0
+        self._answered = 0
+        self._last_activity = time.monotonic()
+        self._background: set[asyncio.Task[Any]] = set()
+        self._closed = False
+        self._started = time.time()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    # -- lifecycle --------------------------------------------------------- #
+
+    async def start(self) -> DaemonState:
+        self._loop = asyncio.get_running_loop()
+        self._server = await asyncio.start_server(
+            self._handle,
+            self.host,
+            self.port,
+            reuse_address=os.name != "nt",
+        )
+        sockets = self._server.sockets or ()
+        if sockets:
+            self.port = int(sockets[0].getsockname()[1])
+        state = DaemonState(
+            pid=os.getpid(),
+            port=self.port,
+            token=self.token,
+            host=self.host,
+            started=time.time(),
+            protocol=PROTOCOL_VERSION,
+            api_version=api_version(),
+            base_url=self.base_url,
+            idle_timeout=self.idle_timeout,
+            python=sys.executable,
+        )
+        state.write(self.state_file)
+        self._spawn(self._watchdog())
+        prepare = getattr(self.session, "prepare", None)
+        if callable(prepare):
+            self._spawn(self._prepare(prepare))
+        return state
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.ensure_future(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _prepare(self, prepare: Any) -> None:
+        try:
+            await prepare()
+        except Exception as exc:  # noqa: BLE001 - surfaced on the first prompt
+            log(f"warm browser pre-start failed: {exc}")
+
+    def request_stop(self) -> None:
+        """Ask the server to stop; safe from any thread or signal handler."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(self._stop.set)
+                return
+            except RuntimeError:  # pragma: no cover - loop already closing
+                pass
+        self._stop.set()
+
+    async def run(self) -> None:
+        if self._server is None:
+            await self.start()
+        try:
+            await self._stop.wait()
+        finally:
+            await self._shutdown()
+
+    async def _shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        if self._server is not None:
+            self._server.close()
+            with contextlib.suppress(Exception):
+                await self._server.wait_closed()
+            self._server = None
+        for task in list(self._background):
+            task.cancel()
+        for task in list(self._background):
+            with contextlib.suppress(BaseException):
+                await task
+        self._background.clear()
+        with contextlib.suppress(OSError):
+            self.state_file.unlink()
+        with contextlib.suppress(OSError):
+            _options_path(self.state_file).unlink()
+        with contextlib.suppress(Exception):
+            await self.session.aclose()
+
+    async def _watchdog(self) -> None:
+        interval = max(1.0, min(30.0, self.idle_timeout / 4.0))
+        while not self._stop.is_set():
+            await asyncio.sleep(interval)
+            if self._active:
+                continue
+            if time.monotonic() - self._last_activity >= self.idle_timeout:
+                log(f"idle for {self.idle_timeout:g}s, shutting down")
+                self._stop.set()
+                return
+
+    # -- connection handling ---------------------------------------------- #
+
+    def _touch(self) -> None:
+        self._last_activity = time.monotonic()
+
+    async def _write(self, writer: asyncio.StreamWriter, payload: Mapping[str, Any]) -> None:
+        writer.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
+        await writer.drain()
+
+    async def _handle(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            await self._dispatch(reader, writer)
+        except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
+            pass
+        except Exception as exc:  # noqa: BLE001 - one bad client must not stop us
+            log(f"connection failed: {exc}")
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
+
+    async def _dispatch(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        line = await reader.readline()
+        if not line:
+            return
+        try:
+            hello = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            await self._write(
+                writer, {"type": "error", "kind": "protocol", "message": "bad handshake"}
+            )
+            return
+        if not isinstance(hello, Mapping) or hello.get("op") != "hello":
+            await self._write(
+                writer, {"type": "error", "kind": "protocol", "message": "bad handshake"}
+            )
+            return
+        token = str(hello.get("token") or "")
+        if not hmac.compare_digest(token, self.token):
+            await self._write(
+                writer, {"type": "error", "kind": "auth", "message": "invalid daemon token"}
+            )
+            return
+        self._touch()
+        await self._write(
+            writer,
+            {
+                "type": "hello",
+                "pid": os.getpid(),
+                "protocol": PROTOCOL_VERSION,
+                "version": api_version(),
+                "base_url": self.base_url,
+            },
+        )
+        while True:
+            line = await reader.readline()
+            if not line:
+                return
+            try:
+                message = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                await self._write(
+                    writer,
+                    {"type": "error", "kind": "protocol", "message": "malformed frame"},
+                )
+                continue
+            if not isinstance(message, Mapping):
+                continue
+            self._touch()
+            op = message.get("op")
+            if op == "ping":
+                await self._write(writer, {"type": "pong"})
+            elif op == "status":
+                await self._write(writer, self._status_payload())
+            elif op == "shutdown":
+                await self._write(writer, {"type": "bye"})
+                self._stop.set()
+                return
+            elif op == "ask":
+                if not await self._ask(message, writer):
+                    return
+            elif op == "cancel":
+                continue
+            else:
+                await self._write(
+                    writer,
+                    {
+                        "type": "error",
+                        "kind": "protocol",
+                        "message": f"unknown op {op!r}",
+                    },
+                )
+
+    def _status_payload(self) -> dict[str, Any]:
+        describe = getattr(self.session, "describe", None)
+        detail: dict[str, Any] = {}
+        if callable(describe):
+            with contextlib.suppress(Exception):
+                detail = dict(describe() or {})
+        payload: dict[str, Any] = {
+            "type": "status",
+            "pid": os.getpid(),
+            "port": self.port,
+            "protocol": PROTOCOL_VERSION,
+            "version": api_version(),
+            "base_url": self.base_url,
+            "idle_timeout": self.idle_timeout,
+            "idle_for": round(time.monotonic() - self._last_activity, 1),
+            "active": self._active,
+            "started": self._started,
+        }
+        payload.update(detail)
+        return payload
+
+    async def _ask(
+        self, message: Mapping[str, Any], writer: asyncio.StreamWriter
+    ) -> bool:
+        prompt = message.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            await self._write(
+                writer,
+                {"type": "error", "kind": "usage", "message": "empty prompt"},
+            )
+            return True
+        model = message.get("model")
+        model_value = model if isinstance(model, str) and model else None
+        self._active += 1
+        stream = self.session.ask(prompt, model_value)
+        try:
+            await self._write(writer, {"type": "start"})
+            pieces: list[str] = []
+            with latency.span("warm.stream"):
+                async for delta in stream:
+                    if not delta:
+                        continue
+                    pieces.append(delta)
+                    await self._write(writer, {"type": "delta", "text": delta})
+            await self._write(writer, {"type": "done", "text": "".join(pieces)})
+            self._answered += 1
+            return True
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller
+            detail = str(exc) or type(exc).__name__
+            kind = error_kind(exc)
+            with contextlib.suppress(Exception):
+                await self._write(
+                    writer,
+                    {"type": "error", "kind": kind, "message": detail},
+                )
+            if kind == "auth" and not self._answered:
+                # Nothing ever worked with this session: do not linger for the
+                # whole idle timeout with a browser nobody can use.  The caller
+                # now falls back to the ordinary path, which explains why.
+                log(f"first prompt failed with {detail}; shutting down")
+                self.request_stop()
+            return True
+        finally:
+            close = getattr(stream, "aclose", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    await close()
+            self._active -= 1
+            self._touch()
+
+
+# --------------------------------------------------------------------------- #
+# Daemon entry point: python -m arena_api.warm
+# --------------------------------------------------------------------------- #
+
+
+def _options_from_payload(payload: Mapping[str, Any]) -> Any:
+    """Rebuild the CLI's own :class:`AutoOptions` from the forwarded arguments."""
+    from .auto import _options_from_args, build_arg_parser
+
+    argv = payload.get("argv") or []
+    if not isinstance(argv, Sequence):
+        raise UsageError("argv must be a list")
+    parser = build_arg_parser()
+    try:
+        namespace = parser.parse_args([str(item) for item in argv])
+    except SystemExit as exc:
+        raise UsageError("invalid command line forwarded to the warm daemon") from exc
+    options = _options_from_args(namespace)
+    # A daemon cannot ask a human for anything, and the verification probe only
+    # delays the first prompt: the request itself reports a rejected session.
+    return replace(options, interactive=False, verify=False)
+
+
+async def _serve(
+    options: Any,
+    *,
+    state_file: Path,
+    idle_timeout: float,
+    host: str,
+    port: int,
+) -> int:
+    session = WarmSession(options)
+    server = _WarmServer(
+        session,
+        state_file=state_file,
+        token=secrets.token_hex(32),
+        host=host,
+        port=port,
+        base_url=str(options.base_url),
+        idle_timeout=idle_timeout,
+    )
+    loop = asyncio.get_running_loop()
+    installed: list[int] = []
+    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(sig, server.request_stop)
+            installed.append(sig)
+    try:
+        await server.run()
+    finally:
+        for sig in installed:
+            with contextlib.suppress(Exception):
+                loop.remove_signal_handler(sig)
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """``python -m arena_api.warm``: the daemon process itself."""
+    parser = argparse.ArgumentParser(
+        prog="python -m arena_api.warm",
+        description=(
+            "Keep a Direct Chat browser warm for one-shot arena-api calls. "
+            "Started automatically; run `arena-api --warm-stop` to stop it."
+        ),
+    )
+    parser.add_argument("--state", default=None, help="state file to publish")
+    parser.add_argument("--options-file", default=None, help="JSON with the CLI arguments")
+    parser.add_argument("--idle-timeout", type=float, default=None)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=0)
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    payload: dict[str, Any] = {}
+    if args.options_file:
+        try:
+            payload = json.loads(Path(args.options_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log(f"cannot read {args.options_file}: {exc}")
+            return 2
+    try:
+        options = _options_from_payload(payload)
+    except UsageError as exc:
+        log(str(exc))
+        return 2
+    finally:
+        if args.options_file:
+            # The forwarded command line may carry a cookie header; once it is
+            # parsed there is no reason to keep it on disk.
+            with contextlib.suppress(OSError):
+                Path(args.options_file).unlink()
+    path = state_path(args.state)
+    idle = _idle_timeout(args.idle_timeout)
+    latency.reset()
+    log(
+        f"aiming at {options.base_url}; idle timeout {idle:g}s; "
+        f"state {path}"
+    )
+    try:
+        return asyncio.run(
+            _serve(
+                options,
+                state_file=path,
+                idle_timeout=idle,
+                host=args.host,
+                port=args.port,
+            )
+        )
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        for leftover in (path, _options_path(path)):
+            with contextlib.suppress(OSError):
+                leftover.unlink()
+
+
+# --------------------------------------------------------------------------- #
+# Lightweight CLI front-end
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _WarmArgs:
+    prompt: str | None = None
+    model: str | None = None
+    rest: list[str] = field(default_factory=list)
+    base_url: str = DEFAULT_BASE_URL
+    state_file: str | None = None
+    idle_timeout: float | None = None
+    start_timeout: float | None = None
+    force: bool | None = None
+    usable: bool = True
+
+
+def scan_argv(argv: Sequence[str]) -> _WarmArgs:
+    """Split the warm-relevant flags off a one-shot ``--prompt`` command line.
+
+    Everything else is forwarded to the daemon unchanged, which rebuilds
+    :class:`AutoOptions` with the real CLI parser — one source of truth for
+    flag semantics.
+    """
+    parsed = _WarmArgs()
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            parsed.usable = False
+            return parsed
+        if arg == "--prompt":
+            parsed.prompt = argv[index + 1] if index + 1 < len(argv) else ""
+            index += 2
+            continue
+        if arg.startswith("--prompt="):
+            parsed.prompt = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg == "--model":
+            parsed.model = argv[index + 1] if index + 1 < len(argv) else None
+            index += 2
+            continue
+        if arg.startswith("--model="):
+            parsed.model = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg in ("--warm", "--no-warm"):
+            parsed.force = arg == "--warm"
+            index += 1
+            continue
+        if arg in ("--warm-idle", "--warm-timeout", "--warm-state"):
+            value = argv[index + 1] if index + 1 < len(argv) else None
+            _store_warm_option(parsed, arg, value)
+            index += 2
+            continue
+        if arg.startswith(("--warm-idle=", "--warm-timeout=", "--warm-state=")):
+            name, value = arg.split("=", 1)
+            _store_warm_option(parsed, name, value)
+            index += 1
+            continue
+        if arg in ("--base-url", "--verification-token"):
+            value = argv[index + 1] if index + 1 < len(argv) else None
+            if arg == "--base-url" and value:
+                parsed.base_url = value
+            if arg == "--verification-token" and value not in (None, "", "auto"):
+                # A caller-supplied assertion cannot be reproduced by the
+                # daemon, which mints its own: use the regular path.
+                parsed.usable = False
+            parsed.rest.extend([arg, value] if value is not None else [arg])
+            index += 2
+            continue
+        if arg.startswith("--verification-token="):
+            value = arg.split("=", 1)[1]
+            if value not in ("", "auto"):
+                parsed.usable = False
+            parsed.rest.append(arg)
+            index += 1
+            continue
+        if arg.startswith("--base-url="):
+            parsed.base_url = arg.split("=", 1)[1]
+            parsed.rest.append(arg)
+            index += 1
+            continue
+        parsed.rest.append(arg)
+        index += 1
+    if parsed.model is not None and parsed.model.strip().lower() == "auto":
+        parsed.model = None
+    return parsed
+
+
+def _store_warm_option(parsed: _WarmArgs, name: str, value: str | None) -> None:
+    if value is None:
+        parsed.usable = False
+        return
+    if name == "--warm-state":
+        parsed.state_file = value
+        return
+    try:
+        number = float(value)
+    except ValueError:
+        parsed.usable = False
+        return
+    if name == "--warm-idle":
+        parsed.idle_timeout = number
+    else:
+        parsed.start_timeout = number
+
+
+def _stdout_write(text: str) -> None:
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        encoding = str(getattr(sys.stdout, "encoding", "") or "utf-8") or "utf-8"
+        sys.stdout.write(text.encode(encoding, errors="replace").decode(encoding))
+    sys.stdout.flush()
+
+
+def _payload_for(parsed: _WarmArgs) -> dict[str, Any]:
+    return {"argv": parsed.rest, "base_url": parsed.base_url}
+
+
+def _ensure_for_cli(parsed: _WarmArgs) -> DaemonState | None:
+    try:
+        return ensure_daemon(
+            payload=_payload_for(parsed),
+            base_url=parsed.base_url,
+            state_file=parsed.state_file,
+            idle_timeout=parsed.idle_timeout,
+            start_timeout=parsed.start_timeout,
+        )
+    except WarmDaemonUnavailable as exc:
+        _mark_skipped()
+        log(f"warm daemon unavailable ({exc}); using the one-shot path")
+        return None
+
+
+def _stop_if_running(parsed: _WarmArgs) -> None:
+    """Retire the daemon so it cannot hold the shared browser profile."""
+    if DaemonState.read(state_path(parsed.state_file)) is None:
+        return
+    with contextlib.suppress(Exception):
+        stop_daemon(parsed.state_file)
+
+
+def fast_prompt_main(argv: Sequence[str]) -> int | None:
+    """Answer ``--prompt`` through the daemon; ``None`` means "fall back".
+
+    Returning ``None`` is always safe: the caller then runs the ordinary
+    in-process path, which is what every version before the daemon did.
+    """
+    parsed = scan_argv(argv)
+    if parsed.force is False:
+        # The daemon keeps the Direct Chat Chromium profile open; a second
+        # browser on the same profile cannot start.  ``--no-warm`` therefore
+        # retires it instead of failing on the lock.
+        _stop_if_running(parsed)
+        return None
+    if not parsed.usable or not parsed.prompt:
+        return None
+    if parsed.force is not True and not warm_enabled():
+        return None
+    if parsed.force is not True and supplied_verification_token():
+        return None
+    state = _ensure_for_cli(parsed)
+    if state is None:
+        return None
+    latency.mark("cli.warm.ready")
+    try:
+        stream = ask_stream(parsed.prompt, state=state, model=parsed.model)
+        try:
+            first = next(stream)
+        except StopIteration:
+            first = ""
+        except (WarmDaemonUnavailable, AuthenticationError) as exc:
+            # A rejected/absent session is reported much better by the ordinary
+            # path (it lists every cookie source it checked), and nothing has
+            # been printed yet, so hand the request over.
+            _mark_skipped()
+            if isinstance(exc, AuthenticationError):
+                reason = "no usable session"
+            else:
+                reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            log(f"warm daemon could not start the answer ({reason}); using the one-shot path")
+            stream.close()
+            return None
+        latency.mark("cli.first_delta")
+        if parsed.model:
+            print(f"model             : {parsed.model}")
+        sys.stdout.write("answer            : ")
+        sys.stdout.flush()
+        _stdout_write(first)
+        for delta in stream:
+            _stdout_write(delta)
+        print()
+        latency.mark("cli.done")
+        return 0
+    except WarmDaemonUnavailable as exc:
+        _mark_skipped()
+        log(f"warm daemon went away ({exc}); using the one-shot path")
+        return None
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:  # noqa: BLE001 - same contract as arena_api.auto.main
+        print(f"[arena-api] {exc}", file=sys.stderr)
+        return 1
+
+
+def stop_main(argv: Sequence[str]) -> int:
+    """``--warm-stop``: shut the daemon down and report what happened."""
+    parsed = scan_argv(list(argv))
+    stopped = stop_daemon(parsed.state_file)
+    path = state_path(parsed.state_file)
+    if stopped:
+        print(f"warm daemon       : stopped ({path})")
+        return 0
+    print(f"warm daemon       : not running ({path})")
+    return 0
+
+
+def status_main(argv: Sequence[str]) -> int:
+    """``--warm-status``: print where the daemon is and how warm it is."""
+    parsed = scan_argv(list(argv))
+    path = state_path(parsed.state_file)
+    info = describe_daemon(parsed.state_file)
+    if info is None:
+        print(f"warm daemon       : not running ({path})")
+        return 1
+    print(f"warm daemon       : running (pid {info.get('pid')}, port {info.get('port')})")
+    print(f"state file        : {path}")
+    print(f"browser warmed    : {'yes' if info.get('warm') else 'starting'}")
+    print(f"idle for          : {info.get('idle_for')}s (timeout {info.get('idle_timeout')}s)")
+    print(f"active prompts    : {info.get('active')}")
+    print(f"base url          : {info.get('base_url')}")
+    if info.get("last_error"):
+        print(f"last error        : {info['last_error']}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - `python -m arena_api.warm`
+    raise SystemExit(main())

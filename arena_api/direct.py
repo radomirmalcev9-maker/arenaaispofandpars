@@ -28,6 +28,7 @@ from .constants import (
     DIRECT_STREAM_PATH,
 )
 from .exceptions import ModelUnavailableError, ProtocolError, QueueTimeoutError
+from .latency import mark as _latency_mark
 from .auth.firefox_session import SessionManager
 from .models import GenerationConfig, Message, ModelInfo, StreamChunk
 from .transport import (
@@ -832,6 +833,7 @@ class DirectArenaClient(_DirectMixin):
             custom_http_transport=self.transport._custom_http_transport,
         )
         explicit_model_id: str | None = None
+        _latency_mark("direct.stream.begin")
         if model is not None:
             # Supplying the UUID itself is the zero-request fast path.  Names
             # still need the catalog for their public-name -> UUID mapping.
@@ -839,6 +841,7 @@ class DirectArenaClient(_DirectMixin):
                 explicit_model_id = self._resolve_model(model, self._models or [])
             else:
                 explicit_model_id = self._resolve_model(model, self.get_models())
+            _latency_mark("direct.model")
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
             self.conversation_id = chat_id
@@ -877,6 +880,7 @@ class DirectArenaClient(_DirectMixin):
                 for kind, value in _iter_wire_records(
                     wire_chunks, content_type=content_type
                 ):
+                    _latency_mark("direct.wire")
                     if time.monotonic() >= stream_deadline:
                         raise QueueTimeoutError(
                             "Direct Chat stream exceeded its configured timeout."

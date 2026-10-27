@@ -27,7 +27,7 @@ dependencies = ["httpx[http2]>=0.27,<1"]
 
 [project.scripts]
 # The zero-configuration bootstrap CLI: `arena-api --explain`, `arena-api --status`.
-arena-api = "arena_api.auto:main"
+arena-api = "arena_api._cli:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "tomli>=2; python_version < '3.11'"]

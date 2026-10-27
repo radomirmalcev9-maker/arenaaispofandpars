@@ -106,6 +106,11 @@ if TYPE_CHECKING:
         StreamChunk,
     )
     from .session import AsyncChatSession, ChatSession
+    from .warm import (
+        describe_daemon,
+        stop_daemon,
+        warm_enabled,
+    )
     from .transport import (
         IMPERSONATE_EXTRA,
         ArenaTransport,
@@ -203,6 +208,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "impersonation_profile": (".auto", "impersonation_profile"),
     "interactive_login": (".auto", "interactive_login"),
     "profile_for_source": (".auto", "profile_for_source"),
+    # .warm
+    "describe_daemon": (".warm", "describe_daemon"),
+    "stop_daemon": (".warm", "stop_daemon"),
+    "warm_enabled": (".warm", "warm_enabled"),
 }
 
 _SUBMODULES: frozenset[str] = frozenset(
@@ -215,6 +224,7 @@ _SUBMODULES: frozenset[str] = frozenset(
         "models",
         "session",
         "transport",
+        "warm",
     }
 )
 
@@ -310,6 +320,7 @@ __all__ = [
     "auto_direct_client",
     "alogin_and_save",
     "build_init_script",
+    "describe_daemon",
     "discover_session",
     "interactive_login",
     "inspect_page",
@@ -317,4 +328,6 @@ __all__ = [
     "login_and_save",
     "normalize_cookies",
     "parse_cookie_header",
+    "stop_daemon",
+    "warm_enabled",
 ]
