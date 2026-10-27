@@ -86,11 +86,22 @@ def version_report() -> list[str]:
         if _has_anthropic_shim()
         else "no -- this build predates --claude, upgrade it"
     )
+    try:
+        from .auto import AutoOptions
+
+        sessions = (
+            "yes (--session firefox, firefox:<profile>, storage, chrome, auto)"
+            if "session_source" in getattr(AutoOptions, "__dataclass_fields__", {})
+            else "NOT supported, upgrade the package"
+        )
+    except Exception as exc:  # noqa: BLE001 - a broken install is the answer
+        sessions = f"cannot import arena_api.auto: {exc}"
     return [
         f"arena-api {_package_version()}",
         f"module       : {module_dir}",
         f"python       : {sys.executable} ({platform.python_version()})",
         f"anthropic shim: {shim}",
+        f"sessions     : {sessions}",
     ]
 
 

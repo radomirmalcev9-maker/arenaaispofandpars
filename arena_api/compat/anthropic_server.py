@@ -1886,6 +1886,38 @@ def _engine_hint(exc: BaseException) -> str:
     )
 
 
+def startup_session_note(
+    *,
+    session: str | None,
+    profile: str | None = None,
+    profile_root: str | None = None,
+    base_url: str = DEFAULT_BASE_URL,
+) -> tuple[bool, str]:
+    """Check the session once, cheaply, before the first request arrives.
+
+    Returns ``(found, text)``.  Reading a browser profile is a file read, so
+    this costs milliseconds and turns a confusing failure inside Claude Code
+    into a line in the banner: "the session is not there, run --doctor".
+    """
+    try:
+        from ..auto import find_session_for_doctor
+
+        found, _options = find_session_for_doctor(
+            session=session,
+            profile=profile,
+            profile_root=profile_root,
+            base_url=base_url,
+        )
+    except Exception as exc:  # noqa: BLE001 - a banner must never crash
+        return False, f"{type(exc).__name__}: {exc}"
+    if found is None:
+        return False, (
+            f"НЕ НАЙДЕНА (источник {session or 'auto'}) — Claude Code получит "
+            "ошибку; проверьте: arena-api --claude --doctor"
+        )
+    return True, found.description
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """``arena-api --claude``: run the shim until interrupted."""
     args = [item for item in (sys.argv[1:] if argv is None else argv) if item != "--claude"]
@@ -1909,12 +1941,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     bound = server.server_address
     host = str(bound[0])
     port = int(bound[1])
+    session_line = parsed.session + (
+        f" (profile {parsed.profile})" if parsed.profile else ""
+    )
+    if parsed.engine != "echo":
+        # One cheap file read now beats a cryptic error later: a missing
+        # Firefox profile is the most common reason the first prompt fails.
+        _ok, note = startup_session_note(
+            session=parsed.session,
+            profile=parsed.profile,
+            profile_root=parsed.profile_root,
+            base_url=parsed.base_url,
+        )
+        session_line += f" -> {note}"
     banner = [
         f"arena-api anthropic shim : http://{host}:{port}",
         f"engine                   : {parsed.engine}",
         f"tools                    : {parsed.tools}",
-        f"session                  : {parsed.session}"
-        + (f" (profile {parsed.profile})" if parsed.profile else ""),
+        f"session                  : {session_line}",
         f"default model            : {parsed.default_model}",
         "",
         "Claude Code:",
@@ -1953,5 +1997,6 @@ __all__ = [
     "render_tool_instructions",
     "render_transcript",
     "resolve_arena_model",
+    "startup_session_note",
     "translate_request",
 ]
