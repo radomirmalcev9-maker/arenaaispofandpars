@@ -190,7 +190,7 @@ def test_tool_instructions_and_choice_are_rendered() -> None:
             "tool_choice": {"type": "tool", "name": "Read"},
         }
     )
-    assert '<tool_call>{"name": "<tool name>", "arguments"' in request.prompt
+    assert '<tool_call>{"name": "<tool>", "arguments"' in request.prompt
     assert '- Read{"file_path": string, "limit": integer} (required: file_path)' in (
         request.prompt
     )
@@ -1179,3 +1179,106 @@ def test_auto_source_helper() -> None:
     assert shim._is_auto_source(None) is True
     assert shim._is_auto_source("auto") is True
     assert shim._is_auto_source("firefox") is False
+
+
+# --------------------------------------------------------------------------- #
+# Doctor and the unknown-model retry
+# --------------------------------------------------------------------------- #
+
+
+def test_unknown_model_error_is_recognised() -> None:
+    assert shim._looks_like_unknown_model(RuntimeError("model 'x' not found"))
+    assert shim._looks_like_unknown_model(RuntimeError("Unknown model: x"))
+    assert not shim._looks_like_unknown_model(RuntimeError("timeout waiting for headers"))
+    assert not shim._looks_like_unknown_model(RuntimeError("model quota exceeded"))
+
+
+def test_engine_retries_with_the_default_model_when_arena_rejects_the_name() -> None:
+    class Picking:
+        name = "picking"
+
+        def __init__(self) -> None:
+            self.models: list[str | None] = []
+
+        def answer(self, prompt: str, *, model: str | None = None) -> Iterator[str]:
+            del prompt
+            self.models.append(model)
+            if model is not None:
+                raise RuntimeError(f"model {model!r} not found")
+            yield "ответ моделью Arena по умолчанию"
+
+        def close(self) -> None:
+            return None
+
+    engine = shim.ArenaEngine(engine="echo", log=lambda _m: None)
+    primary = Picking()
+    engine._primary = primary  # type: ignore[assignment]
+    assert "".join(engine.answer("hi", model="claude-sonnet-4-5")) == (
+        "ответ моделью Arena по умолчанию"
+    )
+    assert primary.models == ["claude-sonnet-4-5", None]
+
+
+def test_engine_does_not_retry_other_failures() -> None:
+    class Broken:
+        name = "broken"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def answer(self, prompt: str, *, model: str | None = None) -> Iterator[str]:
+            del prompt, model
+            self.calls += 1
+            raise RuntimeError("network is down")
+            yield ""  # pragma: no cover
+
+        def close(self) -> None:
+            return None
+
+    engine = shim.ArenaEngine(engine="echo", log=lambda _m: None)
+    primary = Broken()
+    engine._primary = primary  # type: ignore[assignment]
+    engine._fallback = Broken()  # type: ignore[assignment]
+    with pytest.raises(shim.EngineError):
+        list(engine.answer("hi", model="gpt-5"))
+    assert primary.calls == 1
+
+
+def test_doctor_reports_a_missing_session(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from arena_api import auto
+
+    def no_session(**_: Any) -> tuple[Any, Any]:
+        return None, auto.AutoOptions(session_source="firefox")
+
+    monkeypatch.setattr(auto, "find_session_for_doctor", no_session)
+    code = shim.doctor(["--claude", "--engine", "echo", "--session", "firefox"])
+    printed = capsys.readouterr().out
+    assert code == 1
+    assert "1. Установка" in printed
+    assert "2. Сессия" in printed
+    assert "сессия не найдена" in printed
+    # The engine and the loopback protocol still get checked after a session
+    # failure: knowing the other links work narrows the problem down.
+    assert "3. Движок ответа" in printed
+    assert "4. Протокол на loopback" in printed
+    assert "message_stop" not in printed or "SSE" in printed
+
+
+def test_doctor_checks_the_protocol_even_with_a_fake_engine(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = shim.doctor(["--claude", "--engine", "echo", "--session", "auto"])
+    printed = capsys.readouterr().out
+    assert "SSE" in printed
+    assert "JSON-ответ" in printed
+    # echo needs no session at all, so the protocol part must pass
+    assert "message_stop" not in printed  # only names, never raw event dumps
+    assert code in (0, 1)
+
+
+def test_doctor_help_is_documented(serve: Any) -> None:
+    parser = shim._serve_parser()
+    assert parser.parse_args(["--doctor"]).doctor is True
+    assert parser.parse_args([]).doctor is False

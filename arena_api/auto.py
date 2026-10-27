@@ -757,6 +757,34 @@ def _from_named_browser(name: str) -> Callable[[AutoOptions], DiscoveredSession 
     return discover
 
 
+def find_session_for_doctor(
+    *,
+    session: str | None = None,
+    profile: str | None = None,
+    profile_root: str | Path | None = None,
+    base_url: str = DEFAULT_BASE_URL,
+) -> tuple[DiscoveredSession | None, AutoOptions]:
+    """Discover a session exactly the way ``--session`` would, for diagnostics.
+
+    Returns the session (``None`` when nothing was found) together with the
+    options that were used, so the caller can print :func:`explain_sources`
+    for the *same* configuration instead of a default one.  Nothing is
+    verified and nothing is interactive: this only reads.
+    """
+    options = AutoOptions(
+        base_url=base_url,
+        session_source=session,
+        profile_name=profile,
+        profiles_root=profile_root,
+        interactive=False,
+        verify=False,
+    )
+    try:
+        return discover_session(options), options
+    except AuthenticationError:
+        return None, options
+
+
 def discover_session(options: AutoOptions | None = None) -> DiscoveredSession | None:
     """Return the first usable session, or ``None`` when there is none.
 
