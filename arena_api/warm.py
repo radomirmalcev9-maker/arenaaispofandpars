@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import contextlib
 import hmac
 import json
@@ -433,6 +434,7 @@ def ask_stream(
                     anchor=anchor,
                     prefix="daemon.startup." if message.get("kind") == "startup" else "daemon.",
                 )
+                latency.set_metrics(message.get("metrics"))
                 continue
             if kind == "delta":
                 text = message.get("text")
@@ -596,6 +598,21 @@ def _child_env() -> dict[str, str]:
     return env
 
 
+#: Children we started in this process.  Holding them keeps ``Popen.__del__``
+#: from firing at an arbitrary moment (it warns about a running child) and lets
+#: us reap an exited daemon instead of leaving a zombie behind.
+_SPAWNED: list[subprocess.Popen[bytes]] = []
+
+
+def _reap_spawned() -> None:
+    for child in list(_SPAWNED):
+        if child.poll() is not None:
+            _SPAWNED.remove(child)
+
+
+atexit.register(_reap_spawned)
+
+
 def spawn_daemon(
     *,
     state_file: Path,
@@ -634,8 +651,11 @@ def spawn_daemon(
         kwargs["creationflags"] = creationflags
     else:
         kwargs["start_new_session"] = True
+    _reap_spawned()
     try:
-        return subprocess.Popen(command, **kwargs)  # noqa: S603 - fixed argv
+        child = subprocess.Popen(command, **kwargs)  # noqa: S603 - fixed argv
+        _SPAWNED.append(child)
+        return child
     finally:
         handle.close()
 
@@ -808,10 +828,25 @@ class WarmSession:
             for attempt in range(2):
                 try:
                     client = await self._client_or_create()
+                    # How much of the answer time was the server *thinking*, and
+                    # how much was it trickling tokens?  Recorded per request and
+                    # shown by `arena-api --warm-profile`.
+                    chunks = 0
+                    chars = 0
+                    longest_gap = 0.0
+                    last_at = time.monotonic()
                     with latency.span("warm.ask"):
                         async for chunk in client.astream(prompt, model=model):
+                            now = time.monotonic()
+                            longest_gap = max(longest_gap, now - last_at)
+                            last_at = now
+                            chunks += 1
+                            chars += len(chunk.delta or "")
                             if chunk.delta:
                                 yield chunk.delta
+                    latency.metric("answer.chunks", chunks)
+                    latency.metric("answer.chars", chars)
+                    latency.metric("answer.longest_gap_ms", round(longest_gap * 1000.0, 1))
                     self._last_error = None
                     return
                 except (AuthenticationError, ChallengeRequiredError) as exc:
@@ -1086,11 +1121,20 @@ class _WarmServer:
         phases = latency.rows_since(marker)
         if not phases:
             return
+        collected = latency.metrics()
         self._ask_profiles.append(
-            {"at": time.time(), "phases": phases}
+            {"at": time.time(), "phases": phases, "metrics": collected}
         )
         with contextlib.suppress(Exception):
-            await self._write(writer, {"type": "profile", "kind": "ask", "phases": phases})
+            await self._write(
+                writer,
+                {
+                    "type": "profile",
+                    "kind": "ask",
+                    "phases": phases,
+                    "metrics": latency.metrics(),
+                },
+            )
 
     def _profiles_payload(self, message: Mapping[str, Any]) -> dict[str, Any]:
         try:
@@ -1143,6 +1187,7 @@ class _WarmServer:
         try:
             await self._write(writer, {"type": "start"})
             await self._send_startup_profile(writer)
+            latency.reset()
             ask_marker = latency.marker()
             pieces: list[str] = []
             with latency.span("warm.stream"):
@@ -1469,6 +1514,15 @@ def profile_main(argv: Sequence[str]) -> int:
         print(f"\n  #{number} at {stamp}")
         for line in format_profile_table(phases or [], title="    "):
             print(line)
+        metrics = entry.get("metrics") if isinstance(entry, Mapping) else None
+        if isinstance(metrics, Mapping) and metrics:
+            rendered = ", ".join(
+                f"{key}={value:g}"
+                for key, value in metrics.items()
+                if isinstance(value, (int, float))
+            )
+            if rendered:
+                print(f"    metrics: {rendered}")
     return 0
 
 

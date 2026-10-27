@@ -37,6 +37,7 @@ from typing import Any, TextIO
 
 _LOCK = threading.Lock()
 _MARKS: list[tuple[str, float]] = []
+_METRICS: dict[str, float] = {}
 _CREATED = time.perf_counter()
 
 _TRUE = {"1", "true", "yes", "on", "y"}
@@ -81,6 +82,7 @@ def reset() -> None:
     """Forget every mark (tests and long-lived daemons)."""
     with _LOCK:
         _MARKS.clear()
+        _METRICS.clear()
     global _CREATED
     _CREATED = time.perf_counter()
 
@@ -151,6 +153,33 @@ def extend(
         _MARKS.sort(key=lambda item: item[1])
 
 
+def metric(key: str, value: float) -> None:
+    """Record one number (chunk count, streamed bytes, longest gap...).
+
+    Metrics answer questions a timeline cannot: whether a long phase was the
+    server thinking or the network trickling.
+    """
+    if not _MODE:
+        return
+    with _LOCK:
+        _METRICS[str(key)] = float(value)
+
+
+def metrics() -> dict[str, float]:
+    with _LOCK:
+        return dict(_METRICS)
+
+
+def set_metrics(values: Any) -> None:
+    """Import metrics recorded elsewhere (the warm daemon)."""
+    if not _MODE or not isinstance(values, Mapping):
+        return
+    for key, value in values.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            with _LOCK:
+                _METRICS[str(key)] = float(value)
+
+
 @contextmanager
 def span(name: str) -> Iterator[None]:
     """Mark ``name`` on entry and ``name.end`` (or ``name.error``) on exit."""
@@ -211,16 +240,21 @@ def report(prefix: str = "[arena-api latency]") -> str:
     lines.append(
         f"{prefix} {'total':<{width}} {'':>10} {rows[-1]['at_ms']:>10.1f}"
     )
+    for key, value in metrics().items():
+        lines.append(f"{prefix} {key} = {value:g}")
     return "\n".join(lines)
 
 
 def as_json(prefix: str = "[arena-api latency]", pretty: bool = False) -> str:
     """One-line (or pretty) JSON report, including the process start offset."""
     rows = _rows()
-    payload = {
+    payload: dict[str, Any] = {
         "total_ms": rows[-1]["at_ms"] if rows else 0.0,
         "phases": [{"phase": row["phase"], "at_ms": row["at_ms"], "delta_ms": row["delta_ms"]} for row in rows],
     }
+    collected = metrics()
+    if collected:
+        payload["metrics"] = collected
     body = json.dumps(payload, ensure_ascii=False, indent=2 if pretty else None)
     return f"{prefix} {body}" if prefix else body
 
