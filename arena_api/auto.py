@@ -2348,6 +2348,8 @@ class DirectVerificationToken:
 
         registered_listeners: list[tuple[str, Callable[..., Any]]] = []
         response_tasks: set[asyncio.Task[None]] = set()
+        challenge_tasks: set[asyncio.Task[dict[str, Any]]] = set()
+        queue_wait_task: asyncio.Task[tuple[str, Any]] | None = None
         page = state.page
         context = getattr(page, "context", None)
         cdp_pump = state.cdp_pump
@@ -2633,7 +2635,11 @@ class DirectVerificationToken:
             challenge_cleared_at: float | None = None
             retried_send_after_clear = False
             replayed_v2_payload = False
+            watch_challenges = used_composer and (
+                window_visible or self.options.solve_captchas is not False
+            )
 
+            obs_task: asyncio.Task[dict[str, Any]] | None = None
             while True:
                 now = time.monotonic()
                 if now >= deadline:
@@ -2645,20 +2651,36 @@ class DirectVerificationToken:
                         "Direct Chat browser request timed out waiting for response headers."
                     )
 
+                if queue_wait_task is None:
+                    queue_wait_task = asyncio.create_task(async_q.get())
+                if watch_challenges and obs_task is None:
+                    # Network events and DOM inspection finish independently; keep
+                    # both tasks alive across polling slices so neither can stall
+                    # delivery of the other.
+                    obs_task = asyncio.create_task(_detect_post_submit_challenge(page))
+                    challenge_tasks.add(obs_task)
+                    obs_task.add_done_callback(challenge_tasks.discard)
                 poll_slice = min(0.5, max(0.05, deadline - now))
-                got_event = False
+                assert queue_wait_task is not None
+                waiters: set[asyncio.Task[Any]] = {queue_wait_task}
+                if obs_task is not None:
+                    waiters.add(obs_task)
+                done, _ = await asyncio.wait(
+                    waiters,
+                    timeout=poll_slice,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                got_event = queue_wait_task in done
                 ev_kind = ""
                 ev_val: Any = None
-                try:
-                    ev_kind, ev_val = await asyncio.wait_for(
-                        async_q.get(), timeout=poll_slice
-                    )
-                    got_event = True
-                except asyncio.TimeoutError:
-                    got_event = False
-
                 if got_event:
+                    ev_kind, ev_val = queue_wait_task.result()
+                    queue_wait_task = None
                     if ev_kind != "http_error":
+                        if obs_task is not None:
+                            obs_task.cancel()
+                            await asyncio.gather(obs_task, return_exceptions=True)
+                            obs_task = None
                         first_kind, first_val = ev_kind, ev_val
                         break
                     err_map = ev_val if isinstance(ev_val, Mapping) else {}
@@ -2694,10 +2716,13 @@ class DirectVerificationToken:
                             status, err_body, resp_headers
                         )
 
-                if used_composer and (
-                    window_visible or self.options.solve_captchas is not False
+                if (
+                    watch_challenges
+                    and obs_task is not None
+                    and obs_task in done
                 ):
-                    obs = await _detect_post_submit_challenge(page)
+                    obs = obs_task.result()
+                    obs_task = None
                     obs_kind = obs.get("kind")
                     if isinstance(obs_kind, str) and obs_kind:
                         if not challenge_active:
@@ -2947,9 +2972,14 @@ class DirectVerificationToken:
                         remove_fn(ev_name, cb)
                     except Exception:  # noqa: BLE001
                         pass
+            if queue_wait_task is not None and not queue_wait_task.done():
+                queue_wait_task.cancel()
             for task in list(response_tasks):
                 if not task.done():
                     task.cancel()
+            for challenge_task in list(challenge_tasks):
+                if not challenge_task.done():
+                    challenge_task.cancel()
             if discard_state or not _is_page_usable(page):
                 if self._warm_state is state:
                     self._warm_state = None
