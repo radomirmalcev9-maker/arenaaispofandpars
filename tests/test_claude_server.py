@@ -1051,7 +1051,9 @@ def test_warm_engine_asks_for_the_firefox_session(monkeypatch: pytest.MonkeyPatc
     )
     engine = shim.ArenaEngine(engine="warm", base_url="https://example.test")
     assert "".join(engine.answer("привет")) == "ok"
-    assert seen["payload"]["argv"] == ["--session", "firefox"]
+    # Firefox first; archiving rides along as its own flag (see the archive
+    # tests below), so the exact list is asserted there.
+    assert seen["payload"]["argv"][:2] == ["--session", "firefox"]
 
 
 def test_http_engine_passes_the_session_to_the_client(
@@ -1416,3 +1418,111 @@ def test_version_report_marks_a_build_without_session_support(
     report = "\n".join(_cli.version_report())
     assert "sessions     : NOT supported" in report
     assert "--session" not in report.split("sessions")[1]
+
+
+# --------------------------------------------------------------------------- #
+# Archiving each answered conversation
+# --------------------------------------------------------------------------- #
+
+
+def test_archive_is_on_by_default_for_claude_code() -> None:
+    assert shim.DEFAULT_ARCHIVE is True
+    parser = shim._serve_parser()
+    assert parser.parse_args([]).archive is True
+    assert parser.parse_args(["--no-archive"]).archive is False
+    assert parser.parse_args(["--archive"]).archive is True
+
+
+def test_archive_env_variable_can_switch_it_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARENA_CLAUDE_ARCHIVE", "0")
+    assert shim._serve_parser().parse_args([]).archive is False
+
+
+def test_archive_flag_reaches_the_warm_daemon() -> None:
+    assert "--archive-after-answer" in shim._session_argv(archive=True)
+    assert "--archive-after-answer" not in shim._session_argv(archive=False)
+    assert "--archive-after-answer" not in shim._session_argv()
+
+
+def test_archive_flag_is_passed_to_the_direct_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arena_api import auto
+
+    seen: dict[str, Any] = {}
+
+    class Client:
+        def stream(self, prompt: str, *, model: str | None = None) -> Iterator[Any]:
+            yield type("Chunk", (), {"delta": "ok"})()
+
+        def close(self) -> None:
+            return None
+
+    def fake_client(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return Client()
+
+    monkeypatch.setattr(auto, "auto_direct_client", fake_client)
+    engine = shim._HttpEngine(base_url="https://example.test", archive=True)
+    assert "".join(engine.answer("hi")) == "ok"
+    assert seen["archive_after_answer"] is True
+
+
+def test_warm_engine_archives_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_api import warm
+
+    seen: dict[str, Any] = {}
+
+    def fake_ensure(**kwargs: Any) -> str:
+        seen.update(kwargs)
+        return "state"
+
+    monkeypatch.setattr(warm, "ensure_daemon", fake_ensure)
+    monkeypatch.setattr(
+        warm, "ask_stream", lambda prompt, *, state, model=None, **_: iter(["ok"])
+    )
+    engine = shim.ArenaEngine(engine="warm", base_url="https://example.test")
+    assert "".join(engine.answer("hi")) == "ok"
+    assert "--archive-after-answer" in seen["payload"]["argv"]
+
+
+def test_info_reports_the_archive_setting(serve: Any) -> None:
+    server, _ = serve("ok")
+    server.engine.archive = True
+    with urllib.request.urlopen(_url(server, "/"), timeout=10) as response:
+        payload = json.loads(response.read())
+    assert payload["archive"] is True
+
+
+def test_banner_reports_the_archive_setting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class FakeServer:
+        server_address = ("127.0.0.1", 4300)
+
+        class engine:
+            @staticmethod
+            def close() -> None:
+                return None
+
+        def serve_forever(self, poll_interval: float = 0.2) -> None:
+            raise KeyboardInterrupt
+
+        def shutdown(self) -> None:
+            return None
+
+        def server_close(self) -> None:
+            return None
+
+    captured: dict[str, Any] = {}
+
+    def fake_create(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return FakeServer()
+
+    monkeypatch.setattr(shim, "create_server", fake_create)
+    monkeypatch.setattr(shim, "startup_session_note", lambda **_: (True, "ok"))
+    assert shim.main(["--claude"]) == 0
+    printed = capsys.readouterr().out
+    assert "archive after answer     : yes" in printed
+    assert captured["archive"] is True

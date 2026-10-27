@@ -643,6 +643,233 @@ _COMPOSER_NONEMPTY_JS = (
     "return !!(el && ((el.value || el.textContent || '').trim().length > 0)); }"
 )
 
+# --------------------------------------------------------------------------- #
+# Archiving the finished conversation ("... -> Archive")
+# --------------------------------------------------------------------------- #
+
+#: Marks every candidate trigger for the conversation menu.  The sidebar row of
+#: the chat that is open has a "menu" button (``aria-haspopup="menu"``); which
+#: element it is exactly differs between Arena builds, so the candidates are
+#: ranked, tried in order, and each is marked with its index for Playwright to
+#: click with real pointer events (Radix opens on pointerdown, not on click).
+_ARCHIVE_MARK_TRIGGERS_JS = r"""
+/* arena_archive_triggers */ () => {
+  for (const old of document.querySelectorAll('[data-arena-archive-trigger]')) {
+    old.removeAttribute('data-arena-archive-trigger');
+  }
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 2 && rect.height > 2 &&
+      style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const activeRow = () => {
+    const marked = document.querySelector(
+      '[aria-current="page"], [data-state="active"], [data-active="true"]'
+    );
+    if (marked) return marked;
+    const url = window.location.pathname || '';
+    const match = url.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (match) {
+      const link = document.querySelector('a[href*="' + match[0] + '"]');
+      if (link) return link;
+    }
+    return null;
+  };
+
+  const ranked = [];
+  const push = (el, score) => {
+    if (!el || !visible(el) || ranked.some((item) => item.el === el)) return;
+    ranked.push({ el, score });
+  };
+
+  const row = activeRow();
+  // 1. A menu button inside the active conversation row (or its container).
+  if (row) {
+    for (const el of row.querySelectorAll('[aria-haspopup="menu"]')) push(el, 100);
+    let parent = row.parentElement;
+    for (let depth = 0; parent && depth < 3; depth += 1, parent = parent.parentElement) {
+      for (const el of parent.querySelectorAll('[aria-haspopup="menu"]')) push(el, 90 - depth);
+    }
+  }
+  // 2. Any menu button that sits next to a link to a conversation.
+  for (const link of document.querySelectorAll('a[href*="/c/"], a[href*="/chat"]')) {
+    const container = link.closest('li, [role="listitem"], div');
+    if (!container) continue;
+    for (const el of container.querySelectorAll('[aria-haspopup="menu"]')) push(el, 70);
+  }
+  // 3. Last resort: a visible menu button in a sidebar-ish container.
+  for (const el of document.querySelectorAll('[aria-haspopup="menu"]')) {
+    const inNav = el.closest('aside, nav, [role="navigation"]');
+    push(el, inNav ? 50 : 10);
+  }
+
+  ranked.sort((left, right) => right.score - left.score);
+  const chosen = ranked.slice(0, 4);
+  chosen.forEach((item, index) => {
+    item.el.setAttribute('data-arena-archive-trigger', String(index));
+  });
+  return { found: chosen.length, strategies: chosen.map((item) => item.score) };
+}
+""".strip()
+
+_ARCHIVE_FIND_ITEM_JS = r"""
+/* arena_archive_item */ () => {
+  for (const old of document.querySelectorAll('[data-arena-archive-item]')) {
+    old.removeAttribute('data-arena-archive-item');
+  }
+  const label = /(^|\s)(archive|архив|в архив)(\s|$)/i;
+  const items = [];
+  for (const el of document.querySelectorAll(
+    '[role="menuitem"], [data-radix-collection-item], [role="menu"] [role="option"]'
+  )) {
+    const text = (el.textContent || '').trim();
+    if (!text || !label.test(text)) continue;
+    if (el.getAttribute('data-disabled') !== null) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) continue;
+    items.push(el);
+  }
+  if (!items.length) return { found: 0 };
+  items[0].setAttribute('data-arena-archive-item', '1');
+  return { found: items.length, label: (items[0].textContent || '').trim() };
+}
+""".strip()
+
+_ARCHIVE_CLOSE_MENU_JS = (
+    "/* arena_archive_close */ () => { document.body.dispatchEvent("
+    "new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return true; }"
+)
+
+_ARCHIVE_CONFIRM_JS = r"""
+/* arena_archive_confirm */ () => {
+  const menuOpen = document.querySelector('[role="menu"]');
+  const active = document.querySelector(
+    '[aria-current="page"], [data-state="active"], [data-active="true"]'
+  );
+  return { menu_open: Boolean(menuOpen), active_row: Boolean(active) && active.offsetParent !== null };
+}
+""".strip()
+
+_ARCHIVE_CLEANUP_JS = (
+    "/* arena_archive_cleanup */ () => { "
+    "for (const el of document.querySelectorAll("
+    "'[data-arena-archive-trigger],[data-arena-archive-item]')) { "
+    "el.removeAttribute('data-arena-archive-trigger'); "
+    "el.removeAttribute('data-arena-archive-item'); } }"
+)
+
+
+async def _click_marked(page: Any, selector: str) -> bool:
+    """Click a marked element with real pointer events, then by coordinates."""
+    locator_fn = getattr(page, "locator", None)
+    if callable(locator_fn):
+        try:
+            target = locator_fn(selector).first
+            await target.click(timeout=2_000)
+            return True
+        except Exception:  # noqa: BLE001 - fall back to a synthetic click
+            pass
+        try:
+            target = locator_fn(selector).first
+            await target.click(timeout=1_500, force=True)
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+    eval_fn = getattr(page, "evaluate", None)
+    if callable(eval_fn):
+        try:
+            await eval_fn(
+                "/* arena_archive_dom_click */ () => {"
+                f" const el = document.querySelector({selector!r});"
+                " if (!el) return false;"
+                " for (const type of ['pointerdown','mousedown','pointerup','mouseup','click']) {"
+                "  el.dispatchEvent(new (type.startsWith('pointer') ? PointerEvent : MouseEvent)"
+                "   (type, { bubbles: true, cancelable: true, view: window, button: 0 }));"
+                " } return true; }"
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+async def archive_conversation(
+    page: Any,
+    *,
+    timeout: float = 8.0,
+    confirm_timeout: float = 0.6,
+    wait_fn: Any = None,
+) -> bool:
+    """Move the open conversation to the archive.
+
+    The UI action is "conversation row -> menu -> Archive"; the row's menu
+    button is found by :data:`_ARCHIVE_MARK_TRIGGERS_JS`, the ``Archive`` entry
+    by :data:`_ARCHIVE_FIND_ITEM_JS` (that is the ``role="menuitem"`` element
+    with a lucide ``archive`` icon in Arena's markup).  Returns ``True`` only
+    when the menu item was actually clicked, so a caller can log a miss instead
+    of pretending the chat was archived.
+    """
+    eval_fn = getattr(page, "evaluate", None)
+    if not callable(eval_fn):
+        return False
+    sleep = wait_fn or getattr(page, "wait_for_timeout", None)
+
+    async def _wait() -> None:
+        if callable(sleep):
+            try:
+                await sleep(60)
+            except Exception:  # noqa: BLE001 - a fake page may not implement it
+                pass
+
+    try:
+        marked = await eval_fn(_ARCHIVE_MARK_TRIGGERS_JS)
+        found = int(marked.get("found") or 0) if isinstance(marked, Mapping) else 0
+        if not found:
+            return False
+        deadline = time.monotonic() + max(1.0, timeout)
+        for index in range(found):
+            selector = f'[data-arena-archive-trigger="{index}"]'
+            if not await _click_marked(page, selector):
+                continue
+            # Radix renders the menu into a portal on the next frame.
+            for _ in range(12):
+                item = await eval_fn(_ARCHIVE_FIND_ITEM_JS)
+                if isinstance(item, Mapping) and int(item.get("found") or 0):
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                await _wait()
+            else:
+                item = {"found": 0}
+            if isinstance(item, Mapping) and int(item.get("found") or 0):
+                clicked = await _click_marked(page, '[data-arena-archive-item="1"]')
+                if not clicked:
+                    return False
+                # Give the app a moment to send its request: closing the browser
+                # right after the click would abort the archival.  The menu
+                # closing is the first sign it went through.
+                deadline_confirm = time.monotonic() + max(0.0, confirm_timeout)
+                while time.monotonic() < deadline_confirm:
+                    state = await eval_fn(_ARCHIVE_CONFIRM_JS)
+                    if isinstance(state, Mapping) and not state.get("menu_open"):
+                        break
+                    await _wait()
+                return True
+            # Wrong trigger: close whatever it opened and try the next one.
+            try:
+                await eval_fn(_ARCHIVE_CLOSE_MENU_JS)
+            except Exception:  # noqa: BLE001
+                pass
+            await _wait()
+        return False
+    finally:
+        try:
+            await eval_fn(_ARCHIVE_CLEANUP_JS)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 _CLEANUP_ARENA_DOM_MARKS_JS = (
     "/* arena_cleanup_marks */ () => { "
     "for (const el of document.querySelectorAll('[data-arena-composer],[data-arena-send]')) { "

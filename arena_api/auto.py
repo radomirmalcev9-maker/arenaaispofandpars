@@ -101,6 +101,7 @@ from ._direct_page import (
     _seed_direct_context_cookies,
     _seedable_browser_cookies,
     _submit_prompt_via_composer,
+    archive_conversation,
     _token_solver,
 )
 from ._window_cloak import (
@@ -393,6 +394,12 @@ class AutoOptions:
     #: guessing the browser would mismatch the headers we send. Pass ``"off"``
     #: to disable, or a profile name (``"firefox147"``) to force one.
     impersonate: str | None = "auto"
+
+    #: Archive the conversation once the answer has been fully received
+    #: (conversation row -> menu -> Archive). Off by default: it is a UI action
+    #: on the user's account, so the caller asks for it explicitly. A one-shot
+    #: request is the intended case -- a follow-up turn needs the chat open.
+    archive_after_answer: bool = False
 
     #: ``True``/``False`` force challenge solving on or off; ``"auto"`` (the
     #: default) enables it when the solver dependencies are importable.
@@ -3271,6 +3278,27 @@ class DirectVerificationToken:
             yield content_type, _iter_chunks()
             state.has_active_conversation = bool(used_composer)
             if (
+                self.options.archive_after_answer
+                and not follow_up
+                and bool(used_composer)
+                and _is_page_usable(page)
+            ):
+                # The caller consumed the whole answer, so the transcript is
+                # complete: move the chat to the archive now.  Best effort --
+                # a UI change must never fail a finished request.
+                _latency_mark("archive.start")
+                try:
+                    archived = await archive_conversation(page)
+                except Exception as exc:  # noqa: BLE001
+                    archived = False
+                    _latency_mark("archive.error")
+                    if self.options.output is not None:
+                        print(
+                            f"[arena-api] could not archive the chat: {exc}",
+                            file=self.options.output,
+                        )
+                _latency_mark("archive.done" if archived else "archive.missed")
+            if (
                 prefetch_next
                 and keep_alive
                 and self._warm_state is state
@@ -3922,6 +3950,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--archive-after-answer",
+        action="store_true",
+        default=False,
+        help=(
+            "move the conversation to the archive once the answer has been "
+            "fully received (one-shot requests only; needs the composer path)"
+        ),
+    )
+    parser.add_argument(
         "--session",
         default=None,
         metavar="SOURCE",
@@ -4068,6 +4105,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         impersonate=args.impersonate,
         proxy=args.proxy,
         session_source=getattr(args, "session", None),
+        archive_after_answer=bool(getattr(args, "archive_after_answer", False)),
         profiles_root=args.profile_root,
         profile_name=args.profile,
         show_browser=bool(getattr(args, "show_browser", False)),

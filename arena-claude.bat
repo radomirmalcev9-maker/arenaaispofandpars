@@ -28,6 +28,7 @@ rem    ARENA_CLAUDE_SESSION=firefox     session source: firefox, firefox:<profil
 rem                                     storage, chrome, auto
 rem    ARENA_CLAUDE_ENGINE=warm         warm (daemon), http, echo
 rem    ARENA_CLAUDE_VERBOSE=1           log every request in the shim log
+rem    ARENA_CLAUDE_ARCHIVE=0           keep answered chats (default: archive them)
 rem
 rem  The output of this file is deliberately ASCII: cmd reads a script in the
 rem  console codepage, so Cyrillic here turns into garbage.  Russian
@@ -49,6 +50,9 @@ set "ENGINE=%ARENA_CLAUDE_ENGINE%"
 if "%ENGINE%"=="" set "ENGINE=warm"
 set "EXTRA="
 if "%ARENA_CLAUDE_VERBOSE%"=="1" set "EXTRA=--verbose"
+set "ARCHIVE_NOTE=after the answer is complete"
+if "%ARENA_CLAUDE_ARCHIVE%"=="0" set "EXTRA=%EXTRA% --no-archive"
+if "%ARENA_CLAUDE_ARCHIVE%"=="0" set "ARCHIVE_NOTE=no (chats are kept)"
 
 set "SHIMPID="
 set "STARTED_SHIM="
@@ -151,6 +155,7 @@ echo   ANTHROPIC_BASE_URL = http://127.0.0.1:%SHIM_PORT%
 echo   model              = %MODEL%
 echo   session            = %SESSION%
 echo   engine             = %ENGINE%
+echo   archive chat       = %ARCHIVE_NOTE%
 echo.
 if not defined STARTED_SHIM echo [arena] port %SHIM_PORT% was already served - reusing it, not stopping it.
 

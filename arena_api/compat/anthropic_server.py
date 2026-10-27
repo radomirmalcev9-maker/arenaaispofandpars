@@ -72,6 +72,12 @@ TOOLS_MODES = ("emulate", "off")
 #: anonymous profile.  ``--session auto`` restores the discovery ladder.
 DEFAULT_SESSION = "firefox"
 
+#: Claude Code starts a fresh conversation for every request and never looks at
+#: Arena's sidebar, so each answered chat is archived once its transcript is
+#: complete -- otherwise a few hundred chats pile up in the list.  ``--no-archive``
+#: keeps them.
+DEFAULT_ARCHIVE = True
+
 _AUTO_SOURCES = frozenset({"", "auto", "any", "default"})
 
 
@@ -95,6 +101,7 @@ def _session_argv(
     session: str | None = None,
     profile: str | None = None,
     profile_root: str | None = None,
+    archive: bool | None = None,
 ) -> list[str]:
     """Turn the session knobs into the CLI arguments the daemon parses."""
     argv: list[str] = []
@@ -104,6 +111,8 @@ def _session_argv(
         argv.extend(["--profile", profile.strip()])
     if isinstance(profile_root, str) and profile_root.strip():
         argv.extend(["--profile-root", profile_root.strip()])
+    if archive:
+        argv.append("--archive-after-answer")
     return argv
 
 _TOOL_CALL_RE = re.compile(
@@ -634,10 +643,14 @@ class _WarmEngine:
         session: str | None = None,
         profile: str | None = None,
         profile_root: str | None = None,
+        archive: bool | None = None,
     ) -> None:
         self._base_url = base_url
         self._argv = _session_argv(
-            session=session, profile=profile, profile_root=profile_root
+            session=session,
+            profile=profile,
+            profile_root=profile_root,
+            archive=archive,
         )
 
     def answer(self, prompt: str, *, model: str | None = None) -> Iterator[str]:
@@ -665,12 +678,14 @@ class _HttpEngine:
         session: str | None = None,
         profile: str | None = None,
         profile_root: str | None = None,
+        archive: bool | None = None,
         log: Any = None,
     ) -> None:
         self._base_url = base_url
         self._session = session
         self._profile = profile
         self._profile_root = profile_root
+        self._archive = bool(archive)
         self._log = log
         self._client: Any = None
         self._lock = threading.Lock()
@@ -685,6 +700,7 @@ class _HttpEngine:
             session_source=session,
             profile_name=self._profile,
             profiles_root=self._profile_root,
+            archive_after_answer=self._archive,
         )
 
     def _get_client(self) -> Any:
@@ -763,6 +779,7 @@ class ArenaEngine:
         session: str | None = DEFAULT_SESSION,
         profile: str | None = None,
         profile_root: str | None = None,
+        archive: bool | None = DEFAULT_ARCHIVE,
         log: Any = None,
     ) -> None:
         if engine not in ENGINES:
@@ -775,6 +792,7 @@ class ArenaEngine:
         self.session = session
         self.profile = profile
         self.profile_root = profile_root
+        self.archive = bool(archive)
         self.model_hint = prompt
         self.log = log
         self.verbose = False
@@ -789,6 +807,7 @@ class ArenaEngine:
                 session=session,
                 profile=profile,
                 profile_root=profile_root,
+                archive=archive,
                 log=self._note,
             )
         else:
@@ -797,6 +816,7 @@ class ArenaEngine:
                 session=session,
                 profile=profile,
                 profile_root=profile_root,
+                archive=archive,
             )
             # A cold or unavailable daemon must not turn into a 500: the same
             # direct client the CLI falls back to answers instead.
@@ -805,6 +825,7 @@ class ArenaEngine:
                 session=session,
                 profile=profile,
                 profile_root=profile_root,
+                archive=archive,
                 log=self._note,
             )
 
@@ -1114,6 +1135,7 @@ class _Handler(BaseHTTPRequestHandler):
             "engine": self.engine.engine,
             "tools": self.engine.tools_mode,
             "session": getattr(self.engine, "session", None),
+            "archive": getattr(self.engine, "archive", None),
             "default_model": self.server.default_model,  # type: ignore[attr-defined]
             "base_url": getattr(self.engine, "base_url", None),
             "endpoints": [
@@ -1431,6 +1453,7 @@ def create_server(
     session: str | None = DEFAULT_SESSION,
     profile: str | None = None,
     profile_root: str | None = None,
+    archive: bool | None = DEFAULT_ARCHIVE,
     verbose: bool = False,
     log: Any = None,
 ) -> _Server:
@@ -1442,6 +1465,7 @@ def create_server(
         session=session,
         profile=profile,
         profile_root=profile_root,
+        archive=archive,
         log=log,
     )
     server = _Server(
@@ -1524,6 +1548,22 @@ def _serve_parser() -> Any:
             "discovery ladder. Firefox is the profile this library reads best, "
             "and its cookies/TLS fingerprint are what the requests carry"
         ),
+    )
+    parser.add_argument(
+        "--archive",
+        dest="archive",
+        action="store_true",
+        default=_env("ARENA_CLAUDE_ARCHIVE", "1") not in {"0", "false", "no", "off"},
+        help=(
+            "archive each conversation once its answer is fully received "
+            "(default, keeps Arena's sidebar clean; --no-archive keeps the chats)"
+        ),
+    )
+    parser.add_argument(
+        "--no-archive",
+        dest="archive",
+        action="store_false",
+        help="keep the conversations in Arena's sidebar",
     )
     parser.add_argument(
         "--profile",
@@ -1751,6 +1791,7 @@ def doctor(argv: Sequence[str] | None = None) -> int:
             session=session,
             profile=parsed.profile,
             profile_root=parsed.profile_root,
+            archive=parsed.archive,
             log=report.note,
         )
         text, first, total = _answer_once(
@@ -1936,6 +1977,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session=parsed.session,
         profile=parsed.profile,
         profile_root=parsed.profile_root,
+        archive=parsed.archive,
         verbose=parsed.verbose,
     )
     bound = server.server_address
@@ -1959,6 +2001,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"engine                   : {parsed.engine}",
         f"tools                    : {parsed.tools}",
         f"session                  : {session_line}",
+        f"archive after answer     : {'yes' if parsed.archive else 'no'}",
         f"default model            : {parsed.default_model}",
         "",
         "Claude Code:",
