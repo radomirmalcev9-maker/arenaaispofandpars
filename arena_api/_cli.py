@@ -94,6 +94,13 @@ def version_report() -> list[str]:
             if "session_source" in getattr(AutoOptions, "__dataclass_fields__", {})
             else "NOT supported, upgrade the package"
         )
+    except ModuleNotFoundError as exc:
+        # Not a broken build but an environment without the extras: name the
+        # missing package and the command that installs it.
+        sessions = (
+            f"cannot import arena_api.auto: {exc} "
+            '(install the dependencies: pip install -e ".[auto]")'
+        )
     except Exception as exc:  # noqa: BLE001 - a broken install is the answer
         sessions = f"cannot import arena_api.auto: {exc}"
     return [

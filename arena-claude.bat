@@ -60,6 +60,7 @@ set "BUILD_OK="
 set "LAUNCH_EXE="
 set "LAUNCH_ARGS="
 set "DOCTOR_ARGS="
+set "REPO_DIR=%~dp0"
 set "BASE=%TEMP%\arena-claude-%SHIM_PORT%"
 set "LOG=%BASE%.log"
 set "ERRLOG=%BASE%.err.log"
@@ -136,13 +137,28 @@ endlocal & exit /b 1
 
 :stale_build
 echo.
-echo [arena] ERROR: no installed arena-api can serve --claude here.
-echo [arena] A build without the shim or without --session was found instead.
+echo [arena] ERROR: no build here can serve --claude.
+echo [arena] Two usual causes:
+echo [arena]   * arena-api.exe is left over from an install whose Python no
+echo [arena]     longer has the package  (ModuleNotFoundError: arena_api), or
+echo [arena]   * the installed build predates --claude / --session.
 echo.
 if exist "%VERSION_FILE%" powershell -NoProfile -Command "Get-Content -Encoding UTF8 '%VERSION_FILE%'"
-echo [arena] Fix it from the repository clone:
-echo         pip install -U -e ".[auto]"
-echo [arena] Then check:  arena-claude.bat version
+echo [arena] What that output says and what to do:
+findstr /C:"No module named" "%VERSION_FILE%" >nul 2>&1
+if not errorlevel 1 (
+    echo         the module is missing in that interpreter. Reinstall it there:
+    echo                 py -m pip install -e "."
+    echo         or just delete the broken script:
+    echo                 del "%LOCALAPPDATA%\Programs\Python\Python311\Scripts\arena-api.exe"
+)
+findstr /C:"unrecognized arguments" "%VERSION_FILE%" >nul 2>&1
+if not errorlevel 1 (
+    echo         that build is too old. Reinstall from the clone:
+    echo                 py -m pip install -U -e ".[auto]"
+)
+echo [arena] Meanwhile this file always works from the repository root:
+echo         py -m arena_api --claude --port %SHIM_PORT%
 call :cleanup
 endlocal & exit /b 1
 
@@ -216,21 +232,31 @@ goto :eof
 rem --- find the build that can actually serve -------------------------------
 :pick_build
 set "BUILD_OK="
-call :consider arena-api
+rem 1. The console script (what pip installs).
+call :consider arena-api exe
 if "%BUILD_OK%"=="1" goto :build_args
-call :consider py
+rem 2./3. Run the package straight out of this clone: the script lives in the
+rem    repository root, so `-m arena_api` needs no installation at all.  This
+rem    also rescues the common breakage "arena-api.exe exists but its Python
+rem    no longer has the module".
+call :consider py module
 if "%BUILD_OK%"=="1" goto :build_args
-call :consider python
+call :consider python module
 if "%BUILD_OK%"=="1" goto :build_args
 goto :eof
 
 :consider
+rem %~1 = executable to look for, %~2 = exe | module
 set "CAND="
 for /f "delims=" %%e in ('where %~1 2^>nul') do if not defined CAND set "CAND=%%e"
 if not defined CAND goto :eof
 set "LAUNCH_EXE=%CAND%"
 set "DOCTOR_ARGS="
-if /i not "%~1"=="arena-api" set "DOCTOR_ARGS=-m arena_api"
+if /i "%~2"=="module" (
+    set "DOCTOR_ARGS=-m arena_api"
+    rem Make the clone importable from any working directory.
+    set "PYTHONPATH=%REPO_DIR%;%PYTHONPATH%"
+)
 if exist "%VERSION_FILE%" del "%VERSION_FILE%" >nul 2>&1
 "%LAUNCH_EXE%" %DOCTOR_ARGS% --version > "%VERSION_FILE%" 2>&1
 findstr /C:"anthropic shim: yes" "%VERSION_FILE%" >nul 2>&1
