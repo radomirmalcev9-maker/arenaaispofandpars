@@ -866,6 +866,7 @@ async def _submit_prompt_via_composer(
     generation_params: Mapping[str, Any] | None = None,
     has_submitted: Callable[[], bool] | None = None,
     install_legacy_tap_flags: bool = False,
+    fast_submit: bool = False,
 ) -> bool:
     locator_fn = getattr(page, "locator", None)
     eval_fn = getattr(page, "evaluate", None)
@@ -900,17 +901,19 @@ async def _submit_prompt_via_composer(
     if not isinstance(info, Mapping) or not info.get("found"):
         return False
 
-    mouse = getattr(page, "mouse", None)
-    if mouse is not None and callable(getattr(mouse, "move", None)):
-        cx = float(info.get("x") or 400)
-        cy = float(info.get("y") or 700)
-        try:
-            await mouse.move(cx, cy, steps=3)
-        except Exception:  # noqa: BLE001
-            pass
-
     composer = locator_fn('[data-arena-composer="1"]').first
-    await composer.click()
+    # focus() instead of click(): no actionability animation, no mouse move, no
+    # click dispatch -- the composer only needs the caret, and fill()/type()
+    # verify the element is editable anyway.  click() stays as a fallback for
+    # pages whose composer only reacts to a real pointer event.
+    focus_fn = getattr(composer, "focus", None)
+    if callable(focus_fn):
+        try:
+            await focus_fn()
+        except Exception:  # noqa: BLE001
+            await composer.click()
+    else:
+        await composer.click()
 
     keyboard = getattr(page, "keyboard", None)
     single_line = "\n" not in prompt and "\r" not in prompt
@@ -937,21 +940,31 @@ async def _submit_prompt_via_composer(
             await keyboard.type(first_line, delay=2)
         await composer.fill(prompt)
 
-    if callable(wait_fn):
-        await wait_fn(15)
+    if fast_submit:
+        # Enter submits the composer in one event instead of mark-scan + mouse
+        # move + button click (~200-300 ms).  Guarded: if the app did not start
+        # an evaluation request, fall through to the explicit Send button, so a
+        # composer that ignores Enter behaves exactly as before.
+        press_fn = getattr(composer, "press", None)
+        if callable(press_fn):
+            try:
+                await press_fn("Enter")
+            except Exception:  # noqa: BLE001
+                pass
+            else:
+                for _ in range(5):
+                    if has_submitted is not None and has_submitted():
+                        try:
+                            await eval_fn(_CLEANUP_ARENA_DOM_MARKS_JS)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return True
+                    if callable(wait_fn):
+                        await wait_fn(40)
 
     btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
     try:
         if isinstance(btn_info, Mapping) and btn_info.get("found"):
-            if mouse is not None and callable(getattr(mouse, "move", None)):
-                try:
-                    await mouse.move(
-                        float(btn_info.get("x") or 500),
-                        float(btn_info.get("y") or 700),
-                        steps=2,
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
             send_btn = locator_fn('[data-arena-send="1"]').first
             await send_btn.click()
             # Only press Enter as a fallback when no explicit submit/Send button

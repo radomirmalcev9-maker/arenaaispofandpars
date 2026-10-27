@@ -422,6 +422,13 @@ class AutoOptions:
     #: invisibly in New Headless mode (default ``False`` = invisible).
     show_browser: bool = False
 
+    #: Submit the prompt with Enter first and fall back to the Send button if
+    #: the app did not start an evaluation (~200-300 ms less per prompt on the
+    #: warm path).  Off by default: a page that does not submit on Enter pays
+    #: the probe window instead, and Arena escalates to an invisible v2
+    #: challenge on some accounts.
+    fast_submit: bool = False
+
     def __post_init__(self) -> None:
         if self.storage_path is not None:
             self.storage_path = Path(self.storage_path)
@@ -1685,7 +1692,7 @@ def _is_page_usable(page: Any) -> bool:
 #: page is scanned on every iteration, so a widget is found immediately.
 #: Minimal, DOM-only probe: does the composer still hold the prompt (the tab is
 #: mid-submission) and is a known stop/cancel control on screen?
-_PENDING_WORK_JS = """
+_PENDING_WORK_JS = r"""
 () => {
   const composer = document.querySelector('[data-arena-composer="1"]') ||
     document.querySelector('textarea:not([id*="recaptcha"]):not([name*="recaptcha"]), [contenteditable="true"]');
@@ -2682,6 +2689,7 @@ class DirectVerificationToken:
                     state.legacy_stream_callbacks_installed = True
 
             wait_for_timeout = getattr(page, "wait_for_timeout", None)
+            fast_submit = bool(getattr(self.options, "fast_submit", False))
             used_composer = False
             can_reuse_open_conversation = (
                 reused_warm_page
@@ -2701,6 +2709,7 @@ class DirectVerificationToken:
                     generation_params=None,
                     has_submitted=lambda: eval_request_seen,
                     install_legacy_tap_flags=not has_network_events,
+                    fast_submit=fast_submit,
                 )
 
             if not used_composer:
@@ -2778,7 +2787,10 @@ class DirectVerificationToken:
                 # From this point the fresh page is consumed by a submission or
                 # a direct fetch; the next independent prompt must navigate anew.
                 state.direct_page_ready = False
-                await _gentle_page_warmup(page)
+                if not reused_warm_page:
+                    # Only a freshly loaded document needs the pointer warm-up;
+                    # on a reused tab it is a CDP animation for nothing.
+                    await _gentle_page_warmup(page)
 
                 if prompt is not None and not follow_up:
                     used_composer = await _submit_prompt_via_composer(
@@ -2788,6 +2800,7 @@ class DirectVerificationToken:
                         generation_params=generation_params,
                         has_submitted=lambda: eval_request_seen,
                         install_legacy_tap_flags=not has_network_events,
+                        fast_submit=fast_submit,
                     )
 
             if not used_composer:
@@ -3790,6 +3803,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="show the Direct Chat browser window instead of running invisibly in the background",
     )
+    parser.add_argument(
+        "--fast-submit",
+        action="store_true",
+        help=(
+            "submit with Enter first and fall back to the Send button "
+            "(~200-300 ms faster per warm prompt; off by default)"
+        ),
+    )
     parser.add_argument("--prompt", default=None, help="send one prompt and print the answer")
     parser.add_argument(
         "--warm",
@@ -3889,6 +3910,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         profiles_root=args.profile_root,
         profile_name=args.profile,
         show_browser=bool(getattr(args, "show_browser", False)),
+        fast_submit=bool(getattr(args, "fast_submit", False)),
     )
 
 
@@ -4133,6 +4155,10 @@ def _run_warm_prompt(
     from . import warm
 
     if warm.skip_for_process():
+        return None
+    if auto_client is not _DEFAULT_AUTO_CLIENT or probe is not _DEFAULT_PROBE:
+        # Somebody replaced the machinery (tests, embedders): a background
+        # daemon would run a *different* code path than the caller configured.
         return None
     raw = getattr(args, "_raw_argv", None) or []
     parsed = warm.scan_argv(raw)

@@ -3287,6 +3287,122 @@ def test_direct_composer_submission_uses_native_ui_without_forcing_model_and_han
     assert getattr(seen_env_options[0], "timezone_id") is None
 
 
+def _composer_page(*, enter_submits: bool) -> tuple[object, dict[str, int]]:
+    """Minimal composer page: records focus/press/click on the Send button."""
+    events = {"focus": 0, "press": 0, "send_click": 0, "submitted": 0}
+
+    class Composer:
+        def __init__(self) -> None:
+            self.value = ""
+
+        async def fill(self, value: str) -> None:
+            self.value = value
+
+        async def press(self, key: str) -> None:
+            assert key == "Enter"
+            events["press"] += 1
+            if enter_submits:
+                events["submitted"] = 1
+
+        async def click(self) -> None:
+            events["focus"] += 1
+
+        async def focus(self) -> None:
+            events["focus"] += 0  # focus() must not be counted as a click
+
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        @property
+        def first(self) -> "Locator":
+            return self
+
+        async def focus(self) -> None:
+            if "composer" in self.selector:
+                events["focus"] += 1
+
+        async def click(self) -> None:
+            if "send" in self.selector:
+                events["send_click"] += 1
+                events["submitted"] = 1
+
+        async def fill(self, value: str) -> None:
+            return None
+
+        async def press(self, key: str) -> None:
+            assert key == "Enter"
+            events["press"] += 1
+            if enter_submits:
+                events["submitted"] = 1
+
+    class Page:
+        keyboard = None
+        mouse = None
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def evaluate(self, script: str) -> object:
+            if "arena_cleanup_marks" in script:
+                return None
+            if "composer_nonempty" in script:
+                return True
+            if "data-arena-composer" in script and "data-arena-send" not in script:
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {"found": True, "confidence": "explicit", "x": 650, "y": 700}
+            return None
+
+    return Page(), events
+
+
+def test_submit_focuses_the_composer_instead_of_clicking_it() -> None:
+    page, events = _composer_page(enter_submits=False)
+    submitted = asyncio.run(
+        auto_module._submit_prompt_via_composer(
+            page, "привет", has_submitted=lambda: events["submitted"] == 1
+        )
+    )
+    assert submitted is True
+    # focus() costs a fraction of click(): no actionability animation.
+    assert events["focus"] == 1
+    assert events["send_click"] == 1
+
+
+def test_fast_submit_uses_enter_and_skips_the_send_click() -> None:
+    page, events = _composer_page(enter_submits=True)
+    submitted = asyncio.run(
+        auto_module._submit_prompt_via_composer(
+            page,
+            "привет",
+            has_submitted=lambda: events["submitted"] == 1,
+            fast_submit=True,
+        )
+    )
+    assert submitted is True
+    assert events["press"] == 1
+    assert events["send_click"] == 0
+
+
+def test_fast_submit_falls_back_to_the_send_button() -> None:
+    page, events = _composer_page(enter_submits=False)
+    submitted = asyncio.run(
+        auto_module._submit_prompt_via_composer(
+            page,
+            "привет",
+            has_submitted=lambda: events["submitted"] == 1,
+            fast_submit=True,
+        )
+    )
+    assert submitted is True
+    assert events["press"] == 1
+    assert events["send_click"] == 1  # Enter did nothing: the button is still used
+
+
 def test_post_submit_recaptcha_anchor_checkbox_clicked_without_expose_function(
     tmp_path, monkeypatch
 ) -> None:

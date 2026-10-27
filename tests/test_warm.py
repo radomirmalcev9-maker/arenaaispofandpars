@@ -43,6 +43,9 @@ class FakeSession:
             await asyncio.sleep(self.delay)
         for piece in self.deltas:
             yield piece
+        # The real session records these; the daemon forwards them.
+        warm.latency.metric("answer.chunks", len(self.deltas))
+        warm.latency.metric("answer.chars", sum(len(p) for p in self.deltas))
         if self.error is not None:
             raise self.error
 
@@ -74,6 +77,8 @@ class ServerThread:
             self._ready.set()
 
     async def _serve(self) -> None:
+        # The real daemon always collects phases so `--warm-profile` works.
+        warm.latency.enable_collection()
         self.server = warm._WarmServer(
             self.session,
             state_file=self.state_file,
@@ -148,6 +153,11 @@ def test_profiles_op_reports_the_last_prompts(server: ServerThread) -> None:
     assert payload["type"] == "profiles"
     assert payload["total_answered"] == 1
     assert isinstance(payload["asks"], list)
+    entry = payload["asks"][-1]
+    assert entry["phases"]  # the timeline is always collected by the daemon
+    # ... and the numbers that say whether the answer streamed or stalled.
+    metrics = entry.get("metrics") or {}
+    assert "answer.chunks" in metrics
 
 
 def test_profile_table_renders_phases() -> None:
