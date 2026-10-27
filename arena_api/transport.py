@@ -620,9 +620,13 @@ def _raise_for_status(
             f"The supplied session was rejected (HTTP {status}){suffix}."
         )
     if status == 429:
-        raise RateLimitError(
-            "Arena rate limit reached.", retry_after=_retry_after(headers)
+        wait = _retry_after(headers)
+        hint = (
+            f" Retry in about {wait:g}s."
+            if wait is not None
+            else " Wait a little before retrying."
         )
+        raise RateLimitError(f"Arena rate limit reached.{hint}", retry_after=wait)
     raise ArenaError(f"Arena returned HTTP {status}{suffix}.")
 
 
