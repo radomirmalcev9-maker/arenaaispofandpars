@@ -3682,6 +3682,7 @@ def test_live_browser_runs_invisible_by_default_and_honours_show_browser(
         follow_up=False,
         user_data_dir=None,
         hide_window=False,
+        prefetch_next=False,
     ):
         seen_calls.append((headless, hide_window, allow_headed_retry, user_data_dir))
         if not headless and fail_display:
@@ -4712,15 +4713,24 @@ def test_warm_browser_keep_alive_reuses_environment_and_follow_up_skips_goto(
     ) as client:
         assert client.complete("Вопрос 1") == "Ответ #1"
         assert env_enters == 1 and env_exits == 0
-        assert len(goto_urls) == 1
+        # One navigation for the request itself plus the background prefetch
+        # back to Direct Chat that starts as soon as the answer finished.
+        assert len(goto_urls) == 2
+        assert tok._warm_state is not None
+        assert tok._warm_state.prefetched_url == tok.page_url
 
         assert client.complete("Вопрос 2 — длинный текст свыше тридцати двух символов для быстрой вставки!") == "Ответ #2"
         assert env_enters == 1 and env_exits == 0
-        assert len(goto_urls) == 2
+        # The second request reused the prefetched page: no navigation on its
+        # critical path, only a new prefetch afterwards.
+        assert len(goto_urls) == 3
 
         conv = client.chat()
         assert conv.send_message("Старт диалога") == "Ответ #3"
+        # A chat session keeps its conversation open: no prefetch after it.
         assert len(goto_urls) == 3
+        assert tok._warm_state is not None
+        assert tok._warm_state.prefetch_task is None
         # Follow-up in the open conversation skips page.goto completely!
         assert conv.send_message("Продолжение") == "Ответ #4"
         assert len(goto_urls) == 3
@@ -4761,9 +4771,13 @@ def test_warm_browser_self_heals_if_cached_page_crashed(
                 raise RuntimeError("Target page, context or browser has been closed")
 
         async def title(self) -> str:
+            if self.crashed:
+                raise RuntimeError("Target page, context or browser has been closed")
             return "Arena"
 
         async def evaluate(self, script: str) -> object:
+            if self.crashed:
+                raise RuntimeError("Target page, context or browser has been closed")
             if "chat_submit" in script:
                 return f"tok-{self.env_id}"
             if "window.fetch" in script:

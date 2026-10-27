@@ -1653,6 +1653,14 @@ class _WarmBrowserState:
     loop: asyncio.AbstractEventLoop
     has_active_conversation: bool = False
     seeded_cookies: dict[str, str] = field(default_factory=dict)
+    #: Background navigation back to the Direct Chat page started right after
+    #: a one-shot answer finished, so the next prompt finds the page loaded.
+    prefetch_task: asyncio.Task[Any] | None = None
+    prefetched_url: str | None = None
+    #: Queue of the request currently owning the legacy ``expose_function``
+    #: taps (pages without ``page.on``); rebound on every request.
+    legacy_queue: Any = None
+    legacy_taps_installed: bool = False
 
 
 def _is_page_usable(page: Any) -> bool:
@@ -1668,8 +1676,28 @@ def _is_page_usable(page: Any) -> bool:
     return True
 
 
+async def _warm_page_responds(page: Any) -> bool:
+    """Cheap liveness probe: a crashed/detached renderer fails ``page.title()``."""
+    title_fn = getattr(page, "title", None)
+    if not callable(title_fn):
+        return True
+    try:
+        await asyncio.wait_for(title_fn(), timeout=5.0)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 async def _close_browser_state(state: _WarmBrowserState) -> None:
     state.win_cloaker.stop()
+    if state.prefetch_task is not None:
+        if not state.prefetch_task.done():
+            state.prefetch_task.cancel()
+        try:
+            await state.prefetch_task
+        except BaseException:  # noqa: BLE001
+            pass
+        state.prefetch_task = None
     if state.cdp_pump is not None:
         try:
             await state.cdp_pump.aclose()
@@ -1759,6 +1787,10 @@ class DirectVerificationToken:
             else base
         )
         _ACTIVE_DIRECT_TOKENS.add(self)
+
+    #: Lets :mod:`arena_api.direct` pass ``prefetch_next=`` without probing
+    #: signatures of third-party runner objects.
+    supports_prefetch_hint: bool = True
 
     def _should_keep_browser_alive(self) -> bool:
         if isinstance(self.keep_browser_alive, bool):
@@ -2098,6 +2130,7 @@ class DirectVerificationToken:
         follow_up: bool = False,
         user_data_dir: str | Path | None = None,
         hide_window: bool = False,
+        prefetch_next: bool = False,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
         resolved_proxy = self._resolve_proxy()
         cloaked_headful = (not headless) and bool(hide_window)
@@ -2114,6 +2147,7 @@ class DirectVerificationToken:
                 and candidate.headless == headless
                 and candidate.hide_window == hide_window
                 and _is_page_usable(candidate.page)
+                and await _warm_page_responds(candidate.page)
             ):
                 state = candidate
                 reused_warm_page = True
@@ -2207,6 +2241,7 @@ class DirectVerificationToken:
                 state.seeded_cookies = dict(seed_cookies)
 
             async_q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            state.legacy_queue = async_q
             if cdp_pump is not None:
                 cdp_pump.bind_queue(async_q)
             on_fn = getattr(page, "on", None)
@@ -2312,33 +2347,39 @@ class DirectVerificationToken:
                 ):
                     on_fn(ev_name, cb)
                     registered_listeners.append((ev_name, cb))
-            elif not reused_warm_page:
+            elif not state.legacy_taps_installed:
                 expose_fn = getattr(page, "expose_function", None)
                 if callable(expose_fn):
+                    legacy_state = state
+
+                    def _legacy_put(kind: str, payload: Any) -> None:
+                        target_q = legacy_state.legacy_queue
+                        if target_q is not None:
+                            target_q.put_nowait((kind, payload))
+
                     await expose_fn(
                         "__arenaDirectMeta",
-                        lambda ct: async_q.put_nowait(("meta", str(ct or ""))),
+                        lambda ct: _legacy_put("meta", str(ct or "")),
                     )
                     await expose_fn(
                         "__arenaDirectChunk",
-                        lambda piece: async_q.put_nowait(
-                            ("chunk", str(piece).encode("utf-8"))
+                        lambda piece: _legacy_put(
+                            "chunk", str(piece).encode("utf-8")
                         ),
                     )
                     await expose_fn(
                         "__arenaDirectEof",
-                        lambda: async_q.put_nowait(("eof", None)),
+                        lambda: _legacy_put("eof", None),
                     )
                     await expose_fn(
                         "__arenaDirectHttpError",
-                        lambda info: async_q.put_nowait(("http_error", info)),
+                        lambda info: _legacy_put("http_error", info),
                     )
                     await expose_fn(
                         "__arenaDirectStreamError",
-                        lambda err: async_q.put_nowait(
-                            ("stream_error", str(err or ""))
-                        ),
+                        lambda err: _legacy_put("stream_error", str(err or "")),
                     )
+                    state.legacy_taps_installed = True
 
             wait_for_timeout = getattr(page, "wait_for_timeout", None)
             used_composer = False
@@ -2364,7 +2405,8 @@ class DirectVerificationToken:
 
             if not used_composer:
                 state.has_active_conversation = False
-                await page.goto(self.page_url, wait_until="domcontentloaded")
+                if not await self._consume_prefetched_page(state, page):
+                    await page.goto(self.page_url, wait_until="domcontentloaded")
                 skip_full_html_check = False
                 title_fn = getattr(page, "title", None)
                 if callable(title_fn):
@@ -2735,6 +2777,13 @@ class DirectVerificationToken:
 
             yield content_type, _iter_chunks()
             state.has_active_conversation = bool(used_composer)
+            if (
+                prefetch_next
+                and keep_alive
+                and self._warm_state is state
+                and _is_page_usable(page)
+            ):
+                self._schedule_prefetch(state, page)
 
             cookies_fn = getattr(context, "cookies", None)
             if callable(cookies_fn):
@@ -2763,6 +2812,8 @@ class DirectVerificationToken:
         finally:
             if cdp_pump is not None:
                 cdp_pump.bind_queue(None)
+            if state.legacy_queue is async_q:
+                state.legacy_queue = None
             remove_fn = (
                 getattr(page, "remove_listener", None) if page is not None else None
             )
@@ -2780,6 +2831,64 @@ class DirectVerificationToken:
                     self._warm_state = None
                 await _close_browser_state(state)
 
+    def _schedule_prefetch(self, state: _WarmBrowserState, page: Any) -> None:
+        """Navigate the idle warm tab back to Direct Chat in the background.
+
+        A one-shot ``complete()``/``stream()`` leaves the tab on the finished
+        conversation; the next prompt would start with a full ``page.goto``.
+        Doing that navigation now, while the caller is busy with the answer,
+        takes it off the next request's critical path. Follow-up turns of a
+        chat session never ask for this (they need the conversation open).
+        """
+        goto_fn = getattr(page, "goto", None)
+        if not callable(goto_fn):
+            return
+        if state.prefetch_task is not None and not state.prefetch_task.done():
+            return
+        state.has_active_conversation = False
+        state.prefetched_url = self.page_url
+        try:
+            task = asyncio.get_running_loop().create_task(
+                goto_fn(self.page_url, wait_until="domcontentloaded")
+            )
+        except RuntimeError:
+            state.prefetched_url = None
+            return
+        state.prefetch_task = task
+
+        def _swallow(done: asyncio.Task[Any]) -> None:
+            if done.cancelled():
+                return
+            try:
+                done.exception()
+            except BaseException:  # noqa: BLE001
+                pass
+
+        task.add_done_callback(_swallow)
+
+    async def _consume_prefetched_page(
+        self, state: _WarmBrowserState, page: Any
+    ) -> bool:
+        """Wait for a background prefetch; ``True`` when the tab is already on Direct Chat."""
+        task = state.prefetch_task
+        target = state.prefetched_url
+        state.prefetch_task = None
+        state.prefetched_url = None
+        if task is None or target != self.page_url:
+            if task is not None and not task.done():
+                task.cancel()
+            return False
+        try:
+            await asyncio.wait_for(task, timeout=20.0)
+        except BaseException:  # noqa: BLE001
+            return False
+        current_url = getattr(page, "url", None)
+        if isinstance(current_url, str) and current_url:
+            wanted = self.page_url.split("?", 1)[0].rstrip("/")
+            if not current_url.split("?", 1)[0].rstrip("/").startswith(wanted):
+                return False
+        return True
+
     @asynccontextmanager
     async def astream_evaluation(
         self,
@@ -2791,8 +2900,14 @@ class DirectVerificationToken:
         model_id_override: str | None = None,
         generation_params: Mapping[str, Any] | None = None,
         follow_up: bool = False,
+        prefetch_next: bool = False,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
-        """Mint a fresh v3 assertion and stream ``endpoint_path`` inside the same browser tab."""
+        """Mint a fresh v3 assertion and stream ``endpoint_path`` inside the same browser tab.
+
+        ``prefetch_next`` marks a one-shot request: once its answer finished,
+        the warm tab navigates back to Direct Chat in the background so the
+        following prompt skips that navigation entirely.
+        """
         self._check_stream_browser_ready()
         allow_headed = bool(self.options.interactive)
         is_live_browser = BrowserEnvironment is _DEFAULT_BROWSER_ENVIRONMENT
@@ -2818,6 +2933,7 @@ class DirectVerificationToken:
                         follow_up=follow_up,
                         user_data_dir=profile_dir,
                         hide_window=hide_live_window,
+                        prefetch_next=prefetch_next,
                     ) as outcome:
                         stream_yielded = True
                         yield outcome
@@ -2846,6 +2962,7 @@ class DirectVerificationToken:
                 follow_up=follow_up,
                 user_data_dir=profile_dir,
                 hide_window=False,
+                prefetch_next=prefetch_next,
             ) as outcome:
                 yield outcome
             return
@@ -2864,6 +2981,7 @@ class DirectVerificationToken:
                     generation_params=generation_params,
                     follow_up=follow_up,
                     user_data_dir=profile_dir,
+                    prefetch_next=prefetch_next,
                 ) as outcome:
                     stream_yielded = True
                     yield outcome
@@ -2897,6 +3015,7 @@ class DirectVerificationToken:
             generation_params=generation_params,
             follow_up=follow_up,
             user_data_dir=profile_dir,
+            prefetch_next=prefetch_next,
         ) as outcome:
             yield outcome
 
@@ -2911,6 +3030,7 @@ class DirectVerificationToken:
         model_id_override: str | None = None,
         generation_params: Mapping[str, Any] | None = None,
         follow_up: bool = False,
+        prefetch_next: bool = False,
     ) -> Iterator[tuple[str, Iterator[bytes]]]:
         """Synchronous streaming bridge over :meth:`astream_evaluation`."""
         sync_q: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -2931,6 +3051,7 @@ class DirectVerificationToken:
                     model_id_override=model_id_override,
                     generation_params=generation_params,
                     follow_up=follow_up,
+                    prefetch_next=prefetch_next,
                 ) as (content_type, async_chunks):
                     sync_q.put(("meta", content_type))
                     async for wire in async_chunks:
