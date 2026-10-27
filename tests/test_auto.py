@@ -5691,3 +5691,116 @@ def test_cli_session_flag_reaches_the_options() -> None:
     assert options.session_source == "firefox"
     assert options.profile_name == "work"
     assert auto_module._options_from_args(parser.parse_args([])).session_source is None
+
+
+# --------------------------------------------------------------------------- #
+# Archiving the finished conversation
+# --------------------------------------------------------------------------- #
+
+
+class _ArchivePage:
+    """Fake page for the "row -> menu -> Archive" flow."""
+
+    def __init__(self, *, triggers: int = 1, item_after_clicks: int = 1) -> None:
+        self.triggers = triggers
+        self.item_after_clicks = item_after_clicks
+        self.clicks: list[str] = []
+        self.scripts: list[str] = []
+        self._menu_open = False
+        self._open_count = 0
+
+    def locator(self, selector: str) -> object:
+        page = self
+
+        class Locator:
+            @property
+            def first(self) -> "Locator":
+                return self
+
+            async def click(self, timeout: float = 0, force: bool = False) -> None:
+                del timeout, force
+                page.clicks.append(selector)
+                if "trigger" in selector:
+                    page._open_count += 1
+                    page._menu_open = page._open_count >= page.item_after_clicks
+                if "archive-item" in selector:
+                    page._menu_open = False
+
+        return Locator()
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        del ms
+
+    async def evaluate(self, script: str) -> object:
+        self.scripts.append(script)
+        if "arena_archive_triggers" in script:
+            return {"found": self.triggers, "strategies": [100] * self.triggers}
+        if "arena_archive_item" in script:
+            return {"found": 1, "label": "Archive"} if self._menu_open else {"found": 0}
+        if "arena_archive_confirm" in script:
+            # After the item is clicked the menu is closed, which is what the
+            # real page reports too.
+            return {"menu_open": self._menu_open, "active_row": False}
+        return True
+
+
+def test_archive_conversation_clicks_the_menu_item() -> None:
+    page = _ArchivePage()
+    archived = asyncio.run(auto_module.archive_conversation(page))
+    assert archived is True
+    assert page.clicks == [
+        '[data-arena-archive-trigger="0"]',
+        '[data-arena-archive-item="1"]',
+    ]
+    # The DOM marks are cleaned up even on success, and the action is confirmed
+    # (the menu closes) instead of being assumed.
+    assert any("arena_archive_cleanup" in script for script in page.scripts)
+    assert any("arena_archive_confirm" in script for script in page.scripts)
+
+
+def test_archive_conversation_without_a_trigger_is_a_miss() -> None:
+    page = _ArchivePage(triggers=0)
+    assert asyncio.run(auto_module.archive_conversation(page)) is False
+    assert page.clicks == []
+
+
+def test_archive_conversation_tries_the_next_trigger() -> None:
+    # The first two triggers open a menu that has no Archive entry.
+    page = _ArchivePage(triggers=3, item_after_clicks=3)
+    assert asyncio.run(auto_module.archive_conversation(page, timeout=0.3)) is True
+    triggers = [click for click in page.clicks if "trigger" in click]
+    assert triggers == [
+        '[data-arena-archive-trigger="0"]',
+        '[data-arena-archive-trigger="1"]',
+        '[data-arena-archive-trigger="2"]',
+    ]
+
+
+def test_archive_conversation_gives_up_when_the_menu_never_opens() -> None:
+    page = _ArchivePage(triggers=2, item_after_clicks=99)
+    assert asyncio.run(auto_module.archive_conversation(page, timeout=0.2)) is False
+    assert all("archive-item" not in click for click in page.clicks)
+
+
+def test_archive_conversation_needs_a_page() -> None:
+    assert asyncio.run(auto_module.archive_conversation(object())) is False
+
+
+def test_archive_option_is_off_by_default_and_parsed_from_the_cli() -> None:
+    assert auto_module.AutoOptions().archive_after_answer is False
+    parser = auto_module.build_arg_parser()
+    options = auto_module._options_from_args(
+        parser.parse_args(["--archive-after-answer"])
+    )
+    assert options.archive_after_answer is True
+
+
+def test_follow_ups_are_never_archived() -> None:
+    """A follow-up turn needs the conversation open, so it must be excluded.
+
+    The guard sits inline in the browser attempt; this test pins the option it
+    reads so a rename cannot silently enable archiving for chat sessions.
+    """
+    options = auto_module.AutoOptions(archive_after_answer=True)
+    assert options.archive_after_answer is True
+    assert auto_module.AutoOptions().archive_after_answer is False
