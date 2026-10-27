@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,34 @@ def _load() -> Any:
 bench = _load()
 
 
+def _report(phases: list[tuple[str, float]]) -> str:
+    payload = {
+        "total_ms": phases[-1][1] if phases else 0.0,
+        "phases": [{"phase": n, "at_ms": at, "delta_ms": 0.0} for n, at in phases],
+    }
+    return f"[arena-api latency] {json.dumps(payload)}"
+
+
+def test_parse_first_token_reads_the_merged_daemon_phases() -> None:
+    stderr = "\n".join(
+        [
+            "[arena-api] session: Firefox profile ...",
+            _report([("cli.start", 4.0), ("daemon.first_byte", 900.0), ("cli.exit", 8000.0)]),
+        ]
+    )
+    assert bench.parse_first_token(stderr) == 0.9
+
+
+def test_parse_first_token_takes_the_earliest_marker() -> None:
+    stderr = _report([("first_byte", 700.0), ("first_delta", 950.0), ("cli.exit", 5000.0)])
+    assert bench.parse_first_token(stderr) == 0.7
+
+
+def test_parse_first_token_without_a_report() -> None:
+    assert bench.parse_first_token("[arena-api] nothing") is None
+    assert bench.parse_first_token("[arena-api latency] {broken") is None
+
+
 def _strict(*args: Any, **kwargs: Any) -> Any:
     """Fail the test if the benchmark ever sleeps between runs."""
     raise AssertionError(f"the benchmark must not delay a run ({args})")
@@ -30,15 +59,16 @@ def test_no_delays_are_used_and_failures_do_not_abort(
 ) -> None:
     calls: list[list[str]] = []
 
-    def _run(_python: str, argv: Any) -> tuple[float, int, str]:
+    def _run(_python: str, argv: Any) -> tuple[float, int, str, float | None]:
         argv = list(argv)
         calls.append(argv)
         if "--warm-stop" in argv:
-            return 0.1, 0, ""
+            return 0.1, 0, "", None
         if "--no-warm" in argv and len(calls) == 2:
             # The user's case: one prompt is rejected (captcha not cleared).
-            return 8.5, 1, "[arena-api] Arena answered HTTP 429. No verification challenge was found"
-        return (8.8 if "--no-warm" in argv else 1.2), 0, ""
+            return 8.5, 1, "[arena-api] Arena answered HTTP 429. No verification challenge was found", None
+        cold = "--no-warm" in argv
+        return (8.8 if cold else 1.2), 0, "", (5.0 if cold else 0.6)
 
     monkeypatch.setattr(bench, "_run", _run)
     monkeypatch.setattr(bench.time, "sleep", _strict)
@@ -59,7 +89,7 @@ def test_stops_only_when_nothing_was_measured(
     monkeypatch.setattr(
         bench,
         "_run",
-        lambda *a, **k: (1.0, 1, "[arena-api] no session found for arena.ai"),
+        lambda *a, **k: (1.0, 1, "[arena-api] no session found for arena.ai", None),
     )
     monkeypatch.setattr(bench.time, "sleep", _strict)
     assert bench.main(["--prompt", "hi", "--runs", "2"]) == 2
@@ -69,13 +99,13 @@ def test_stops_only_when_nothing_was_measured(
 def test_reports_when_only_one_side_was_measured(
     monkeypatch: Any, capsys: Any
 ) -> None:
-    def _run(_python: str, argv: Any) -> tuple[float, int, str]:
+    def _run(_python: str, argv: Any) -> tuple[float, int, str, float | None]:
         argv = list(argv)
         if "--warm-stop" in argv:
-            return 0.1, 0, ""
+            return 0.1, 0, "", None
         if "--no-warm" in argv:
-            return 8.8, 0, ""
-        return 2.0, 1, "[arena-api] Arena answered HTTP 429."
+            return 8.8, 0, "", 4.0
+        return 2.0, 1, "[arena-api] Arena answered HTTP 429.", None
 
     monkeypatch.setattr(bench, "_run", _run)
     monkeypatch.setattr(bench.time, "sleep", _strict)
@@ -89,21 +119,23 @@ def test_first_warm_run_is_reported_apart(
 ) -> None:
     times = {"cold": 9.0, "warm": 1.5}
 
-    def _run(_python: str, argv: Any) -> tuple[float, int, str]:
+    def _run(_python: str, argv: Any) -> tuple[float, int, str, float | None]:
         argv = list(argv)
         if "--warm-stop" in argv:
-            return 0.1, 0, ""
+            return 0.1, 0, "", None
         if "--no-warm" in argv:
-            return times["cold"], 0, ""
+            return times["cold"], 0, "", 6.0
         value = times["warm"]
         times["warm"] = 1.0  # every following warm call is faster
-        return value, 0, ""
+        return value, 0, "", 0.5
 
     monkeypatch.setattr(bench, "_run", _run)
     monkeypatch.setattr(bench.time, "sleep", _strict)
     assert bench.main(["--prompt", "hi", "--runs", "2"]) == 0
     out = capsys.readouterr().out
     assert "first warm run (daemon start): 1.50s" in out
+    assert "time to first token" in out
+    assert "speed-up on first token" in out
     assert "speed-up on repeated prompts: 9.0x" in out
 
 

@@ -4859,6 +4859,45 @@ def test_cdp_stream_pump_handles_pre_arm_Macrotask_race_and_arm_failure_fallback
     asyncio.run(_exercise())
 
 
+def test_cookies_need_reload_only_for_new_session_cookies() -> None:
+    need = auto_module._cookies_need_reload
+    previous = {"arena-auth-prod-v1.0": "jwt-1", "_ga": "GA1", "sidebar_state": "true"}
+
+    # Arena rotates its JWT on every turn and the page rewrites its own
+    # cookies: neither may cost a full page reload.
+    assert need(previous, {**previous, "arena-auth-prod-v1.0": "jwt-2"}) is False
+    assert need(previous, {**previous, "_ga": "GA2"}) is False
+    assert need(previous, {**previous, "sidebar_state": "false"}) is False
+    assert need(previous, dict(previous)) is False
+    # A genuinely new session cookie (fresh --login) must be picked up.
+    assert need(previous, {**previous, "arena-auth-prod-v1.1": "jwt-3"}) is True
+    assert need({}, {"arena-auth-prod-v1.0": "jwt"}) is True
+    assert need({}, {}) is False
+
+
+def test_page_is_working_ignores_unavailable_pages() -> None:
+    class Bare:
+        pass
+
+    class Busy:
+        async def evaluate(self, script: str) -> object:
+            assert "stop generating" in script or "pending" in script
+            return {"pending": True, "busy": True}
+
+    class Idle:
+        async def evaluate(self, script: str) -> object:
+            return {"pending": False, "busy": False}
+
+    class Broken:
+        async def evaluate(self, script: str) -> object:
+            raise RuntimeError("target closed")
+
+    assert asyncio.run(auto_module._page_is_working(Bare())) is False
+    assert asyncio.run(auto_module._page_is_working(Busy())) is True
+    assert asyncio.run(auto_module._page_is_working(Idle())) is False
+    assert asyncio.run(auto_module._page_is_working(Broken())) is False
+
+
 def test_warm_browser_keep_alive_reuses_environment_and_follow_up_skips_goto(
     tmp_path, monkeypatch
 ) -> None:
@@ -5019,15 +5058,22 @@ def test_warm_browser_keep_alive_reuses_environment_and_follow_up_skips_goto(
         # critical path, only a new prefetch afterwards.
         assert len(goto_urls) == 3
 
+        # Arena rotates the auth cookie on every turn.  That must not be read as
+        # "new cookies, reload the page" -- the open tab is already warm.
+        tok.session_cookies = {"arena-auth-prod-v1.0": "jwt-rotated"}
+        assert client.complete("Вопрос 3") == "Ответ #3"
+        assert env_enters == 1 and env_exits == 0
+        assert len(goto_urls) == 4  # the background prefetch only, no reload
+
         conv = client.chat()
-        assert conv.send_message("Старт диалога") == "Ответ #3"
+        assert conv.send_message("Старт диалога") == "Ответ #4"
         # A chat session keeps its conversation open: no prefetch after it.
-        assert len(goto_urls) == 3
+        assert len(goto_urls) == 4
         assert tok._warm_state is not None
         assert tok._warm_state.prefetch_task is None
         # Follow-up in the open conversation skips page.goto completely!
-        assert conv.send_message("Продолжение") == "Ответ #4"
-        assert len(goto_urls) == 3
+        assert conv.send_message("Продолжение") == "Ответ #5"
+        assert len(goto_urls) == 4
         assert env_enters == 1 and env_exits == 0
 
     assert env_exits == 1
