@@ -44,6 +44,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from ..constants import DEFAULT_BASE_URL
@@ -270,20 +271,12 @@ def render_tool_instructions(
         return ""
     lines = [
         "### Tools",
-        "You can act by calling tools. A tool call is ONLY recognised when it is",
-        "written as this exact block, at the end of your message, outside any",
-        "markdown fence and without additional commentary inside it:",
-        "",
-        '<tool_call>{"name": "<tool name>", "arguments": {"<argument>": <value>}}</tool_call>',
-        "",
-        "Rules:",
-        "1. Emit a tool call only when you need information or an action.",
-        "2. One block per call; several blocks are allowed when calls are independent.",
-        "3. `arguments` must be a JSON object matching the tool's schema exactly.",
-        "4. A file path or other value shown above must be copied verbatim.",
-        "5. When no tool is needed, answer normally -- never invent the result of",
-        "   a tool you did not call, and never write pseudo tool output.",
-        "6. After a tool call you will receive `[tool_result ...]`. Continue from it.",
+        "To call a tool, write exactly this and nothing else inside the block:",
+        '<tool_call>{"name": "<tool>", "arguments": {"<arg>": <value>}}</tool_call>',
+        "Rules: call only when you need information or an action; `arguments` is a",
+        "JSON object matching the schema; copy paths and commands verbatim; answer",
+        "normally when no tool is needed; never invent or write tool output; after",
+        "a call you receive `[tool_result ...]` -- continue from it.",
         "",
         "Available tools:",
     ]
@@ -292,8 +285,10 @@ def render_tool_instructions(
         if not name:
             continue
         description = str(tool.get("description") or "").strip()
-        if len(description) > 900:
-            description = description[:900].rstrip() + "..."
+        # Claude Code declares a dozen-plus tools; a 900-character description
+        # each would spend the whole context on documentation.
+        if len(description) > 300:
+            description = description[:300].rstrip() + "..."
         lines.append(f"- {name}{_tool_signature(tool)}")
         if description:
             lines.append(f"    {description}")
@@ -737,6 +732,24 @@ class _HttpEngine:
                 pass
 
 
+def _looks_like_unknown_model(exc: BaseException) -> bool:
+    """Whether an error really means "there is no such model"."""
+    text = str(exc).lower()
+    if "model" not in text:
+        return False
+    markers = (
+        "not found",
+        "unknown",
+        "unsupported",
+        "invalid",
+        "no such",
+        "does not exist",
+        "could not find",
+        "not available",
+    )
+    return any(marker in text for marker in markers)
+
+
 class ArenaEngine:
     """Serialises prompts and picks the backend, with a graceful fallback."""
 
@@ -805,30 +818,67 @@ class ArenaEngine:
                 pass
         print(f"[arena-api] {message}", file=sys.stderr, flush=True)
 
+    def _open(
+        self, prompt: str, model: str | None
+    ) -> tuple[Any, str]:
+        """Open the best available stream and return it with its first delta.
+
+        Two failures are worth a retry rather than an error page:
+
+        * the client named a model Arena does not have (Claude Code sends its
+          own ``claude-sonnet-...`` ids) -- retry with Arena's default model,
+          because refusing the whole turn for a name mismatch is useless;
+        * the primary engine (the warm daemon) is not there -- fall back to the
+          in-process client, which is exactly what the CLI does.
+        """
+        last_error: BaseException | None = None
+        for engine in (self._primary, self._fallback):
+            if engine is None:
+                continue
+            active_model = model
+            for attempt in (0, 1):
+                stream = engine.answer(prompt, model=active_model)
+                try:
+                    return stream, next(stream)
+                except StopIteration:
+                    self._close_stream(stream)
+                    return engine.answer(prompt, model=active_model), ""
+                except Exception as exc:  # noqa: BLE001 - decided below
+                    last_error = exc
+                    self._close_stream(stream)
+                    if (
+                        attempt == 0
+                        and active_model is not None
+                        and _looks_like_unknown_model(exc)
+                    ):
+                        self._note(
+                            f"Arena не знает модель {active_model!r} ({exc}); "
+                            "отвечаю моделью Arena по умолчанию"
+                        )
+                        active_model = None
+                        continue
+                    self._note(f"{engine.name} engine failed ({exc}); falling back")
+                    break
+        raise EngineError(str(last_error) if last_error else "no engine available")
+
+    @staticmethod
+    def _close_stream(stream: Any) -> None:
+        close_fn = getattr(stream, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:  # noqa: BLE001
+                pass
+
     def answer(self, prompt: str, *, model: str | None = None) -> Iterator[str]:
         with self._lock:
-            stream = self._primary.answer(prompt, model=model)
+            stream, first = self._open(prompt, model)
             try:
-                first = next(stream)
-            except StopIteration:
-                return
-            except Exception as exc:  # noqa: BLE001 - fallback path
-                self._note(f"{self._primary.name} engine failed ({exc}); falling back")
-                if self._fallback is None:
-                    raise EngineError(str(exc)) from exc
-                stream = self._fallback.answer(prompt, model=model)
-                yield from stream
-                return
-            yield first
-            try:
+                if first:
+                    yield first
                 yield from stream
             finally:
-                close_fn = getattr(stream, "close", None)
-                if callable(close_fn):
-                    try:
-                        close_fn()
-                    except Exception:  # noqa: BLE001
-                        pass
+                self._close_stream(stream)
 
     def close(self) -> None:
         for engine in (self._primary, self._fallback):
@@ -1504,12 +1554,343 @@ def _serve_parser() -> Any:
         help="truncate a rendered prompt beyond this many characters",
     )
     parser.add_argument("--verbose", action="store_true", help="log every request")
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help=(
+            "check the four links (installed package, session, engine, loopback "
+            "protocol) and name the first one that breaks"
+        ),
+    )
     return parser
+
+
+
+# --------------------------------------------------------------------------- #
+# Doctor: tell the user *which* of the four links is broken
+# --------------------------------------------------------------------------- #
+
+
+class _Report:
+    """Collects the doctor's verdicts and prints them as it goes."""
+
+    def __init__(self, out: Any = None) -> None:
+        self.lines: list[str] = []
+        self.failures = 0
+        self._out = out or sys.stdout
+
+    def step(self, title: str) -> None:
+        self._write("")
+        self._write(title)
+
+    def ok(self, message: str) -> None:
+        self._write(f"  ok    {message}")
+
+    def fail(self, message: str, hint: str | None = None) -> None:
+        self.failures += 1
+        self._write(f"  ОШИБКА {message}")
+        if hint:
+            for line in hint.splitlines():
+                self._write(f"         {line}")
+
+    def note(self, message: str) -> None:
+        self._write(f"        {message}")
+
+    def _write(self, line: str) -> None:
+        self.lines.append(line)
+        print(line, flush=True)
+
+
+def _answer_once(
+    engine: Any, prompt: str, *, limit: int = 400
+) -> tuple[str, float, float]:
+    """Run one prompt through the engine; return text, first-delta and total time."""
+    started = time.monotonic()
+    first = 0.0
+    parts: list[str] = []
+    size = 0
+    for delta in engine.answer(prompt):
+        if not first:
+            first = time.monotonic() - started
+        parts.append(delta)
+        size += len(delta)
+        if size >= limit:
+            break
+    return "".join(parts), first or (time.monotonic() - started), (
+        time.monotonic() - started
+    )
+
+
+def _post_loopback(
+    url: str, payload: Mapping[str, Any], *, stream: bool, timeout: float = 120.0
+) -> tuple[int, list[tuple[str, Any]]]:
+    """Speak the Anthropic protocol to our own port, exactly like a client."""
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"content-type": "application/json", "anthropic-version": ANTHROPIC_VERSION},
+        method="POST",
+    )
+    if not stream:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, [("http_error", exc.read().decode("utf-8", "replace"))]
+        return 200, [("message", data)]
+    events: list[tuple[str, Any]] = []
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            name = ""
+            for raw in response:
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if line.startswith("event: "):
+                    name = line[len("event: ") :]
+                elif line.startswith("data: "):
+                    try:
+                        events.append((name, json.loads(line[len("data: ") :])))
+                    except ValueError:
+                        events.append((name, line[len("data: ") :]))
+                # No early break: `message_stop` is announced by its event
+                # line, and its data line is the very thing worth reading.
+    except urllib.error.HTTPError as exc:
+        return exc.code, [("http_error", exc.read().decode("utf-8", "replace"))]
+    return 200, events
+
+
+def doctor(argv: Sequence[str] | None = None) -> int:
+    """``arena-api --claude --doctor``: find out what is actually broken.
+
+    The shim has four links -- the installed package, the session, the engine
+    that talks to Arena, and the HTTP/SSE protocol on loopback -- and a failure
+    in any of them looks like "Claude Code says something went wrong".  This
+    walks them in order and names the first one that breaks, with the fix.
+    """
+    args = [item for item in (sys.argv[1:] if argv is None else argv) if item != "--claude"]
+    parsed, _ = _serve_parser().parse_known_args(args)
+    report = _Report()
+    report.step("1. Установка")
+    from importlib.util import find_spec
+
+    import arena_api
+
+    from .._cli import _package_version
+
+    report.note(f"arena-api {_package_version()}")
+    module_dir = str(Path(str(arena_api.__file__)).parent)
+    report.note(f"пакет    : {module_dir}")
+    report.note(f"python   : {sys.executable}")
+    if find_spec("arena_api.compat.anthropic_server") is None:  # pragma: no cover
+        report.fail(
+            "шим отсутствует в этой сборке",
+            "обновите пакет: pip install -U -e \".[auto]\" (из клона репозитория)",
+        )
+    else:
+        report.ok("шим на месте (arena_api.compat.anthropic_server)")
+
+    try:
+        from ..auto import AutoOptions, build_arg_parser
+
+        fields = set(getattr(AutoOptions, "__dataclass_fields__", {}))
+        has_session = "session_source" in fields and "session" in (
+            build_arg_parser().parse_args([]).__dict__
+        )
+    except Exception as exc:  # noqa: BLE001 - an old package raises here
+        has_session = False
+        report.fail(f"arena_api.auto не импортируется: {exc}")
+    if has_session:
+        report.ok("--session / session_source поддержаны")
+    else:
+        report.fail(
+            "эта сборка не знает --session",
+            "обновите пакет: pip install -U -e \".[auto]\" — иначе сессия "
+            "Firefox не может быть выбрана",
+        )
+
+    session = parsed.session
+    report.step(f"2. Сессия (источник: {session}"
+                + (f", профиль {parsed.profile}" if parsed.profile else "") + ")")
+    if not has_session:
+        report.fail("шаг пропущен: пакет не умеет --session")
+    else:
+        from ..auto import explain_sources, find_session_for_doctor
+
+        try:
+            found, active = find_session_for_doctor(
+                session=session,
+                profile=parsed.profile,
+                profile_root=parsed.profile_root,
+                base_url=parsed.base_url,
+            )
+        except Exception as exc:  # noqa: BLE001 - this is what the doctor is for
+            found, active, failure = None, None, f"{type(exc).__name__}: {exc}"
+        else:
+            failure = ""
+        if found is None:
+            lines = [failure] if failure else ["куки не найдены"]
+            if active is not None:
+                lines.extend(explain_sources(active))
+            report.fail("сессия не найдена", "\n".join(lines))
+        else:
+            report.ok(found.description)
+            names = ", ".join(sorted(found.cookies))[:160]
+            report.note(f"куки: {names}")
+
+    engine_name = parsed.engine
+    report.step(f"3. Движок ответа ({engine_name})")
+    engine: Any = None
+    try:
+        engine = ArenaEngine(
+            engine=engine_name,
+            base_url=parsed.base_url,
+            tools_mode=parsed.tools,
+            session=session,
+            profile=parsed.profile,
+            profile_root=parsed.profile_root,
+            log=report.note,
+        )
+        text, first, total = _answer_once(
+            engine, "Ответь одним словом: работает", limit=200
+        )
+        if text.strip():
+            preview = text.strip().replace("\n", " ")[:120]
+            report.ok(f'ответ за {total:.1f} с (первый фрагмент {first:.1f} с): "{preview}"')
+        else:
+            report.fail("движок вернул пустой ответ")
+    except Exception as exc:  # noqa: BLE001 - this is the point of the doctor
+        report.fail(f"{type(exc).__name__}: {exc}", _engine_hint(exc))
+
+    report.step("4. Протокол на loopback (как это видит Claude Code)")
+    if engine is None:
+        report.fail("шаг пропущен: движок не создан")
+    else:
+        server = create_server(
+            host="127.0.0.1",
+            port=0,
+            engine=engine,
+            verbose=False,
+            default_model=parsed.default_model,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = _address_url(server.server_address)
+        try:
+            request = {
+                "model": parsed.default_model,
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "скажи ок"}],
+            }
+            status, payload_events = _post_loopback(
+                f"{base}/v1/messages", request, stream=False
+            )
+            if status == 200 and payload_events:
+                blocks = payload_events[0][1].get("content") or []
+                text = "".join(str(block.get("text") or "") for block in blocks)
+                report.ok(f"JSON-ответ: {len(text)} символов, stop_reason="
+                          f"{payload_events[0][1].get('stop_reason')}")
+            else:
+                report.fail(f"JSON-ответ: HTTP {status}: {payload_events[:1]}")
+            status, events = _post_loopback(
+                f"{base}/v1/messages", {**request, "stream": True}, stream=True
+            )
+            event_names = [name for name, _ in events]
+            if status == 200 and "message_stop" in event_names:
+                reply = "".join(
+                    data["delta"].get("text", "")
+                    for name, data in events
+                    if name == "content_block_delta" and isinstance(data, dict)
+                )
+                report.ok(
+                    f"SSE: {len(event_names)} событий, {len(reply)} символов, "
+                    f"события: {', '.join(event_names[:6])}..."
+                )
+            else:
+                report.fail(f"SSE: HTTP {status}, события: {event_names[:8]}")
+            with_tools = {
+                **request,
+                "tools": [
+                    {
+                        "name": "Bash",
+                        "description": "run a command",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    }
+                ],
+            }
+            status, events = _post_loopback(
+                f"{base}/v1/messages", {**with_tools, "stream": True}, stream=True
+            )
+            event_names = [name for name, _ in events]
+            kinds = [
+                data["content_block"]["type"]
+                for name, data in events
+                if name == "content_block_start" and isinstance(data, dict)
+            ]
+            if status == 200 and "message_stop" in event_names:
+                report.ok(f"SSE с инструментами: блоки {kinds or ['—']}")
+            else:
+                report.fail(
+                    f"SSE с инструментами: HTTP {status}, "
+                    f"события: {event_names[:8]}"
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            engine.close()
+
+    report.step("ИТОГ")
+    if report.failures == 0:
+        report.note("Шим отвечает. Запускайте:")
+        report.note(f"  arena-api --claude --port {DEFAULT_PORT}")
+        report.note(f'  ANTHROPIC_BASE_URL=http://127.0.0.1:{DEFAULT_PORT}')
+        report.note("  ANTHROPIC_API_KEY=arena")
+        return 0
+    report.note(f"Найдено проблем: {report.failures}. Начните с первой — остальные")
+    report.note("обычно её следствие.")
+    return 1
+
+
+def _engine_hint(exc: BaseException) -> str:
+    """Turn an engine failure into something the user can act on."""
+    text = str(exc)
+    lowered = text.lower()
+    if isinstance(exc, TypeError) and "unexpected keyword" in lowered:
+        return (
+            "похоже, установлена старая сборка arena-api: обновите её "
+            "(pip install -U -e \".[auto]\")"
+        )
+    if "session" in lowered or "cookies" in lowered or "profile" in lowered:
+        return "проверьте, что в Firefox открыт arena.ai и вы вошли в аккаунт"
+    if "playwright" in lowered or "browser" in lowered:
+        return "нужен браузер Playwright: playwright install chromium"
+    if "captcha" in lowered or "challenge" in lowered or "403" in lowered:
+        return (
+            "Arena показала капчу/челлендж: поставьте солвер "
+            "(pip install 'arena-api[captcha]') или обновите сессию через "
+            "arena-api --login"
+        )
+    if "401" in lowered or "403" in lowered or "unauthor" in lowered:
+        return "сессия отклонена: обновите её (arena-api --login) или --session auto"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "Arena не ответила вовремя: проверьте прокси/сеть (--proxy, --no-verify)"
+    return (
+        "подробности выше; для полного лога: set ARENA_WARM_DEBUG=1 и "
+        "arena-api --claude --verbose"
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """``arena-api --claude``: run the shim until interrupted."""
     args = [item for item in (sys.argv[1:] if argv is None else argv) if item != "--claude"]
+    if "--doctor" in args:
+        return doctor(args)
     parsed, _ = _serve_parser().parse_known_args(args)
     server = create_server(
         host=parsed.host,
@@ -1565,6 +1946,7 @@ __all__ = [
     "MessagesRequest",
     "build_content_blocks",
     "create_server",
+    "doctor",
     "main",
     "parse_tool_calls",
     "render_prompt",
