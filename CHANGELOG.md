@@ -5,6 +5,29 @@
 
 ## Unreleased
 
+### Firefox по умолчанию и принудительный выбор источника сессии
+
+- **`arena-api --claude` берёт сессию Firefox** (`--session firefox`):
+  профиль Firefox, его куки и TLS-отпечаток — то, что библиотека читает лучше
+  всего, — так что Claude Code разговаривает с Arena как уже вошедший
+  пользователь, без анонимного профиля и лишней капчи. Уточнить профиль можно
+  `--session firefox:<profile>`, `--session firefox:<profile-root>`,
+  `--profile`, `--profile-root` (и переменными `ARENA_CLAUDE_SESSION`,
+  `ARENA_CLAUDE_PROFILE`, `ARENA_CLAUDE_PROFILE_ROOT`). Если Firefox не найден,
+  шим честно пишет об этом и один раз пробует обычный поиск вместо падения;
+  `--session auto` возвращает лестницу сразу.
+- **`AutoOptions.session_source` + `--session SOURCE` в CLI**: `firefox`,
+  `firefox:<profile>`, `storage`, `chrome`/`edge`/… или `auto`. Принудительный
+  источник пропускает лестницу (явные куки и файл тоже), а его отсутствие —
+  это `AuthenticationError` со списком проверенных источников, а не тихий
+  откат на другой браузер.
+- **Демон помнит свою сессию**: в state-файле появилось поле `session`
+  (`--session`, `--profile`, `--profile-root`, `--cookies`, `--storage`),
+  и `ensure_daemon` не переиспользует демон, запущенный с другой сессией.
+  Старые state-файлы читаются как раньше.
+- **`--explain` показывает принудительный источник** строкой
+  `session source : firefox (forced, ladder skipped)`.
+
 ### Claude Code на моделях Arena: Anthropic-совместимый API
 
 - **`arena-api --version`**: печатает версию, **каталог установленного

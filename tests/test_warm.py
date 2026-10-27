@@ -557,3 +557,59 @@ def test_cli_handles_daemon_commands_without_a_session(
     monkeypatch.setattr(warm, "status_main", lambda _argv: calls.append("status") or 0)
     assert _cli.main(argv) == 0
     assert calls == ["stop" if argv[0] == "--warm-stop" else "status"]
+
+
+# --------------------------------------------------------------------------- #
+# The daemon answers with one session; a different one must not reuse it
+# --------------------------------------------------------------------------- #
+
+
+def test_session_signature_reads_the_flags_that_pick_a_session() -> None:
+    argv = [
+        "--prompt",
+        "hi",
+        "--session",
+        "firefox",
+        "--profile=work",
+        "--warm-idle",
+        "600",
+    ]
+    signature = warm.session_signature(argv)
+    assert "--session=firefox" in signature
+    assert "--profile=work" in signature
+    # A prompt or an idle timeout does not change which session is read.
+    assert "hi" not in signature
+    assert "600" not in signature
+    assert warm.session_signature([]) == ""
+
+
+def test_daemon_state_round_trips_the_session(tmp_path: Path) -> None:
+    path = tmp_path / "warm-daemon.json"
+    state = warm.DaemonState(
+        pid=1, port=2, token="t", session="--session=firefox"
+    )
+    state.write(path)
+    restored = warm.DaemonState.read(path)
+    assert restored is not None
+    assert restored.session == "--session=firefox"
+
+
+def test_a_daemon_with_another_session_is_not_reused() -> None:
+    state = warm.DaemonState(
+        pid=1,
+        port=2,
+        token="t",
+        api_version=warm.api_version(),
+        base_url="https://arena.ai",
+        session="--session=firefox",
+    )
+    assert warm._compatible(state, base_url="https://arena.ai", session="--session=firefox")
+    # Same URL, different session: the caller asked for another profile, so the
+    # running daemon (which holds a browser and cookies) cannot answer for it.
+    assert not warm._compatible(state, base_url="https://arena.ai", session="")
+
+
+def test_old_state_files_without_a_session_still_work() -> None:
+    state = warm.DaemonState.from_json({"pid": 5, "port": 6, "token": "t"})
+    assert state is not None
+    assert state.session == ""

@@ -5585,3 +5585,109 @@ def test_firefox_cookie_snapshot_and_sessionstore_caches_invalidate_on_write(
     c3 = fs_mod.read_firefox_cookies(db_path, ("arena.ai",))
     assert c3 == {"arena-auth-prod-v1.0": "v2", "sess_tok": "s1"}
     assert copy_calls == 2
+
+
+# --------------------------------------------------------------------------- #
+# Forcing one session source (the Claude Code shim asks for Firefox)
+# --------------------------------------------------------------------------- #
+
+
+def test_forced_firefox_reads_the_firefox_profile(tmp_path) -> None:
+    profiles = make_firefox_profile(tmp_path)
+    options = isolated_options(
+        tmp_path,
+        use_browser_profiles=True,
+        profiles_root=profiles,
+        session_source="firefox",
+    )
+    found = discover_session(options)
+    assert found.source == "firefox"
+    assert found.cookies == {"session": "from-firefox"}
+
+
+def test_forced_firefox_wins_over_a_stored_file(tmp_path) -> None:
+    profiles = make_firefox_profile(tmp_path)
+    stored = tmp_path / "cookies.json"
+    stored.write_text(json.dumps({"session": "from-file"}), encoding="utf-8")
+    options = isolated_options(
+        tmp_path,
+        use_browser_profiles=True,
+        profiles_root=profiles,
+        storage_path=stored,
+        session_source="firefox",
+    )
+    # Forcing a source means exactly that: the ladder is not consulted.
+    assert discover_session(options).cookies == {"session": "from-firefox"}
+
+
+def test_forced_firefox_without_a_profile_is_an_error(tmp_path) -> None:
+    options = isolated_options(
+        tmp_path, use_browser_profiles=True, session_source="firefox"
+    )
+    with pytest.raises(auto_module.AuthenticationError) as caught:
+        discover_session(options)
+    assert "firefox" in str(caught.value)
+    assert "cookies" in str(caught.value)
+
+
+def test_forced_firefox_accepts_a_profile_name(tmp_path) -> None:
+    profiles = make_firefox_profile(tmp_path)
+    options = isolated_options(
+        tmp_path,
+        use_browser_profiles=True,
+        profiles_root=profiles,
+        session_source="firefox:abcd1234.default-release",
+    )
+    assert discover_session(options).cookies == {"session": "from-firefox"}
+
+
+def test_forced_firefox_accepts_a_profile_root(tmp_path) -> None:
+    profiles = make_firefox_profile(tmp_path)
+    options = isolated_options(
+        tmp_path, use_browser_profiles=True, session_source=f"firefox:{profiles}"
+    )
+    assert discover_session(options).cookies == {"session": "from-firefox"}
+
+
+def test_forced_storage_reads_the_stored_file(tmp_path) -> None:
+    stored = tmp_path / "cookies.json"
+    stored.write_text(json.dumps({"session": "from-file"}), encoding="utf-8")
+    options = isolated_options(tmp_path, storage_path=stored, session_source="storage")
+    assert discover_session(options).cookies == {"session": "from-file"}
+
+
+def test_forced_browser_name_uses_rookiepy(tmp_path, monkeypatch) -> None:
+    class FakeRookiepy:
+        @staticmethod
+        def chrome(domains=()):
+            return [{"name": "session", "value": "from-chrome", "domain": ".arena.ai"}]
+
+    monkeypatch.setattr(auto_module, "_rookiepy_module", lambda: FakeRookiepy)
+    options = isolated_options(tmp_path, session_source="chrome")
+    found = discover_session(options)
+    assert found.source == "browser:chrome"
+    assert found.cookies == {"session": "from-chrome"}
+
+
+def test_unknown_session_source_is_reported() -> None:
+    options = AutoOptions(session_source="netscape")
+    with pytest.raises(auto_module.AuthenticationError) as caught:
+        discover_session(options)
+    assert "netscape" in str(caught.value)
+
+
+def test_auto_session_source_keeps_the_ladder(tmp_path) -> None:
+    stored = tmp_path / "cookies.json"
+    stored.write_text(json.dumps({"session": "from-file"}), encoding="utf-8")
+    options = isolated_options(tmp_path, storage_path=stored, session_source="auto")
+    assert auto_module._forced_source(options) is None
+    assert discover_session(options).cookies == {"session": "from-file"}
+
+
+def test_cli_session_flag_reaches_the_options() -> None:
+    parser = auto_module.build_arg_parser()
+    namespace = parser.parse_args(["--session", "firefox", "--profile", "work"])
+    options = auto_module._options_from_args(namespace)
+    assert options.session_source == "firefox"
+    assert options.profile_name == "work"
+    assert auto_module._options_from_args(parser.parse_args([])).session_source is None

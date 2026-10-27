@@ -65,6 +65,46 @@ ENGINES = ("warm", "http", "echo")
 #: ``off`` ignores ``tools`` entirely and answers as plain text.
 TOOLS_MODES = ("emulate", "off")
 
+#: Firefox is the default session source: it is the browser this library reads
+#: best (the profile, its cookies and its TLS fingerprint), so Claude Code talks
+#: to Arena as the already signed-in Firefox user instead of starting a fresh
+#: anonymous profile.  ``--session auto`` restores the discovery ladder.
+DEFAULT_SESSION = "firefox"
+
+_AUTO_SOURCES = frozenset({"", "auto", "any", "default"})
+
+
+def _is_auto_source(session: str | None) -> bool:
+    return not isinstance(session, str) or session.strip().lower() in _AUTO_SOURCES
+
+
+def _note(log: Any, message: str) -> None:
+    """Report something through the caller's log, or stderr as a last resort."""
+    if callable(log):
+        try:
+            log(message)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    _log_quiet(message)
+
+
+def _session_argv(
+    *,
+    session: str | None = None,
+    profile: str | None = None,
+    profile_root: str | None = None,
+) -> list[str]:
+    """Turn the session knobs into the CLI arguments the daemon parses."""
+    argv: list[str] = []
+    if isinstance(session, str) and session.strip() and not _is_auto_source(session):
+        argv.extend(["--session", session.strip()])
+    if isinstance(profile, str) and profile.strip():
+        argv.extend(["--profile", profile.strip()])
+    if isinstance(profile_root, str) and profile_root.strip():
+        argv.extend(["--profile-root", profile_root.strip()])
+    return argv
+
 _TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*(?P<body>.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE
 )
@@ -583,18 +623,33 @@ class _EchoEngine:
 
 
 class _WarmEngine:
-    """Answers through the warm daemon: a browser already on a chat page."""
+    """Answers through the warm daemon: a browser already on a chat page.
+
+    The daemon rebuilds its own options from the forwarded ``argv``, so the
+    session source travels as a real ``--session`` argument: the daemon then
+    reads the same browser profile the shim was told to use.
+    """
 
     name = "warm"
 
-    def __init__(self, *, base_url: str) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        session: str | None = None,
+        profile: str | None = None,
+        profile_root: str | None = None,
+    ) -> None:
         self._base_url = base_url
+        self._argv = _session_argv(
+            session=session, profile=profile, profile_root=profile_root
+        )
 
     def answer(self, prompt: str, *, model: str | None = None) -> Iterator[str]:
         from .. import warm
 
         state = warm.ensure_daemon(
-            payload={"argv": [], "base_url": self._base_url},
+            payload={"argv": list(self._argv), "base_url": self._base_url},
             base_url=self._base_url,
         )
         yield from warm.ask_stream(prompt, state=state, model=model)
@@ -608,18 +663,50 @@ class _HttpEngine:
 
     name = "http"
 
-    def __init__(self, *, base_url: str) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        session: str | None = None,
+        profile: str | None = None,
+        profile_root: str | None = None,
+        log: Any = None,
+    ) -> None:
         self._base_url = base_url
+        self._session = session
+        self._profile = profile
+        self._profile_root = profile_root
+        self._log = log
         self._client: Any = None
         self._lock = threading.Lock()
 
+    def _build(self, session: str | None) -> Any:
+        from ..auto import auto_direct_client
+
+        return auto_direct_client(
+            base_url=self._base_url,
+            verification_token="auto",
+            prewarm=True,
+            session_source=session,
+            profile_name=self._profile,
+            profiles_root=self._profile_root,
+        )
+
     def _get_client(self) -> Any:
         if self._client is None:
-            from ..auto import auto_direct_client
-
-            self._client = auto_direct_client(
-                base_url=self._base_url, verification_token="auto", prewarm=True
-            )
+            try:
+                self._client = self._build(self._session)
+            except Exception as exc:  # noqa: BLE001 - only a forced source may fall back
+                if not self._session or _is_auto_source(self._session):
+                    raise
+                # The caller asked for one source; if it has nothing, say so and
+                # use whatever session the machine does have instead of dying.
+                _note(
+                    self._log,
+                    f"{self._session} has no usable session ({exc}); "
+                    "falling back to automatic discovery",
+                )
+                self._client = self._build(None)
         return self._client
 
     def answer(self, prompt: str, *, model: str | None = None) -> Iterator[str]:
@@ -660,6 +747,9 @@ class ArenaEngine:
         base_url: str = DEFAULT_BASE_URL,
         tools_mode: str = "emulate",
         prompt: str = "",
+        session: str | None = DEFAULT_SESSION,
+        profile: str | None = None,
+        profile_root: str | None = None,
         log: Any = None,
     ) -> None:
         if engine not in ENGINES:
@@ -669,6 +759,9 @@ class ArenaEngine:
         self.engine = engine
         self.base_url = base_url
         self.tools_mode = tools_mode
+        self.session = session
+        self.profile = profile
+        self.profile_root = profile_root
         self.model_hint = prompt
         self.log = log
         self.verbose = False
@@ -678,12 +771,29 @@ class ArenaEngine:
         if engine == "echo":
             self._primary = _EchoEngine()
         elif engine == "http":
-            self._primary = _HttpEngine(base_url=base_url)
+            self._primary = _HttpEngine(
+                base_url=base_url,
+                session=session,
+                profile=profile,
+                profile_root=profile_root,
+                log=self._note,
+            )
         else:
-            self._primary = _WarmEngine(base_url=base_url)
+            self._primary = _WarmEngine(
+                base_url=base_url,
+                session=session,
+                profile=profile,
+                profile_root=profile_root,
+            )
             # A cold or unavailable daemon must not turn into a 500: the same
             # direct client the CLI falls back to answers instead.
-            self._fallback = _HttpEngine(base_url=base_url)
+            self._fallback = _HttpEngine(
+                base_url=base_url,
+                session=session,
+                profile=profile,
+                profile_root=profile_root,
+                log=self._note,
+            )
 
     def _note(self, message: str) -> None:
         log = self.log
@@ -953,6 +1063,7 @@ class _Handler(BaseHTTPRequestHandler):
             "name": "arena-api anthropic shim",
             "engine": self.engine.engine,
             "tools": self.engine.tools_mode,
+            "session": getattr(self.engine, "session", None),
             "default_model": self.server.default_model,  # type: ignore[attr-defined]
             "base_url": getattr(self.engine, "base_url", None),
             "endpoints": [
@@ -1267,12 +1378,21 @@ def create_server(
     extra_models: Sequence[str] = (),
     tools_mode: str = "emulate",
     max_prompt_chars: int = 200_000,
+    session: str | None = DEFAULT_SESSION,
+    profile: str | None = None,
+    profile_root: str | None = None,
     verbose: bool = False,
     log: Any = None,
 ) -> _Server:
     """Build the HTTP server; ``engine`` overrides everything for tests."""
     resolved = engine if engine is not None else ArenaEngine(
-        engine=engine_name, base_url=base_url, tools_mode=tools_mode, log=log
+        engine=engine_name,
+        base_url=base_url,
+        tools_mode=tools_mode,
+        session=session,
+        profile=profile,
+        profile_root=profile_root,
+        log=log,
     )
     server = _Server(
         (host, port),
@@ -1345,6 +1465,28 @@ def _serve_parser() -> Any:
         help="extra Arena model id to advertise in GET /v1/models (repeatable)",
     )
     parser.add_argument(
+        "--session",
+        default=_env("ARENA_CLAUDE_SESSION", DEFAULT_SESSION) or DEFAULT_SESSION,
+        metavar="SOURCE",
+        help=(
+            f"which browser session to use (default {DEFAULT_SESSION}): firefox, "
+            "firefox:<profile>, storage, chrome/edge/..., or auto for the "
+            "discovery ladder. Firefox is the profile this library reads best, "
+            "and its cookies/TLS fingerprint are what the requests carry"
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        default=_env("ARENA_CLAUDE_PROFILE") or None,
+        help="Firefox profile name to read (default: the most recent one)",
+    )
+    parser.add_argument(
+        "--profile-root",
+        default=_env("ARENA_CLAUDE_PROFILE_ROOT") or None,
+        metavar="DIR",
+        help="directory holding the Firefox profiles",
+    )
+    parser.add_argument(
         "--base-url",
         default=_env("ARENA_CLAUDE_BASE_URL", DEFAULT_BASE_URL),
         help="Arena frontend to talk to",
@@ -1378,6 +1520,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         extra_models=parsed.arena_model,
         tools_mode=parsed.tools,
         max_prompt_chars=parsed.max_prompt_chars,
+        session=parsed.session,
+        profile=parsed.profile,
+        profile_root=parsed.profile_root,
         verbose=parsed.verbose,
     )
     bound = server.server_address
@@ -1387,6 +1532,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"arena-api anthropic shim : http://{host}:{port}",
         f"engine                   : {parsed.engine}",
         f"tools                    : {parsed.tools}",
+        f"session                  : {parsed.session}"
+        + (f" (profile {parsed.profile})" if parsed.profile else ""),
         f"default model            : {parsed.default_model}",
         "",
         "Claude Code:",

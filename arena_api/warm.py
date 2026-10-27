@@ -215,6 +215,10 @@ class DaemonState:
     base_url: str = DEFAULT_BASE_URL
     idle_timeout: float = DEFAULT_IDLE_TIMEOUT
     python: str = ""
+    #: Which session the daemon answers with (see :func:`session_signature`).
+    #: A daemon reading Firefox must not be reused by a caller that asked for a
+    #: different profile or for the automatic ladder.
+    session: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -228,6 +232,7 @@ class DaemonState:
             "base_url": self.base_url,
             "idle_timeout": self.idle_timeout,
             "python": self.python,
+            "session": self.session,
         }
 
     @classmethod
@@ -265,6 +270,7 @@ class DaemonState:
             base_url=str(payload.get("base_url") or DEFAULT_BASE_URL),
             idle_timeout=idle_timeout,
             python=str(payload.get("python") or ""),
+            session=str(payload.get("session") or ""),
         )
 
     def write(self, path: Path) -> None:
@@ -660,11 +666,39 @@ def spawn_daemon(
         handle.close()
 
 
-def _compatible(state: DaemonState, *, base_url: str) -> bool:
+#: Command-line flags that decide *which* session the daemon uses.
+_SESSION_FLAGS = ("--session", "--profile", "--profile-root", "--cookies", "--storage")
+
+
+def _argv_value(argv: Sequence[str], flag: str) -> str | None:
+    for index, item in enumerate(argv):
+        if item == flag and index + 1 < len(argv):
+            return str(argv[index + 1])
+        if item.startswith(f"{flag}="):
+            return item.split("=", 1)[1]
+    return None
+
+
+def session_signature(argv: Sequence[str]) -> str:
+    """The part of a command line that decides which session is read.
+
+    The daemon holds a browser profile and a signed-in session, so two callers
+    that disagree about Firefox/profile/cookies must not share one daemon.
+    """
+    parts: list[str] = []
+    for flag in _SESSION_FLAGS:
+        value = _argv_value(argv, flag)
+        if value:
+            parts.append(f"{flag}={value}")
+    return " ".join(parts)
+
+
+def _compatible(state: DaemonState, *, base_url: str, session: str = "") -> bool:
     return (
         state.protocol == PROTOCOL_VERSION
         and state.api_version == api_version()
         and (not base_url or state.base_url == base_url)
+        and state.session == session
     )
 
 
@@ -693,10 +727,14 @@ def ensure_daemon(
     path = state_path(state_file)
     idle = _idle_timeout(idle_timeout)
     budget = _start_timeout(start_timeout)
+    raw_argv = payload.get("argv") or []
+    wanted = session_signature(
+        [str(item) for item in raw_argv] if isinstance(raw_argv, Sequence) else []
+    )
 
     current = DaemonState.read(path)
     if current is not None:
-        if _compatible(current, base_url=base_url) and ping(current):
+        if _compatible(current, base_url=base_url, session=wanted) and ping(current):
             latency.mark("warm.reuse")
             return current
         if current.pid and _pid_alive(current.pid):
@@ -710,7 +748,9 @@ def ensure_daemon(
     spawned: subprocess.Popen[bytes] | None = None
     while time.monotonic() < deadline:
         candidate = DaemonState.read(path)
-        if candidate is not None and _compatible(candidate, base_url=base_url):
+        if candidate is not None and _compatible(
+            candidate, base_url=base_url, session=wanted
+        ):
             if ping(candidate):
                 latency.mark("warm.started")
                 return candidate
@@ -885,6 +925,7 @@ class _WarmServer:
         port: int = 0,
         base_url: str = DEFAULT_BASE_URL,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        session_identity: str = "",
     ) -> None:
         self.session = session
         self.state_file = state_file
@@ -893,6 +934,7 @@ class _WarmServer:
         self.port = port
         self.base_url = base_url
         self.idle_timeout = idle_timeout
+        self.session_identity = session_identity
         self._server: asyncio.AbstractServer | None = None
         self._stop = asyncio.Event()
         self._active = 0
@@ -930,6 +972,7 @@ class _WarmServer:
             base_url=self.base_url,
             idle_timeout=self.idle_timeout,
             python=sys.executable,
+            session=self.session_identity,
         )
         state.write(self.state_file)
         self._spawn(self._watchdog())
@@ -1258,8 +1301,10 @@ async def _serve(
     idle_timeout: float,
     host: str,
     port: int,
+    forwarded_argv: Sequence[str] = (),
 ) -> int:
     session = WarmSession(options)
+    published = session_signature(list(forwarded_argv))
     server = _WarmServer(
         session,
         state_file=state_file,
@@ -1268,6 +1313,7 @@ async def _serve(
         port=port,
         base_url=str(options.base_url),
         idle_timeout=idle_timeout,
+        session_identity=published,
     )
     loop = asyncio.get_running_loop()
     installed: list[int] = []
@@ -1337,6 +1383,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 idle_timeout=idle,
                 host=args.host,
                 port=args.port,
+                forwarded_argv=[
+                    str(item) for item in (payload.get("argv") or [])
+                ],
             )
         )
     except KeyboardInterrupt:
