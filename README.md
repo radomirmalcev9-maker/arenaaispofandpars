@@ -205,6 +205,81 @@ with auto_client() as client:
 
 ---
 
+## Claude Code на моделях Arena
+
+Claude Code (и Claude Agent SDK) разговаривают с `api.anthropic.com` по протоколу
+Messages API. Библиотека умеет отвечать этим же протоколом на loopback-порту и
+отправлять запросы через ваш же Direct Chat — то есть **вместо Claude в оболочке
+Claude Code отвечает Arena** (на той модели, к которой у сессии есть доступ).
+
+```bash
+# 1. поднять шим (сессия берётся тем же zero-config путём, что и в CLI)
+arena-api --claude --port 8082
+
+# 2. в другом терминале — Claude Code на нём
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
+export ANTHROPIC_API_KEY=arena        # значение любое, ключ не проверяется
+claude
+```
+
+Короткий вариант (та же команда, отдельный entry point):
+
+```bash
+arena-claude --port 8082 --model arena-auto
+```
+
+### Что реализовано
+
+| Что | Как |
+| --- | --- |
+| `POST /v1/messages` | Поток (`text/event-stream`: `message_start` / `content_block_*` / `message_delta` / `message_stop` / `ping`) и обычный JSON-ответ. |
+| `POST /v1/messages/count_tokens` | Оценка `input_tokens` (≈4 символа на токен), чтобы клиент считал контекст. |
+| `GET /v1/models`, `GET /v1/models/{id}` | Список моделей: `--model` плюс всё из `--arena-model`. |
+| `system`, история, `tool_use` / `tool_result` | История рендерится в один текстовый транскрипт, результаты инструментов видны модели. |
+| `stop_sequences` | Обрезка ответа и `stop_reason: "stop_sequence"`, в том числе на потоке. |
+| `usage` | Оценка токенов входа/выхода. |
+
+### Инструменты (tool use)
+
+Arena отвечает обычным текстом, поэтому `tools` из запроса рендерятся в промпт
+строгим форматом, а ответ разбирается обратно в блоки `tool_use` со
+`stop_reason: "tool_use"`:
+
+```
+<tool_call>{"name": "Bash", "arguments": {"command": "ls -la"}}</tool_call>
+```
+
+Разбор понимает и `` ```json ``-фенс, и «голый» JSON-объект, но только если в нём
+есть поле аргументов — чтобы проза с фигурными скобками не превращалась в вызов.
+Текстовые ответы при этом стримятся по дельтам, как обычно; буферизуется только
+тот ответ, где реально начал формироваться вызов (иначе нельзя отличить
+`<tool_` от текста). Отключить эмуляцию: `--tools off`.
+
+### Движки ответа
+
+- `--engine warm` (по умолчанию) — через тёплый демон: вкладка уже открыта,
+  ответ начинается почти сразу; при недоступности демона запрос автоматически
+  уходит на `http`;
+- `--engine http` — свой `DirectArenaClient` в процессе шима (холодный старт);
+- `--engine echo` — возвращает промпт обратно: проверка проводки без сессии и
+  браузера (`curl`, тесты, отладка клиента).
+
+Все настройки дублируются переменными окружения: `ARENA_CLAUDE_HOST`,
+`ARENA_CLAUDE_PORT`, `ARENA_CLAUDE_ENGINE`, `ARENA_CLAUDE_MODEL`,
+`ARENA_CLAUDE_BASE_URL`, `ARENA_CLAUDE_TOOLS`, `ARENA_CLAUDE_MAX_PROMPT_CHARS`.
+
+### Ограничения, о которых надо знать
+
+- Шим слушает loopback и **не проверяет ключ**: любой, кто дотянется до порта,
+  тратит вашу сессию. Не выставляйте `--host 0.0.0.0` без своей авторизации.
+- Responses API/embeddings не эмулируются — Claude Code их не использует.
+- Стриминг ответа — это стриминг Arena: время до первого токена и скорость
+  генерации ограничены сервером (см. раздел про тёплый демон и `--warm-profile`).
+- Эмуляция инструментов всегда добавляет инструкции в промпт: для больших
+  `tools` (у Claude Code их много) промпт заметно длиннее, чем у нативного API.
+
+---
+
 ## Примеры (`examples/`)
 
 Все готовые скрипты собраны в каталоге [`examples/`](examples/):
@@ -226,6 +301,7 @@ with auto_client() as client:
 | `arena_api/warm.py` | Тёплый демон для повторных `--prompt` вызовов: state-файл, loopback-протокол, `--warm-status` / `--warm-stop`. |
 | `arena_api/latency.py` | Опциональный профилировщик фаз запроса (`ARENA_PROFILE=1` / `json`). |
 | `arena_api/_cli.py` | Лёгкая точка входа CLI: одноразовый `--prompt` уходит в демон без импорта `arena_api.auto`. |
+| `arena_api/compat/anthropic_server.py` | Anthropic-совместимый HTTP-слой (`--claude` / `arena-claude`): Messages API, SSE, эмуляция tool use. |
 | `arena_api/direct.py` | Клиенты `DirectArenaClient` / `AsyncDirectArenaClient` и парсер стрима Vercel AI Data Stream / SSE. |
 | `arena_api/transport.py` | HTTP/2 транспорт, нормализация кук и прокси, TLS-имперсонация (`curl_cffi`). |
 | `arena_api/auth/` | Менеджеры сессий (`FirefoxSessionManager`, `BrowserSessionManager`), `BrowserEnvironment`, кинематика мыши и встроенный `autosolve.py`. |
