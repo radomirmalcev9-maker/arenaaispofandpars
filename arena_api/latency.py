@@ -31,7 +31,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from typing import Any, TextIO
 
@@ -53,6 +53,18 @@ def _mode_from_env(environ: MutableMapping[str, str]) -> str:
 
 
 _MODE = _mode_from_env(os.environ)
+
+
+def enable_collection() -> None:
+    """Record phases even when nobody asked for a printed report.
+
+    Used by the warm daemon: it keeps the timeline of every answered prompt so
+    ``arena-api --warm-profile`` can show it after the fact.  The marks cost a
+    fraction of a microsecond each and are never printed unless requested.
+    """
+    global _MODE
+    if not _MODE:
+        _MODE = "collect"
 
 
 def enabled() -> bool:
@@ -80,6 +92,63 @@ def mark(name: str) -> None:
     now = time.perf_counter()
     with _LOCK:
         _MARKS.append((str(name), now))
+
+
+def marker() -> int:
+    """Opaque position in the timeline, for :func:`rows_since`."""
+    with _LOCK:
+        return len(_MARKS)
+
+
+def rows_since(position: int) -> list[dict[str, Any]]:
+    """Phases recorded after ``position`` (see :func:`marker`).
+
+    Times are relative to the first phase of the window, which is what a
+    process on the other side of a socket (the warm daemon) can hand over
+    without knowing anything about our clock.
+    """
+    marks = _snapshot()[max(0, position) :]
+    if not marks:
+        return []
+    origin = marks[0][1]
+    rows: list[dict[str, Any]] = []
+    previous = origin
+    for name, moment in marks:
+        rows.append(
+            {
+                "phase": name,
+                "at_ms": round((moment - origin) * 1000.0, 1),
+                "delta_ms": round((moment - previous) * 1000.0, 1),
+            }
+        )
+        previous = moment
+    return rows
+
+
+def extend(
+    phases: Any, *, anchor: float | None = None, prefix: str = ""
+) -> None:
+    """Add phases recorded elsewhere (another process) to this timeline.
+
+    ``anchor`` is the local ``perf_counter()`` value the remote window started
+    at, so the imported phases land at the right place in our own report.
+    """
+    if not _MODE or not isinstance(phases, list):
+        return
+    base = time.perf_counter() if anchor is None else anchor
+    imported: list[tuple[str, float]] = []
+    for row in phases:
+        if not isinstance(row, Mapping):
+            continue
+        name = row.get("phase")
+        at_ms = row.get("at_ms")
+        if isinstance(name, str) and isinstance(at_ms, (int, float)):
+            imported.append((f"{prefix}{name}", base + float(at_ms) / 1000.0))
+    if not imported:
+        return
+    with _LOCK:
+        _MARKS.extend(imported)
+        _MARKS.sort(key=lambda item: item[1])
 
 
 @contextmanager

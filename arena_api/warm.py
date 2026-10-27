@@ -41,6 +41,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -418,11 +419,21 @@ def ask_stream(
     """
     sock, reader = _open(state, timeout=timeout, handshake_timeout=min(timeout, 10.0))
     finished = False
+    anchor = time.perf_counter()
     try:
         _send(sock, {"op": "ask", "prompt": prompt, "model": model})
         while True:
             message = _read_message(reader, timeout)
             kind = message.get("type")
+            if kind == "profile":
+                # The daemon's own phases (browser start, page load, submit,
+                # first byte) belong on the same timeline as ours.
+                latency.extend(
+                    message.get("phases"),
+                    anchor=anchor,
+                    prefix="daemon.startup." if message.get("kind") == "startup" else "daemon.",
+                )
+                continue
             if kind == "delta":
                 text = message.get("text")
                 if isinstance(text, str) and text:
@@ -856,6 +867,9 @@ class _WarmServer:
         self._closed = False
         self._started = time.time()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._startup_phases: list[dict[str, Any]] | None = None
+        self._ask_profiles: deque[dict[str, Any]] = deque(maxlen=10)
+        self._boot_marker = latency.marker()
 
     # -- lifecycle --------------------------------------------------------- #
 
@@ -899,6 +913,10 @@ class _WarmServer:
             await prepare()
         except Exception as exc:  # noqa: BLE001 - surfaced on the first prompt
             log(f"warm browser pre-start failed: {exc}")
+        finally:
+            # Browser launch + first page load happen once per daemon; report
+            # them so a slow "cold" prompt can be told apart from a warm one.
+            self._startup_phases = latency.rows_since(self._boot_marker) or None
 
     def request_stop(self) -> None:
         """Ask the server to stop; safe from any thread or signal handler."""
@@ -1030,6 +1048,8 @@ class _WarmServer:
                 await self._write(writer, {"type": "pong"})
             elif op == "status":
                 await self._write(writer, self._status_payload())
+            elif op == "profiles":
+                await self._write(writer, self._profiles_payload(message))
             elif op == "shutdown":
                 await self._write(writer, {"type": "bye"})
                 self._stop.set()
@@ -1048,6 +1068,42 @@ class _WarmServer:
                         "message": f"unknown op {op!r}",
                     },
                 )
+
+    async def _send_startup_profile(self, writer: asyncio.StreamWriter) -> None:
+        """Hand the browser/page startup timeline to the caller once."""
+        phases = self._startup_phases
+        self._startup_phases = None
+        if phases:
+            with contextlib.suppress(Exception):
+                await self._write(
+                    writer, {"type": "profile", "kind": "startup", "phases": phases}
+                )
+
+    async def _send_ask_profile(
+        self, writer: asyncio.StreamWriter, marker: int
+    ) -> None:
+        """Report where this prompt spent its time (best effort)."""
+        phases = latency.rows_since(marker)
+        if not phases:
+            return
+        self._ask_profiles.append(
+            {"at": time.time(), "phases": phases}
+        )
+        with contextlib.suppress(Exception):
+            await self._write(writer, {"type": "profile", "kind": "ask", "phases": phases})
+
+    def _profiles_payload(self, message: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            limit = int(message.get("limit") or 3)
+        except (TypeError, ValueError):
+            limit = 3
+        entries = list(self._ask_profiles)[-max(1, limit) :]
+        return {
+            "type": "profiles",
+            "startup": self._startup_phases or [],
+            "asks": entries,
+            "total_answered": self._answered,
+        }
 
     def _status_payload(self) -> dict[str, Any]:
         describe = getattr(self.session, "describe", None)
@@ -1086,6 +1142,8 @@ class _WarmServer:
         stream = self.session.ask(prompt, model_value)
         try:
             await self._write(writer, {"type": "start"})
+            await self._send_startup_profile(writer)
+            ask_marker = latency.marker()
             pieces: list[str] = []
             with latency.span("warm.stream"):
                 async for delta in stream:
@@ -1093,6 +1151,9 @@ class _WarmServer:
                         continue
                     pieces.append(delta)
                     await self._write(writer, {"type": "delta", "text": delta})
+            # The profile goes out before "done": the caller stops reading as
+            # soon as the answer is complete and closes the socket.
+            await self._send_ask_profile(writer, ask_marker)
             await self._write(writer, {"type": "done", "text": "".join(pieces)})
             self._answered += 1
             return True
@@ -1183,6 +1244,7 @@ async def _serve(
 
 def main(argv: Sequence[str] | None = None) -> int:
     """``python -m arena_api.warm``: the daemon process itself."""
+    latency.enable_collection()
     parser = argparse.ArgumentParser(
         prog="python -m arena_api.warm",
         description=(
@@ -1292,8 +1354,11 @@ def scan_argv(argv: Sequence[str]) -> _WarmArgs:
             parsed.force = arg == "--warm"
             index += 1
             continue
-        if arg in ("--warm-start", "--warm-stop", "--warm-status"):
+        if arg in ("--warm-start", "--warm-stop", "--warm-status", "--warm-profile"):
             # Daemon commands, never forwarded to the daemon's own parser.
+            index += 1
+            continue
+        if arg.startswith("--warm-profile="):
             index += 1
             continue
         if arg in ("--warm-idle", "--warm-timeout", "--warm-state"):
@@ -1331,6 +1396,18 @@ def scan_argv(argv: Sequence[str]) -> _WarmArgs:
             continue
         parsed.rest.append(arg)
         index += 1
+    # `--warm-profile 5` takes a value; drop it from the forwarded arguments.
+    cleaned: list[str] = []
+    skip_next = False
+    for item in parsed.rest:
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--warm-profile":
+            skip_next = True
+            continue
+        cleaned.append(item)
+    parsed.rest = cleaned
     if parsed.model is not None and parsed.model.strip().lower() == "auto":
         parsed.model = None
     return parsed
@@ -1352,6 +1429,47 @@ def _store_warm_option(parsed: _WarmArgs, name: str, value: str | None) -> None:
         parsed.idle_timeout = number
     else:
         parsed.start_timeout = number
+
+
+def profile_main(argv: Sequence[str]) -> int:
+    """``--warm-profile``: where the daemon's last prompts spent their time."""
+    parsed = scan_argv(list(argv))
+    limit = 3
+    for index, arg in enumerate(argv):
+        if arg == "--warm-profile" and index + 1 < len(argv):
+            try:
+                limit = max(1, int(argv[index + 1]))
+            except ValueError:
+                pass
+        elif arg.startswith("--warm-profile="):
+            try:
+                limit = max(1, int(arg.split("=", 1)[1]))
+            except ValueError:
+                pass
+    payload = fetch_profiles(parsed.state_file, limit=limit)
+    if payload is None:
+        print(f"warm daemon       : not running ({state_path(parsed.state_file)})")
+        print("hint              : run a prompt first, then ask again")
+        return 1
+    startup = payload.get("startup") or []
+    if startup:
+        print("daemon startup (browser launch + first page load):")
+        for line in format_profile_table(startup, title="  "):
+            print(line)
+        print()
+    asks = payload.get("asks") or []
+    if not asks:
+        print("no prompts answered yet")
+        return 0
+    print(f"last {len(asks)} prompt(s):")
+    for number, entry in enumerate(asks, start=1):
+        phases = entry.get("phases") if isinstance(entry, Mapping) else None
+        when = entry.get("at") if isinstance(entry, Mapping) else None
+        stamp = time.strftime("%H:%M:%S", time.localtime(when)) if when else "?"
+        print(f"\n  #{number} at {stamp}")
+        for line in format_profile_table(phases or [], title="    "):
+            print(line)
+    return 0
 
 
 def _stdout_write(text: str) -> None:
@@ -1473,6 +1591,52 @@ def start_main(argv: Sequence[str]) -> int:
     print(f"warm daemon       : running (pid {state.pid}, port {state.port})")
     print(f"state file        : {state_path(parsed.state_file)}")
     return 0
+
+
+def fetch_profiles(
+    state_path_value: str | Path | None = None,
+    *,
+    limit: int = 3,
+    timeout: float = 5.0,
+) -> dict[str, Any] | None:
+    """Ask the daemon for the timelines of its last prompts."""
+    path = state_path(state_path_value)
+    state = DaemonState.read(path)
+    if state is None:
+        return None
+    try:
+        sock, reader = _open(state, timeout=timeout, handshake_timeout=timeout)
+    except WarmDaemonUnavailable:
+        return None
+    try:
+        _send(sock, {"op": "profiles", "limit": limit})
+        reply = _read_message(reader, timeout)
+        if reply.get("type") != "profiles":
+            return None
+        return reply
+    except (WarmDaemonUnavailable, OSError):
+        return None
+    finally:
+        _close_quietly(reader, sock)
+
+
+def format_profile_table(
+    phases: Sequence[Mapping[str, Any]], *, title: str = ""
+) -> list[str]:
+    """Render phases the same way ``ARENA_PROFILE=1`` does."""
+    rows = [
+        (str(row.get("phase")), float(row.get("at_ms") or 0.0), float(row.get("delta_ms") or 0.0))
+        for row in phases
+        if isinstance(row, Mapping)
+    ]
+    if not rows:
+        return []
+    width = max(len("phase"), *(len(name) for name, _, _ in rows))
+    lines = [f"{title}{'phase':<{width}} {'delta ms':>10} {'total ms':>10}".rstrip()]
+    for name, at_ms, delta_ms in rows:
+        lines.append(f"{name:<{width}} {delta_ms:>10.1f} {at_ms:>10.1f}")
+    lines.append(f"{'total':<{width}} {'':>10} {rows[-1][1]:>10.1f}")
+    return lines
 
 
 def stop_main(argv: Sequence[str]) -> int:

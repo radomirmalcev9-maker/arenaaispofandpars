@@ -730,7 +730,9 @@ async def _click_challenge_checkbox(
         await _safe_bring_to_front(page)
     wait_fn = getattr(page, "wait_for_timeout", None)
     if callable(wait_fn):
-        await wait_fn(350)
+        # Let the widget finish animating in, but do not pay a third of a
+        # second for it: the mouse path below already takes a few frames.
+        await wait_fn(120)
 
     x = float(obs.get("x") or 0)
     y = float(obs.get("y") or 0)

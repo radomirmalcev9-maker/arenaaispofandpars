@@ -1680,6 +1680,86 @@ def _is_page_usable(page: Any) -> bool:
     return True
 
 
+#: How long a ``429`` that may be a captcha is kept alive before the caller is
+#: told it is a rate limit.  Only an explicit ``Retry-After`` extends it: the
+#: page is scanned on every iteration, so a widget is found immediately.
+#: Minimal, DOM-only probe: does the composer still hold the prompt (the tab is
+#: mid-submission) and is a known stop/cancel control on screen?
+_PENDING_WORK_JS = """
+() => {
+  const composer = document.querySelector('[data-arena-composer="1"]') ||
+    document.querySelector('textarea:not([id*="recaptcha"]):not([name*="recaptcha"]), [contenteditable="true"]');
+  const text = composer ? ((composer.value || composer.textContent || "").trim()) : "";
+  let busy = false;
+  for (const btn of document.querySelectorAll('button, [role="button"], [aria-label], [title]')) {
+    const meta = ((btn.getAttribute("aria-label") || "") + " " + (btn.getAttribute("title") || "") + " " + (btn.textContent || "")).toLowerCase();
+    if (/(^|\s)(stop|stop generating|cancel|abort)(\s|$)/.test(meta)) { busy = true; break; }
+  }
+  if (!busy && document.querySelector('[data-loading="true"], [aria-busy="true"], [data-state="streaming"]')) busy = true;
+  return { pending: text.length > 0 || busy, busy };
+}
+""".strip()
+
+
+async def _page_is_working(page: Any) -> bool:
+    """``True`` while the tab still shows the prompt queued/running."""
+    eval_fn = getattr(page, "evaluate", None)
+    if not callable(eval_fn):
+        return False
+    try:
+        result = await asyncio.wait_for(eval_fn(_PENDING_WORK_JS), timeout=1.0)
+    except Exception:  # noqa: BLE001 - any failure means "no evidence"
+        return False
+    return bool(isinstance(result, Mapping) and result.get("pending"))
+
+_CHALLENGE_PROBE_GRACE_SECONDS = 1.5
+
+#: Cookie names the page owns: they are rewritten by the app itself (one-time
+#: codes, analytics, rotated JWTs) and never need a reload to take effect.
+_PAGE_OWNED_COOKIE_PREFIXES: tuple[str, ...] = (
+    "next-auth.session-token",
+    "__Secure-next-auth",
+    "__Host-next-auth",
+    "sb-",
+    "_ga",
+    "_gid",
+    "_gcl",
+    "_dd_",
+    "__cf_bm",
+    "sidebar_state",
+)
+
+
+def _cookies_need_reload(
+    previous: Mapping[str, str], current: Mapping[str, str]
+) -> bool:
+    """Whether seeding ``current`` requires reloading the Direct Chat page.
+
+    Reloading means a full page load (~1-3 s) plus a fresh reCAPTCHA v3
+    assertion.  Most warm-tab rounds see a *different* cookie map for reasons
+    that do not matter: Arena rotates its auth cookie on every turn, and the
+    page keeps writing analytics/session cookies of its own.  Only a new
+    *session* cookie (something that did not exist before, e.g. after a fresh
+    ``--login``) changes what the application can see, so only that reloads.
+    """
+    if not previous:
+        return bool(current)
+    changed = {
+        str(name)
+        for name, value in current.items()
+        if previous.get(str(name)) != value
+    }
+    if not changed:
+        return False
+    if any(
+        name.startswith(_PAGE_OWNED_COOKIE_PREFIXES) or "analytics" in name.lower()
+        for name in changed
+    ):
+        return False
+    # A genuinely new auth cookie (not a rotation of a known one) needs a load.
+    return any(name not in previous for name in changed)
+
+
 def _status_means_challenge(
     status: int,
     body: str,
@@ -1711,7 +1791,9 @@ async def _warm_page_responds(page: Any) -> bool:
     if not callable(title_fn):
         return True
     try:
-        await asyncio.wait_for(title_fn(), timeout=5.0)
+        # A live renderer answers in a few milliseconds; waiting longer only
+        # delays a restart that is about to happen anyway.
+        await asyncio.wait_for(title_fn(), timeout=2.0)
     except Exception:  # noqa: BLE001
         return False
     return True
@@ -2440,10 +2522,18 @@ class DirectVerificationToken:
             seed_cookies = _seedable_browser_cookies(
                 raw_cookies, cookie_source=self.cookie_source
             )
-            if not reused_warm_page or seed_cookies != state.seeded_cookies:
-                await _seed_direct_context_cookies(
-                    context, seed_cookies, self.options.base_url
-                )
+            if reused_warm_page and not _cookies_need_reload(
+                state.seeded_cookies, seed_cookies
+            ):
+                # Rotation of the JWT and the page's own cookies must not cost a
+                # reload: the open tab is already authenticated and warm.
+                _latency_mark("cookies.kept")
+                state.seeded_cookies = dict(seed_cookies)
+            else:
+                if seed_cookies != state.seeded_cookies:
+                    await _seed_direct_context_cookies(
+                        context, seed_cookies, self.options.base_url
+                    )
                 state.seeded_cookies = dict(seed_cookies)
                 # Cookies installed after a prewarmed navigation need a reload
                 # before the application can observe them.
@@ -2789,9 +2879,12 @@ class DirectVerificationToken:
                         # Keep the request alive while the page is scanned for a
                         # challenge: a 429 that is really a captcha is solved
                         # and the prompt is sent again, a genuine limit is
-                        # re-raised below once nothing appears.
+                        # re-raised as soon as the scan shows no challenge.
                         pending_verification_err = (status, err_body, resp_headers)
-                        grace_until = max(grace_until, time.monotonic() + 12.0)
+                        grace_until = max(
+                            grace_until,
+                            time.monotonic() + _CHALLENGE_PROBE_GRACE_SECONDS,
+                        )
                     else:
                         self._raise_browser_http_error(
                             status, err_body, resp_headers
@@ -2901,7 +2994,9 @@ class DirectVerificationToken:
                             challenge_cleared_at is not None
                             and not retried_send_after_clear
                             and in_flight_eval_requests == 0
-                            and (time.monotonic() - challenge_cleared_at) >= 2.0
+                            # Just long enough for the app to send its own retry;
+                            # the old 2 s window dominated short answers.
+                            and (time.monotonic() - challenge_cleared_at) >= 0.35
                         ):
                             if await _reclick_send_button_if_unsent(page):
                                 retried_send_after_clear = True
@@ -2930,7 +3025,10 @@ class DirectVerificationToken:
                             and not challenge_active
                             and in_flight_eval_requests == 0
                             and time.monotonic() >= grace_until
+                            and not await _page_is_working(page)
                         ):
+                            # Nothing asks for verification and the tab is idle:
+                            # a 429 here is a real limit, not a captcha.
                             self._raise_browser_http_error(*pending_verification_err)
 
             if first_kind == "stream_error":
@@ -3753,6 +3851,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="report whether the background warm daemon is running and exit",
     )
+    parser.add_argument(
+        "--warm-profile",
+        nargs="?",
+        type=int,
+        const=3,
+        default=None,
+        metavar="N",
+        help=(
+            "print where the warm daemon's last N prompts (default 3) spent "
+            "their time and exit"
+        ),
+    )
     return parser
 
 
@@ -3820,12 +3930,17 @@ def _main(argv: Sequence[str]) -> int:
         getattr(args, "warm_start", False)
         or getattr(args, "warm_stop", False)
         or getattr(args, "warm_status", False)
+        or getattr(args, "warm_profile", None) is not None
     ):
-        from .warm import start_main, status_main, stop_main
+        from .warm import profile_main, start_main, status_main, stop_main
 
         if args.warm_start:
             return start_main(argv)
-        return stop_main(argv) if args.warm_stop else status_main(argv)
+        if args.warm_stop:
+            return stop_main(argv)
+        if args.warm_profile is not None:
+            return profile_main(argv)
+        return status_main(argv)
     try:
         options = _options_from_args(args)
     except ValueError as exc:

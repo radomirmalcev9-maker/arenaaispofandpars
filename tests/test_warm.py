@@ -141,6 +141,36 @@ def test_ping_and_status(server: ServerThread) -> None:
     assert info["base_url"] == "https://arena.ai"
 
 
+def test_profiles_op_reports_the_last_prompts(server: ServerThread) -> None:
+    assert list(warm.ask_stream("hi", state=server.published)) == ["Hel", "lo"]
+    payload = warm.fetch_profiles(server.state_file, limit=5)
+    assert payload is not None
+    assert payload["type"] == "profiles"
+    assert payload["total_answered"] == 1
+    assert isinstance(payload["asks"], list)
+
+
+def test_profile_table_renders_phases() -> None:
+    lines = warm.format_profile_table(
+        [
+            {"phase": "cli.start", "at_ms": 1.0, "delta_ms": 1.0},
+            {"phase": "daemon.first_byte", "at_ms": 250.0, "delta_ms": 249.0},
+        ],
+        title="  ",
+    )
+    assert lines[0].strip().startswith("phase")
+    assert any("daemon.first_byte" in line and "250.0" in line for line in lines)
+    assert lines[-1].strip().startswith("total")
+
+
+def test_profile_main_says_when_no_daemon_runs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = warm.profile_main(["--warm-profile", "--warm-state", str(tmp_path / "none.json")])
+    assert code == 1
+    assert "not running" in capsys.readouterr().out
+
+
 def test_bad_token_is_rejected(server: ServerThread) -> None:
     state = server.published
     forged = warm.DaemonState(
@@ -317,6 +347,22 @@ def test_idle_daemon_stops_itself(tmp_path: Path) -> None:
     worker.join(10.0)
     assert not worker.is_alive()
     assert not state_file.exists()
+
+
+def test_daemon_profile_is_merged_into_the_caller_timeline(
+    server: ServerThread, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from arena_api import latency
+
+    monkeypatch.setattr(latency, "_MODE", "1")
+    latency.reset()
+    try:
+        assert list(warm.ask_stream("hi", state=server.published)) == ["Hel", "lo"]
+    finally:
+        monkeypatch.undo()
+    phases = [row["phase"] for row in latency._rows()]
+    assert "daemon.warm.stream" in phases
+    assert "daemon.warm.stream.end" in phases
 
 
 # --------------------------------------------------------------------------- #

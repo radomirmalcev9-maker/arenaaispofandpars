@@ -13,6 +13,10 @@ prints the medians plus the resulting speed-up.  It needs a working session
 (``arena-api --status`` must pass); otherwise every run fails the same way and
 there is nothing to compare.
 
+Two numbers are reported per variant: the whole command (generation included)
+and the time to the first streamed token, read from ``ARENA_PROFILE=json``.
+The first token is what the warm daemon actually removes.
+
 Notes:
 * nothing is delayed or retried between runs: the script measures back-to-back
   invocations, exactly like calling the CLI in a loop;
@@ -26,6 +30,8 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import statistics
 import subprocess
 import sys
@@ -33,15 +39,62 @@ import time
 from collections.abc import Sequence
 
 
-def _run(python: str, argv: Sequence[str]) -> tuple[float, int, str]:
+#: Phase names meaning "the first piece of the answer arrived".
+_FIRST_TOKEN_SUFFIXES = ("first_delta", "first_byte")
+_PROFILE_PREFIX = "[arena-api latency]"
+
+
+def parse_first_token(stderr: str) -> float | None:
+    """Seconds until the first streamed token, from an ``ARENA_PROFILE=json`` line.
+
+    The daemon forwards its own phases (``daemon.first_byte``, ...), so the same
+    report tells us how long the *whole* path took, not just this process.
+    """
+    best: float | None = None
+    for line in stderr.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(_PROFILE_PREFIX):
+            continue
+        try:
+            report = json.loads(stripped[len(_PROFILE_PREFIX) :].strip())
+        except ValueError:
+            continue
+        phases = report.get("phases")
+        if not isinstance(phases, list):
+            continue
+        for phase in phases:
+            if not isinstance(phase, dict):
+                continue
+            name = phase.get("phase")
+            at_ms = phase.get("at_ms")
+            if not isinstance(name, str) or not isinstance(at_ms, (int, float)):
+                continue
+            if not name.endswith(_FIRST_TOKEN_SUFFIXES):
+                continue
+            seconds = float(at_ms) / 1000.0
+            if best is None or seconds < best:
+                best = seconds
+    return best
+
+
+def _run(python: str, argv: Sequence[str]) -> tuple[float, int, str, float | None]:
     started = time.monotonic()
+    env = dict(os.environ)
+    env["ARENA_PROFILE"] = "json"
     result = subprocess.run(
         [python, "-m", "arena_api", *argv],
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
-    return time.monotonic() - started, result.returncode, (result.stderr or "").strip()
+    stderr = (result.stderr or "").strip()
+    return (
+        time.monotonic() - started,
+        result.returncode,
+        stderr,
+        parse_first_token(stderr),
+    )
 
 
 def _label(seconds: float) -> str:
@@ -89,15 +142,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"runs  : {args.runs} per variant\n")
 
     failed: dict[str, int] = {"cold": 0, "warm": 0}
+    first_tokens: dict[str, list[float]] = {"cold": [], "warm": []}
 
     def measure(label: str, variant: str, argv: Sequence[str]) -> float | None:
-        seconds, code, err = _run(args.python, argv)
+        seconds, code, err, first = _run(args.python, argv)
         if code != 0:
             failed[variant] += 1
             first_line = err.splitlines()[0] if err else f"exit code {code}"
             print(f"  {label}: failed — {first_line}")
             return None
-        print(f"  {label}: {seconds:.2f}s")
+        if first is not None:
+            first_tokens[variant].append(first)
+            print(f"  {label}: {seconds:.2f}s (first token {first:.2f}s)")
+        else:
+            print(f"  {label}: {seconds:.2f}s")
         return seconds
 
     cold: list[float] = []
@@ -131,6 +189,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(_format_runs("warm (daemon reused)", warm), f"{failed['warm']:>8}")
     if first_warm is not None:
         print(f"{'first warm run (start)':<26}{'':<32}{_label(first_warm):>10}")
+    cold_first = first_tokens["cold"]
+    warm_first = first_tokens["warm"]
+    if cold_first or warm_first:
+        print()
+        print("time to first token (from the ARENA_PROFILE=json timeline)")
+        print(f"{'variant':<26}{'runs (s)':<32}{'median':>10}")
+        print("-" * 68)
+        print(_format_runs("cold (--no-warm)", cold_first))
+        print(_format_runs("warm (daemon reused)", warm_first))
+        if cold_first and warm_first:
+            print(
+                "speed-up on first token "
+                f": {statistics.median(cold_first) / statistics.median(warm_first):.1f}x"
+            )
     if cold and warm:
         print(f"\nspeed-up on repeated prompts: {statistics.median(cold) / statistics.median(warm):.1f}x")
         if first_warm:

@@ -560,9 +560,10 @@ async def _human_type_into_locator(
 
     if keyboard is not None and callable(getattr(keyboard, "type", None)):
         try:
-            for ch in text:
-                await keyboard.type(ch)
-                await asyncio.sleep(random.uniform(0.04, 0.085))
+            # One call for the whole transcript: the per-character pauses were
+            # emulation of a human listener, and the audio has already been
+            # downloaded and transcribed, so nobody is listening.
+            await keyboard.type(text, delay=0)
             return True
         except Exception:  # noqa: BLE001
             pass
@@ -815,7 +816,7 @@ async def _solve_bframe_via_audio(
             return AutoSolveOutcome(
                 solved=False, error="audio challenge button is not available"
             )
-        await asyncio.sleep(random.uniform(0.35, 0.7))
+        await asyncio.sleep(random.uniform(0.05, 0.12))
         await _human_click_locator(page, audio_btn, kmouse=kmouse)
 
         switch_deadline = time.monotonic() + 5.5
@@ -856,13 +857,13 @@ async def _solve_bframe_via_audio(
             if candidate and candidate not in seen_urls:
                 audio_url = candidate
                 break
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.05)
 
         if not audio_url:
             reload_btn = loc_fn("#recaptcha-reload-button").first
             if await _locator_visible(reload_btn):
                 await _human_click_locator(page, reload_btn, kmouse=kmouse)
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.2)
                 audio_url = await _extract_bframe_audio_url(bframe)
         if not audio_url:
             return AutoSolveOutcome(
@@ -898,24 +899,26 @@ async def _solve_bframe_via_audio(
             reload_btn = loc_fn("#recaptcha-reload-button").first
             if await _locator_visible(reload_btn):
                 await _human_click_locator(page, reload_btn, kmouse=kmouse)
-                await asyncio.sleep(0.7)
+                await asyncio.sleep(0.25)
             continue
 
+        # The clip was downloaded and transcribed in the readings above; the
+        # old 1.35-1.95 s "listening" pause only ever padded the solve.  Keep a
+        # token settle time so the widget sees the play click first.
         elapsed_listen = time.monotonic() - play_started
-        min_listen = random.uniform(1.35, 1.95)
+        min_listen = random.uniform(0.12, 0.2)
         if elapsed_listen < min_listen:
             await asyncio.sleep(min_listen - elapsed_listen)
 
         await _human_type_into_locator(
             page, loc_fn("#audio-response").first, transcript, kmouse=kmouse
         )
-        await asyncio.sleep(random.uniform(0.18, 0.34))
+        await asyncio.sleep(random.uniform(0.03, 0.08))
         verify_btn = loc_fn("#recaptcha-verify-button").first
         await _human_click_locator(page, verify_btn, kmouse=kmouse)
 
         verify_deadline = time.monotonic() + 5.5
         while time.monotonic() < verify_deadline:
-            await asyncio.sleep(0.22)
             if tracker.token:
                 return AutoSolveOutcome(
                     solved=True,
@@ -923,6 +926,7 @@ async def _solve_bframe_via_audio(
                     token=tracker.token,
                     rounds=round_idx + 1,
                 )
+            await asyncio.sleep(0.05)
             if callable(getattr(bframe, "is_detached", None)) and bframe.is_detached():
                 return AutoSolveOutcome(
                     solved=True,
@@ -991,7 +995,7 @@ async def _solve_bframe_via_capsolver(
     img_btn = loc_fn("#recaptcha-image-button").first
     if await _locator_visible(img_btn):
         await _human_click_locator(page, img_btn, kmouse=kmouse)
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(0.25)
 
     for round_idx in range(max_rounds):
         prompt_text = ""
@@ -1029,7 +1033,7 @@ async def _solve_bframe_via_capsolver(
             reload_btn = loc_fn("#recaptcha-reload-button").first
             if await _locator_visible(reload_btn):
                 await _human_click_locator(page, reload_btn, kmouse=kmouse)
-                await asyncio.sleep(0.9)
+                await asyncio.sleep(0.3)
                 continue
             return AutoSolveOutcome(
                 solved=False, error="unrecognized visual challenge prompt or image"
@@ -1078,11 +1082,11 @@ async def _solve_bframe_via_capsolver(
         for idx in indexes:
             if isinstance(idx, int):
                 await _human_click_locator(page, tiles.nth(idx), kmouse=kmouse)
-                await asyncio.sleep(random.uniform(0.12, 0.28))
+                await asyncio.sleep(random.uniform(0.03, 0.08))
 
         verify_btn = loc_fn("#recaptcha-verify-button").first
         await _human_click_locator(page, verify_btn, kmouse=kmouse)
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(0.3)
 
         if (
             tracker.token
@@ -1175,9 +1179,9 @@ async def auto_solve_challenge_on_page(
 
             wait_fn = getattr(page, "wait_for_timeout", None)
             if callable(wait_fn):
-                await wait_fn(800)
+                await wait_fn(250)
             else:
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.25)
 
             if tracker.token or (
                 kind == "recaptcha_anchor" and await _anchor_is_checked(page)

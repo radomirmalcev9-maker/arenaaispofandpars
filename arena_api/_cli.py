@@ -49,14 +49,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI; ``argv`` defaults to ``sys.argv[1:]``."""
     args = list(sys.argv[1:] if argv is None else argv)
     latency.mark("cli.entry")
-    if any(flag in args for flag in ("--warm-stop", "--warm-status", "--warm-start")):
-        from .warm import start_main, status_main, stop_main
+    if any(
+        flag in args or any(item.startswith(f"{flag}=") for item in args)
+        for flag in ("--warm-stop", "--warm-status", "--warm-start", "--warm-profile")
+    ):
+        from .warm import profile_main, start_main, status_main, stop_main
 
         if "--warm-stop" in args:
             return stop_main(args)
         if "--warm-status" in args:
             return status_main(args)
-        return start_main(args)
+        if "--warm-start" in args:
+            return start_main(args)
+        return profile_main(args)
     if _wants_warm_prompt(args):
         from .warm import fast_prompt_main
 
