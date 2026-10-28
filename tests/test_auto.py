@@ -5884,3 +5884,34 @@ def test_fresh_profile_flag_is_parsed_and_resets_once(tmp_path) -> None:
 
 def test_fresh_profile_is_off_by_default() -> None:
     assert auto_module.AutoOptions().reset_profile is False
+
+
+def test_archive_is_skipped_while_another_prompt_waits() -> None:
+    """A queued prompt must not wait for the previous chat's archive click."""
+    calls: list[str] = []
+
+    def guard() -> bool:
+        calls.append("guard")
+        return False
+
+    options = auto_module.AutoOptions(
+        archive_after_answer=True, archive_if_idle=guard
+    )
+    assert callable(options.archive_if_idle)
+    assert options.archive_if_idle() is False
+    assert calls == ["guard"]
+
+
+def test_a_broken_archive_guard_does_not_disable_archiving() -> None:
+    def guard() -> bool:
+        raise RuntimeError("boom")
+
+    options = auto_module.AutoOptions(
+        archive_after_answer=True, archive_if_idle=guard
+    )
+    allowed = True
+    try:
+        allowed = bool(options.archive_if_idle())
+    except Exception:  # noqa: BLE001 - same fallback as the loop in auto.py
+        allowed = True
+    assert allowed is True

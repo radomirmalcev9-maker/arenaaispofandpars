@@ -796,6 +796,8 @@ class ArenaEngine:
         self.model_hint = prompt
         self.log = log
         self.verbose = False
+        #: Timings of the last answer, for the ``--verbose`` log and the doctor.
+        self.last_timings: dict[str, Any] = {}
         self._lock = threading.Lock()
         self._primary: Any
         self._fallback: Any = None
@@ -893,13 +895,32 @@ class ArenaEngine:
 
     def answer(self, prompt: str, *, model: str | None = None) -> Iterator[str]:
         with self._lock:
+            started = time.monotonic()
             stream, first = self._open(prompt, model)
+            opened = time.monotonic() - started
+            chars = len(first)
             try:
                 if first:
                     yield first
-                yield from stream
+                for delta in stream:
+                    chars += len(delta)
+                    yield delta
             finally:
                 self._close_stream(stream)
+                self.last_timings = {
+                    "prompt_chars": len(prompt),
+                    "open_ms": round(opened * 1000.0, 1),
+                    "first_delta_ms": round(opened * 1000.0, 1),
+                    "total_ms": round((time.monotonic() - started) * 1000.0, 1),
+                    "answer_chars": chars,
+                }
+                if self.verbose:
+                    _log_quiet(
+                        "prompt {prompt_chars} chars -> open {open_ms} ms, "
+                        "answer {answer_chars} chars, total {total_ms} ms".format(
+                            **self.last_timings
+                        )
+                    )
 
     def close(self) -> None:
         for engine in (self._primary, self._fallback):
@@ -1159,6 +1180,12 @@ class _Handler(BaseHTTPRequestHandler):
             tools_mode=self.engine.tools_mode,
             max_prompt_chars=self.server.max_prompt_chars,  # type: ignore[attr-defined]
         )
+        if self.server.verbose:  # type: ignore[attr-defined]
+            _log_quiet(
+                f"request: {len(request.prompt)} chars, "
+                f"{len(request.tools)} tools, stream={request.stream}, "
+                f"model={request.model}"
+            )
         if request.stream:
             self._stream_message(request)
         else:
@@ -1186,9 +1213,11 @@ class _Handler(BaseHTTPRequestHandler):
             ),
         )
         if self.server.verbose:  # type: ignore[attr-defined]
+            timings = getattr(self.engine, "last_timings", {}) or {}
             _log_quiet(
                 f"answered in {time.monotonic() - started:.2f}s "
-                f"({len(text)} chars, stop={stop_reason})"
+                f"({len(text)} chars, stop={stop_reason}, "
+                f"engine first delta {timings.get('first_delta_ms', '?')} ms)"
             )
         self._send_json(200, message)
 

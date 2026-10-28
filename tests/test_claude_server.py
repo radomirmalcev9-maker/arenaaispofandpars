@@ -6,6 +6,7 @@ import json
 import threading
 import urllib.request
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1641,3 +1642,28 @@ def test_recover_profile_explains_a_total_failure(tmp_path: Path) -> None:
     message = str(caught.value)
     assert "chrome.exe" in message
     assert "--fresh-profile" in message
+
+
+def test_verbose_logging_reports_the_request_size_and_timings(
+    serve: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    server, _ = serve("ok", verbose=True)
+    _post(
+        server,
+        "/v1/messages",
+        {"stream": False, "messages": [{"role": "user", "content": "привет"}]},
+    )
+    logged = capsys.readouterr().err
+    assert "request: " in logged
+    assert "chars" in logged
+    assert "first delta" in logged
+
+
+def test_engine_records_timings_for_the_last_answer() -> None:
+    engine = shim.ArenaEngine(engine="echo")
+    text = "".join(engine.answer("привет"))
+    assert text
+    timings = engine.last_timings
+    assert timings["prompt_chars"] == len("привет")
+    assert timings["answer_chars"] >= len(text)
+    assert timings["total_ms"] >= 0

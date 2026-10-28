@@ -604,12 +604,48 @@ def test_a_daemon_with_another_session_is_not_reused() -> None:
         session="--session=firefox",
     )
     assert warm._compatible(state, base_url="https://arena.ai", session="--session=firefox")
-    # Same URL, different session: the caller asked for another profile, so the
-    # running daemon (which holds a browser and cookies) cannot answer for it.
-    assert not warm._compatible(state, base_url="https://arena.ai", session="")
+    # Same URL, another *explicit* source: the caller asked for a different
+    # profile, so the running daemon (which holds a browser and cookies) cannot
+    # answer for it.
+    assert not warm._compatible(
+        state, base_url="https://arena.ai", session="--session=firefox:work"
+    )
+    # No source named means "the usual discovery order", and a daemon that is
+    # already warm with any source is exactly what that caller wants: restarting
+    # it here cost a full browser launch and looked like a slow request.
+    assert warm._compatible(state, base_url="https://arena.ai", session="")
 
 
 def test_old_state_files_without_a_session_still_work() -> None:
     state = warm.DaemonState.from_json({"pid": 5, "port": 6, "token": "t"})
     assert state is not None
     assert state.session == ""
+
+
+def test_an_unforced_caller_reuses_a_forced_daemon() -> None:
+    state = warm.DaemonState(
+        pid=1,
+        port=2,
+        token="t",
+        api_version=warm.api_version(),
+        base_url="https://arena.ai",
+        session="--session=firefox",
+    )
+    assert warm._compatible(state, base_url="https://arena.ai", session="")
+
+
+def test_warm_session_asks_for_an_idle_moment_before_archiving() -> None:
+    from dataclasses import replace
+
+    from arena_api.auto import AutoOptions
+
+    session = warm.WarmSession(AutoOptions())
+    guard = session.options.archive_if_idle
+    assert callable(guard)
+    assert guard() is True
+    session._waiting = 2  # a second prompt is already queued
+    assert guard() is False
+    session._waiting = 0
+    assert guard() is True
+    # The rest of the options are untouched: this is the same session config.
+    assert replace(session.options, archive_if_idle=None) == AutoOptions()

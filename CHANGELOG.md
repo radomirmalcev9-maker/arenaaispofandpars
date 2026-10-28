@@ -5,6 +5,22 @@
 
 ## Unreleased
 
+### Запрос больше не «долго отправляется»
+
+- **Пустая подпись сессии совместима с тёплым демоном**:
+  `_compatible(..., session="")` переиспользует уже поднятый демон, а не
+  перезапускает его. Раньше чередование CLI и шима Claude Code (разные
+  подписи) давало холодный старт браузера на каждый запрос. Явно указанный и
+  другой источник по-прежнему поднимает свой демон.
+- **Архивация не встаёт между турнами tool-loop**: `AutoOptions.archive_if_idle`
+  — guard, который `WarmSession` заполняет сам (`self._waiting <= 1`). Если
+  следующий промпт уже ждёт, архив пропускается с меткой `archive.skipped`.
+- **Видимые тайминги**: `arena-api --claude --verbose` печатает
+  `request: N chars, M tools, stream=…` и строку ответа
+  `prompt N chars -> open X ms, answer N chars, total Y ms`; те же числа
+  лежат в `ArenaEngine.last_timings` (`open_ms`, `first_delta_ms`, `total_ms`,
+  `prompt_chars`, `answer_chars`).
+
 ### Запуск браузера переживает занятый/битый профиль
 
 Симптом: `BrowserType.launch_persistent_context: Target page, context or browser
