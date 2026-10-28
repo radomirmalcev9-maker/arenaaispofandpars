@@ -430,11 +430,14 @@ async () => {{
 """
 
 
+_CLEAR_MAIN_FRAME_BODY_PATCH_JS = "() => { window.__arenaBodyPatch = null; }"
+
+
 def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
     patch_literal = json.dumps(dict(patch_obj), separators=(",", ":"))
     return f"""
 () => {{
-  const patch = {patch_literal};
+  window.__arenaBodyPatch = {patch_literal};
   const origFetch = window.fetch;
   if (typeof origFetch !== "function" || window.__arenaPatchInstalled) return;
   window.__arenaPatchInstalled = true;
@@ -443,7 +446,9 @@ def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
     try {{
       urlStr = typeof input === "string" ? input : (input && input.url) || "";
     }} catch (_) {{}}
+    const activePatch = window.__arenaBodyPatch;
     if (
+      activePatch &&
       init &&
       typeof init.body === "string" &&
       (urlStr.indexOf("/nextjs-api/stream/create-evaluation") !== -1 ||
@@ -453,8 +458,8 @@ def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
       try {{
         const parsed = JSON.parse(init.body);
         if (parsed && typeof parsed === "object") {{
-          if (patch.modelAId) parsed.modelAId = patch.modelAId;
-          if (patch.generationConfig) parsed.generationConfig = patch.generationConfig;
+          if (activePatch.modelAId) parsed.modelAId = activePatch.modelAId;
+          if (activePatch.generationConfig) parsed.generationConfig = activePatch.generationConfig;
           const nextInit = Object.assign({{}}, init, {{ body: JSON.stringify(parsed) }});
           return origFetch.call(this, input, nextInit);
         }}
@@ -468,6 +473,119 @@ def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
 
 _FIND_COMPOSER_JS = """
 async () => {
+  function extractFastModelId() {
+    if (window.__arenaFastModelId !== undefined) {
+      return window.__arenaFastModelId;
+    }
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const mediaRe = /image|video|flux|imagen|midjourney|ideogram|recraft|seedream|suno|veo|sora|kling|hailuo|runway|pika|luma|kontext/i;
+    const slowRe = /(?:^|[-_.\\s/])(?:thinking|reasoning|reasoner|max|opus|o1|o3|o4|qwq|r1|pro|ultra|heavy|deep[-_]?research)(?:$|[-_.\\s/0-9])/i;
+    const ultraFastRe = /(?:^|[-_.\\s/])(?:flash[-_]?lite|nano|8b|7b|4b|3b)(?:$|[-_.\\s/0-9])/i;
+    const fastRe = /(?:^|[-_.\\s/])(?:flash|haiku|mini|instant|turbo|fast|scout|maverick|small|lite)(?:$|[-_.\\s/0-9])/i;
+    let bestId = null;
+    let bestScore = 1e9;
+    function hasCap(caps, key) {
+      if (!caps) return false;
+      if (Array.isArray(caps)) return caps.indexOf(key) !== -1;
+      return Boolean(caps[key]);
+    }
+    function consider(m) {
+      if (!m || typeof m !== "object") return;
+      const id = String(m.id || m.modelId || m.model_id || "");
+      if (!uuidRe.test(id)) return;
+      const name = String(m.publicName || m.public_name || m.displayName || m.display_name || m.name || "");
+      if (!name) return;
+      if (m.available === false || m.active === false || m.userSelectable === false) return;
+      const caps = m.capabilities;
+      if (caps && typeof caps === "object") {
+        if (caps.inputCapabilities && !hasCap(caps.inputCapabilities, "text")) return;
+        if (caps.outputCapabilities && !hasCap(caps.outputCapabilities, "text")) return;
+      } else if (mediaRe.test(name)) {
+        return;
+      }
+      let chatRank = 500;
+      if (m.rankByModality && typeof m.rankByModality.chat === "number") {
+        chatRank = m.rankByModality.chat;
+      } else if (typeof m.rank === "number") {
+        chatRank = 10000 + m.rank;
+      } else if (caps || m.rankByModality) {
+        return;
+      }
+      if (chatRank >= 20000) return;
+      let tier = 2000;
+      if (slowRe.test(name)) tier = 8000;
+      else if (ultraFastRe.test(name)) tier = 0;
+      else if (fastRe.test(name)) tier = 50;
+      const total = tier + chatRank;
+      if (total < bestScore) {
+        bestScore = total;
+        bestId = id;
+      }
+    }
+    function walk(node, depth) {
+      if (!node || depth > 14 || typeof node !== "object") return;
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i += 1) walk(node[i], depth + 1);
+        return;
+      }
+      if ((node.id || node.modelId || node.model_id) && (node.publicName || node.public_name || node.displayName || node.display_name || node.name)) {
+        consider(node);
+      }
+      for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (v && typeof v === "object") walk(v, depth + 1);
+      }
+    }
+    function scanChunk(text) {
+      if (!text || (text.indexOf("publicName") === -1 && text.indexOf("displayName") === -1 && text.indexOf("public_name") === -1)) return;
+      for (const key of ['"initialModels":[', '"models":[']) {
+        let idx = text.indexOf(key);
+        while (idx !== -1) {
+          const arrStart = idx + key.length - 1;
+          let depth = 0;
+          let inStr = false;
+          let esc = false;
+          for (let i = arrStart; i < text.length; i += 1) {
+            const ch = text[i];
+            if (inStr) {
+              if (esc) esc = false;
+              else if (ch === "\\\\") esc = true;
+              else if (ch === '"') inStr = false;
+            } else if (ch === '"') {
+              inStr = true;
+            } else if (ch === "[") {
+              depth += 1;
+            } else if (ch === "]") {
+              depth -= 1;
+              if (depth === 0) {
+                try { walk(JSON.parse(text.slice(arrStart, i + 1)), 0); } catch (_) {}
+                break;
+              }
+            }
+          }
+          idx = text.indexOf(key, arrStart + 1);
+        }
+      }
+    }
+    try {
+      const flightRe = /__next_f\\.push\\(\\[\\s*\\d+\\s*,\\s*("(?:\\\\.|[^"\\\\])*")\\s*\\]\\)/g;
+      for (const script of Array.from(document.scripts || [])) {
+        const raw = script.textContent || "";
+        if (!raw || (raw.indexOf("publicName") === -1 && raw.indexOf("displayName") === -1 && raw.indexOf("public_name") === -1)) continue;
+        if ((script.type || "").indexOf("json") !== -1 || raw.trimStart().startsWith("{")) {
+          try { walk(JSON.parse(raw), 0); continue; } catch (_) {}
+        }
+        flightRe.lastIndex = 0;
+        let m;
+        while ((m = flightRe.exec(raw)) !== null) {
+          try { scanChunk(JSON.parse(m[1])); } catch (_) {}
+        }
+        scanChunk(raw);
+      }
+    } catch (_) {}
+    window.__arenaFastModelId = bestId;
+    return bestId;
+  }
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     for (const btn of document.querySelectorAll("button")) {
@@ -513,10 +631,11 @@ async () => {
         found: true,
         tag: best.el.tagName.toLowerCase(),
         x: Math.round(best.rect.left + best.rect.width / 2),
-        y: Math.round(best.rect.top + best.rect.height / 2)
+        y: Math.round(best.rect.top + best.rect.height / 2),
+        fastModelId: extractFastModelId()
       };
     }
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 16));
   }
   return { found: false };
 }
@@ -797,13 +916,13 @@ async def _click_marked(page: Any, selector: str) -> bool:
     if callable(locator_fn):
         try:
             target = locator_fn(selector).first
-            await target.click(timeout=2_000)
+            await target.click(timeout=500)
             return True
         except Exception:  # noqa: BLE001 - fall back to a synthetic click
             pass
         try:
             target = locator_fn(selector).first
-            await target.click(timeout=1_500, force=True)
+            await target.click(timeout=300, force=True)
             return True
         except Exception:  # noqa: BLE001
             pass
@@ -828,9 +947,10 @@ async def _click_marked(page: Any, selector: str) -> bool:
 async def archive_conversation(
     page: Any,
     *,
-    timeout: float = 8.0,
-    confirm_timeout: float = 0.6,
+    timeout: float = 4.0,
+    confirm_timeout: float = 0.25,
     wait_fn: Any = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> bool:
     """Move the open conversation to the archive.
 
@@ -841,6 +961,8 @@ async def archive_conversation(
     when the menu item was actually clicked, so a caller can log a miss instead
     of pretending the chat was archived.
     """
+    if should_abort is not None and should_abort():
+        return False
     eval_fn = getattr(page, "evaluate", None)
     if not callable(eval_fn):
         return False
@@ -849,7 +971,7 @@ async def archive_conversation(
     async def _wait() -> None:
         if callable(sleep):
             try:
-                await sleep(60)
+                await sleep(12)
             except Exception:  # noqa: BLE001 - a fake page may not implement it
                 pass
 
@@ -858,13 +980,17 @@ async def archive_conversation(
         found = int(marked.get("found") or 0) if isinstance(marked, Mapping) else 0
         if not found:
             return False
-        deadline = time.monotonic() + max(1.0, timeout)
+        deadline = time.monotonic() + max(0.1, timeout)
         for index in range(found):
+            if should_abort is not None and should_abort():
+                return False
             selector = f'[data-arena-archive-trigger="{index}"]'
             if not await _click_marked(page, selector):
                 continue
             # Radix renders the menu into a portal on the next frame.
             for _ in range(12):
+                if should_abort is not None and should_abort():
+                    return False
                 item = await eval_fn(_ARCHIVE_FIND_ITEM_JS)
                 if isinstance(item, Mapping) and int(item.get("found") or 0):
                     break
@@ -882,6 +1008,8 @@ async def archive_conversation(
                 # closing is the first sign it went through.
                 deadline_confirm = time.monotonic() + max(0.0, confirm_timeout)
                 while time.monotonic() < deadline_confirm:
+                    if should_abort is not None and should_abort():
+                        break
                     state = await eval_fn(_ARCHIVE_CONFIRM_JS)
                     if isinstance(state, Mapping) and not state.get("menu_open"):
                         break
@@ -1125,6 +1253,8 @@ async def _submit_prompt_via_composer(
     has_submitted: Callable[[], bool] | None = None,
     install_legacy_tap_flags: bool = False,
     fast_submit: bool = False,
+    auto_fast_model: bool = False,
+    resolved_model_out: list[str] | None = None,
     mark: Callable[[str], None] | None = None,
 ) -> bool:
     locator_fn = getattr(page, "locator", None)
@@ -1142,19 +1272,6 @@ async def _submit_prompt_via_composer(
         except Exception:  # noqa: BLE001
             pass
 
-    patch_obj: dict[str, Any] = {}
-    if model_id_override:
-        patch_obj["modelAId"] = model_id_override
-    if generation_params:
-        patch_obj["generationConfig"] = dict(generation_params)
-    if patch_obj:
-        await eval_fn(_build_main_frame_body_patch_js(patch_obj))
-    if install_legacy_tap_flags:
-        patch_literal = json.dumps(patch_obj) if patch_obj else "null"
-        await eval_fn(
-            f"() => {{ window.__arenaBodyPatch = {patch_literal}; window.__arenaTapArmed = true; }}"
-        )
-
     wait_fn = getattr(page, "wait_for_timeout", None)
     info = await eval_fn(_FIND_COMPOSER_JS)
     if (
@@ -1163,13 +1280,44 @@ async def _submit_prompt_via_composer(
         and callable(wait_fn)
     ):
         for _ in range(25):
-            await wait_fn(40)
+            await wait_fn(15)
             info = await eval_fn(_FIND_COMPOSER_JS)
             if not isinstance(info, Mapping) or info.get("found"):
                 break
     if not isinstance(info, Mapping) or not info.get("found"):
         return False
     _mark("composer.visible")
+
+    effective_model_id = model_id_override
+    if effective_model_id is None and auto_fast_model:
+        candidate_fast = info.get("fastModelId")
+        if isinstance(candidate_fast, str) and candidate_fast.strip():
+            effective_model_id = candidate_fast.strip()
+            if resolved_model_out is not None:
+                resolved_model_out.append(effective_model_id)
+
+    patch_obj: dict[str, Any] = {}
+    if effective_model_id:
+        patch_obj["modelAId"] = effective_model_id
+    if generation_params:
+        patch_obj["generationConfig"] = dict(generation_params)
+    if patch_obj:
+        await eval_fn(_build_main_frame_body_patch_js(patch_obj))
+        try:
+            setattr(page, "_arena_has_body_patch", True)
+        except Exception:  # noqa: BLE001
+            pass
+    elif getattr(page, "_arena_has_body_patch", False):
+        await eval_fn(_CLEAR_MAIN_FRAME_BODY_PATCH_JS)
+        try:
+            setattr(page, "_arena_has_body_patch", False)
+        except Exception:  # noqa: BLE001
+            pass
+    if install_legacy_tap_flags:
+        patch_literal = json.dumps(patch_obj) if patch_obj else "null"
+        await eval_fn(
+            f"() => {{ window.__arenaBodyPatch = {patch_literal}; window.__arenaTapArmed = true; }}"
+        )
 
     composer = locator_fn('[data-arena-composer="1"]').first
     # focus() instead of click(): no actionability animation, no mouse move, no
@@ -1194,7 +1342,7 @@ async def _submit_prompt_via_composer(
         and keyboard is not None
         and callable(getattr(keyboard, "type", None))
     ):
-        await keyboard.type(prompt, delay=2)
+        await keyboard.type(prompt, delay=0)
         try:
             non_empty = await eval_fn(_COMPOSER_NONEMPTY_JS)
         except Exception:  # noqa: BLE001
@@ -1202,13 +1350,13 @@ async def _submit_prompt_via_composer(
         if not non_empty:
             await composer.fill(prompt)
     else:
-        first_line = prompt.splitlines()[0][:4] if prompt else ""
+        first_line = prompt.splitlines()[0][:1] if prompt else ""
         if (
             first_line
             and keyboard is not None
             and callable(getattr(keyboard, "type", None))
         ):
-            await keyboard.type(first_line, delay=2)
+            await keyboard.type(first_line, delay=0)
         await composer.fill(prompt)
     _mark("prompt.filled")
 
@@ -1233,7 +1381,7 @@ async def _submit_prompt_via_composer(
                             pass
                         return True
                     if callable(wait_fn):
-                        await wait_fn(40)
+                        await wait_fn(15)
 
     btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
     try:
@@ -1247,14 +1395,14 @@ async def _submit_prompt_via_composer(
             # submission while grecaptcha.enterprise.execute() is still running.
             if btn_info.get("confidence") == "fallback":
                 # The button was matched by a heuristic, so the click may have
-                # hit something inert.  Give the submit up to 500 ms to show up,
+                # hit something inert.  Give the submit up to ~180 ms to show up,
                 # but stop as soon as it does instead of always paying the full
-                # half second before pressing Enter.
+                # wait before pressing Enter.
                 if callable(wait_fn):
-                    for _ in range(20):
+                    for _ in range(12):
                         if has_submitted is not None and has_submitted():
                             break
-                        await wait_fn(25)
+                        await wait_fn(15)
                 already_started = bool(has_submitted and has_submitted())
                 if not already_started:
                     challenge = await _detect_post_submit_challenge(page)

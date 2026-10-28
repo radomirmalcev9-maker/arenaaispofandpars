@@ -99,16 +99,10 @@ if not defined SHIMPID goto no_start
 set "STARTED_SHIM=1"
 echo [arena] shim pid %SHIMPID%, log %LOG%
 
-set /a TRIES=0
-:wait_loop
-call :probe
-if "%PORT_OPEN%"=="1" goto shim_ready
-call :alive
-if not "%ALIVE%"=="1" goto shim_died
-set /a TRIES+=1
-if %TRIES% GEQ 30 goto no_response
-ping -n 2 127.0.0.1 >nul
-goto :wait_loop
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$u = 'http://127.0.0.1:%SHIM_PORT%/healthz'; for ($i = 0; $i -lt 300; $i++) { try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 -Uri $u; if ($r.StatusCode -eq 200) { exit 0 } } catch {} if (-not (Get-Process -Id %SHIMPID% -ErrorAction SilentlyContinue)) { exit 2 } Start-Sleep -Milliseconds 80 }; exit 1" >nul 2>&1
+if "%ERRORLEVEL%"=="0" goto shim_ready
+if "%ERRORLEVEL%"=="2" goto shim_died
+goto no_response
 
 :shim_died
 echo.
