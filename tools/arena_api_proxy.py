@@ -29,6 +29,7 @@ Anthropic-совместимый HTTP-прокси над arena-api.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import json
 import os
 import uuid
@@ -38,8 +39,26 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from arena_api.auto import auto_async_direct_client
+from arena_api.compat.anthropic_server import resolve_arena_model
+from arena_api.exceptions import ModelUnavailableError
 
-app = FastAPI(title="arena-api anthropic proxy")
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    try:
+        await get_client()
+    except Exception:  # noqa: BLE001 - lazy retry on first request
+        pass
+    try:
+        yield
+    finally:
+        global _client
+        if _client is not None:
+            await _client.aclose()
+            _client = None
+
+
+app = FastAPI(title="arena-api anthropic proxy", lifespan=_lifespan)
 
 _PORT_DEFAULT = 8765
 
@@ -100,6 +119,7 @@ async def messages(request: Request):
     """Anthropic Messages API — точка входа Claude Code."""
     body = await request.json()
     model = body.get("model", "arena")
+    arena_model = resolve_arena_model(model)
     stream = body.get("stream", False)
     messages = body.get("messages", [])
 
@@ -114,9 +134,16 @@ async def messages(request: Request):
         chunks: list[str] = []
         client = await get_client()
         try:
-            async for chunk in client.astream(prompt, model=model):
-                if getattr(chunk, "delta", None):
-                    chunks.append(chunk.delta)
+            try:
+                async for chunk in client.astream(prompt, model=arena_model):
+                    if getattr(chunk, "delta", None):
+                        chunks.append(chunk.delta)
+            except ModelUnavailableError:
+                if arena_model is None:
+                    raise
+                async for chunk in client.astream(prompt, model=None):
+                    if getattr(chunk, "delta", None):
+                        chunks.append(chunk.delta)
         except Exception as exc:  # noqa: BLE001 - отдаём понятную ошибку клиенту
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         text = "".join(chunks)
@@ -161,17 +188,32 @@ async def messages(request: Request):
                 },
             )
             try:
-                async for chunk in client.astream(prompt, model=model):
-                    delta = getattr(chunk, "delta", None) or ""
-                    if delta:
-                        yield _sse(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": delta},
-                            },
-                        )
+                try:
+                    async for chunk in client.astream(prompt, model=arena_model):
+                        delta = getattr(chunk, "delta", None) or ""
+                        if delta:
+                            yield _sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {"type": "text_delta", "text": delta},
+                                },
+                            )
+                except ModelUnavailableError:
+                    if arena_model is None:
+                        raise
+                    async for chunk in client.astream(prompt, model=None):
+                        delta = getattr(chunk, "delta", None) or ""
+                        if delta:
+                            yield _sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {"type": "text_delta", "text": delta},
+                                },
+                            )
             finally:
                 yield _sse(
                     "content_block_stop",
