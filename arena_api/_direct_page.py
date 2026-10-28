@@ -868,8 +868,22 @@ _COMPOSER_NONEMPTY_JS = (
 #: element it is exactly differs between Arena builds, so the candidates are
 #: ranked, tried in order, and each is marked with its index for Playwright to
 #: click with real pointer events (Radix opens on pointerdown, not on click).
-_ARCHIVE_MARK_TRIGGERS_JS = r"""
+def _archive_mark_triggers_js(conversation_id: str | None = None) -> str:
+    """JS that marks the menu buttons of conversation rows.
+
+    Without an id the *active* row wins (the chat that was just answered is the
+    one on screen).  With an id the row whose link contains it is preferred --
+    that is how a chat that was skipped earlier (another prompt was already
+    waiting) still gets archived on a later turn, while a different chat is
+    open.
+    """
+    target = json.dumps(conversation_id) if conversation_id else "null"
+    return _ARCHIVE_MARK_TRIGGERS_TEMPLATE.replace("__ARENA_TARGET_ID__", target)
+
+
+_ARCHIVE_MARK_TRIGGERS_TEMPLATE = r"""
 /* arena_archive_triggers */ () => {
+  const targetId = __ARENA_TARGET_ID__;
   for (const old of document.querySelectorAll('[data-arena-archive-trigger]')) {
     old.removeAttribute('data-arena-archive-trigger');
   }
@@ -892,12 +906,32 @@ _ARCHIVE_MARK_TRIGGERS_JS = r"""
     }
     return null;
   };
+  const rowForId = (id) => {
+    if (!id) return null;
+    for (const link of document.querySelectorAll('a[href]')) {
+      if ((link.getAttribute('href') || '').toLowerCase().indexOf(id.toLowerCase()) === -1) {
+        continue;
+      }
+      const container = link.closest('li, [role="listitem"]') || link.parentElement;
+      if (container) return { row: container, link };
+    }
+    return null;
+  };
 
   const ranked = [];
   const push = (el, score) => {
     if (!el || !visible(el) || ranked.some((item) => item.el === el)) return;
     ranked.push({ el, score });
   };
+
+  const wanted = rowForId(targetId);
+  if (wanted) {
+    const scope = wanted.row.parentElement || wanted.row;
+    for (const el of wanted.row.querySelectorAll('[aria-haspopup="menu"]')) push(el, 200);
+    for (const el of (scope.querySelectorAll ? scope.querySelectorAll('[aria-haspopup="menu"]') : [])) {
+      push(el, 190);
+    }
+  }
 
   const row = activeRow();
   // 1. A menu button inside the active conversation row (or its container).
@@ -928,6 +962,11 @@ _ARCHIVE_MARK_TRIGGERS_JS = r"""
   return { found: chosen.length, strategies: chosen.map((item) => item.score) };
 }
 """.strip()
+
+#: Marks the menu buttons of the conversation rows (active row first).
+_ARCHIVE_MARK_TRIGGERS_JS = _archive_mark_triggers_js()
+
+
 
 _ARCHIVE_FIND_ITEM_JS = r"""
 /* arena_archive_item */ () => {
@@ -1017,6 +1056,7 @@ async def archive_conversation(
     confirm_timeout: float = 0.25,
     wait_fn: Any = None,
     should_abort: Callable[[], bool] | None = None,
+    conversation_id: str | None = None,
 ) -> bool:
     """Move the open conversation to the archive.
 
@@ -1026,6 +1066,10 @@ async def archive_conversation(
     with a lucide ``archive`` icon in Arena's markup).  Returns ``True`` only
     when the menu item was actually clicked, so a caller can log a miss instead
     of pretending the chat was archived.
+
+    ``conversation_id`` archives a *specific* chat by its row in the sidebar
+    instead of whatever is on screen: a chat whose archive was postponed (the
+    next prompt was already waiting) can still be filed away later.
     """
     if should_abort is not None and should_abort():
         return False
@@ -1042,7 +1086,7 @@ async def archive_conversation(
                 pass
 
     try:
-        marked = await eval_fn(_ARCHIVE_MARK_TRIGGERS_JS)
+        marked = await eval_fn(_archive_mark_triggers_js(conversation_id))
         found = int(marked.get("found") or 0) if isinstance(marked, Mapping) else 0
         if not found:
             return False

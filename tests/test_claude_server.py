@@ -1787,3 +1787,96 @@ def test_a_code_fence_with_tools_is_still_plain_text(serve: Any) -> None:
         if name == "content_block_start"
     ]
     assert kinds == ["text"]
+
+
+def test_warm_engine_asks_for_archiving_on_every_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon started by the CLI must still archive for the shim.
+
+    The flag travels with the request, not only with the daemon's argv: the CLI
+    does not archive by default, and the shim reuses that running daemon.
+    """
+    from arena_api import warm
+
+    seen: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(warm, "ensure_daemon", lambda **_: "state")
+
+    def fake_ask(prompt: str, **kwargs: Any) -> Iterator[str]:
+        seen.append(kwargs)
+        yield "ответ"
+
+    monkeypatch.setattr(warm, "ask_stream", fake_ask)
+    engine = shim.ArenaEngine(
+        engine="warm", base_url="https://example.test", archive=True
+    )
+    assert "".join(engine.answer("привет")) == "ответ"
+    assert seen[0]["archive"] is True
+
+    seen.clear()
+    engine_off = shim.ArenaEngine(
+        engine="warm", base_url="https://example.test", archive=False
+    )
+    assert "".join(engine_off.answer("привет")) == "ответ"
+    assert seen[0]["archive"] is False
+
+
+def test_archive_can_target_one_conversation_by_id() -> None:
+    chat = "0b7f1c9e-1111-2222-3333-444455556666"
+    from arena_api import _direct_page
+
+    marked = _direct_page._archive_mark_triggers_js(chat)
+    assert f'const targetId = "{chat}";' in marked
+    # The active row is still the fallback, so a chat without an id works.
+    plain = _direct_page._archive_mark_triggers_js(None)
+    assert "const targetId = null;" in plain
+    assert "activeRow" in plain
+
+
+def test_archiving_a_chat_by_id_clicks_its_own_row() -> None:
+    import asyncio
+
+    from arena_api import _direct_page
+
+    chat = "0b7f1c9e-1111-2222-3333-444455556666"
+    evaluated: list[str] = []
+
+    class Page:
+        def __init__(self) -> None:
+            self.locator_hits: list[str] = []
+
+        async def evaluate(self, script: str, *_: Any, **__: Any) -> Any:
+            evaluated.append(script)
+            if "arena_archive_triggers" in script:
+                return {"found": 1, "strategies": [200]}
+            if "arena_archive_item" in script:
+                return {"found": 1, "label": "Archive"}
+            return {"menu_open": False}
+
+        def locator(self, selector: str) -> Any:
+            self.locator_hits.append(selector)
+
+            class Target:
+                @property
+                def first(self) -> Any:
+                    async def click(timeout: int = 0) -> None:
+                        return None
+
+                    async def wait_for(self, *a: Any, **k: Any) -> None:
+                        return None
+
+                    return type("T", (), {"click": staticmethod(click), "wait_for": staticmethod(wait_for)})()
+
+            return Target()
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+    page = Page()
+    archived = asyncio.run(
+        _direct_page.archive_conversation(page, conversation_id=chat, timeout=1.0)
+    )
+    assert archived is True
+    triggers = [script for script in evaluated if "arena_archive_triggers" in script]
+    assert triggers and f'const targetId = "{chat}";' in triggers[0]

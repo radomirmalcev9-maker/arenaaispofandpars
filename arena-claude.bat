@@ -28,7 +28,7 @@ rem    ARENA_CLAUDE_SESSION=firefox     session source: firefox, firefox:<profil
 rem                                     storage, chrome, auto
 rem    ARENA_CLAUDE_ENGINE=warm         warm (daemon), http, echo
 rem    ARENA_CLAUDE_VERBOSE=1           log every request in the shim log
-rem    ARENA_CLAUDE_ARCHIVE=0           keep answered chats (default: archive them)
+rem    (chats are ALWAYS archived with this launcher: the sidebar stays clean)
 rem    ARENA_CLAUDE_FRESH_PROFILE=1      delete the browser profile first; use it
 rem                                     when Chrome refuses to start on it
 rem
@@ -52,9 +52,11 @@ set "ENGINE=%ARENA_CLAUDE_ENGINE%"
 if "%ENGINE%"=="" set "ENGINE=warm"
 set "EXTRA="
 if "%ARENA_CLAUDE_VERBOSE%"=="1" set "EXTRA=--verbose"
-set "ARCHIVE_NOTE=after the answer is complete"
-if "%ARENA_CLAUDE_ARCHIVE%"=="0" set "EXTRA=%EXTRA% --no-archive"
-if "%ARENA_CLAUDE_ARCHIVE%"=="0" set "ARCHIVE_NOTE=no (chats are kept)"
+rem Archive is not optional here: every answered chat is filed away, so the
+rem Arena sidebar does not collect hundreds of one-shot conversations.
+set "ARENA_CLAUDE_ARCHIVE=1"
+set "EXTRA=%EXTRA% --archive"
+set "ARCHIVE_NOTE=always (after the whole answer is received)"
 set "PROFILE_NOTE=reused (stale locks are healed)"
 if "%ARENA_CLAUDE_FRESH_PROFILE%"=="1" set "EXTRA=%EXTRA% --fresh-profile"
 if "%ARENA_CLAUDE_FRESH_PROFILE%"=="1" set "PROFILE_NOTE=recreated (--fresh-profile)"

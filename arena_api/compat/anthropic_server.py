@@ -668,6 +668,11 @@ class _WarmEngine:
             archive=archive,
             fast_model=fast_model,
         )
+        #: Archiving travels with *every* request, not only with the daemon's
+        #: start-up argv: a warm daemon started by the CLI (which does not
+        #: archive by default) is reused by the shim, and chats must still be
+        #: filed away.
+        self._archive = bool(archive)
         self._conn: Any = None
         self._cached_state: Any = None
 
@@ -696,6 +701,7 @@ class _WarmEngine:
                 prompt,
                 ensure_state=self._ensure_state,
                 model=model,
+                archive=self._archive,
             )
             return
 
@@ -703,7 +709,9 @@ class _WarmEngine:
             payload={"argv": list(self._argv), "base_url": self._base_url},
             base_url=self._base_url,
         )
-        yield from warm.ask_stream(prompt, state=state, model=model)
+        yield from warm.ask_stream(
+            prompt, state=state, model=model, archive=self._archive
+        )
 
     def close(self) -> None:
         conn = self._conn
@@ -966,10 +974,24 @@ class ArenaEngine:
             stream, first = self._open(prompt, model)
             opened = time.monotonic() - started
             chars = len(first)
+            deltas = 1 if first else 0
+            first_at = time.monotonic() if first else None
+            # Smoothness of the stream: how many pieces the answer arrived in
+            # and the longest pause between them.  A handful of huge gaps means
+            # the *engine* is lumpy (Arena or the daemon), not this shim: the
+            # handler writes every delta to the socket as it appears.
+            longest_gap = 0.0
+            last_at = time.monotonic()
             try:
                 if first:
                     yield first
                 for delta in stream:
+                    now = time.monotonic()
+                    if first_at is None:
+                        first_at = now
+                    longest_gap = max(longest_gap, now - last_at)
+                    last_at = now
+                    deltas += 1
                     chars += len(delta)
                     yield delta
             finally:
@@ -977,14 +999,20 @@ class ArenaEngine:
                 self.last_timings = {
                     "prompt_chars": len(prompt),
                     "open_ms": round(opened * 1000.0, 1),
-                    "first_delta_ms": round(opened * 1000.0, 1),
-                    "total_ms": round((time.monotonic() - started) * 1000.0, 1),
+                    "first_delta_ms": round(
+                        ((first_at or started) - started) * 1000.0, 1
+                    ),
                     "answer_chars": chars,
+                    "deltas": deltas,
+                    "longest_gap_ms": round(longest_gap * 1000.0, 1),
+                    "total_ms": round((time.monotonic() - started) * 1000.0, 1),
                 }
                 if self.verbose:
                     _log_quiet(
                         "prompt {prompt_chars} chars -> open {open_ms} ms, "
-                        "answer {answer_chars} chars, total {total_ms} ms".format(
+                        "first delta {first_delta_ms} ms, answer {answer_chars} "
+                        "chars in {deltas} deltas (longest gap "
+                        "{longest_gap_ms} ms), total {total_ms} ms".format(
                             **self.last_timings
                         )
                     )

@@ -1857,8 +1857,32 @@ class _WarmBrowserState:
     prefetched_url: str | None = None
     housekeeping_task: asyncio.Task[Any] | None = None
     cancel_archive: bool = False
+    #: Chats whose archive was postponed (the next prompt was already waiting):
+    #: they are filed away on a later turn by their id, so archiving is never
+    #: silently lost -- which is what left dozens of chats in Arena's sidebar.
+    pending_archive_ids: list[str] = field(default_factory=list)
     last_page_title: str = ""
     fast_model_disabled: bool = False
+
+
+_CONVERSATION_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+def _conversation_id_from(*sources: Any) -> str | None:
+    """First conversation UUID found in the given strings/metadata.
+
+    The id travels in the request body (``"id"``), in the page URL after the
+    chat is created, and in the intercepted ``post_data`` of the UI submission.
+    Any of them is enough to find the chat's row in the sidebar later.
+    """
+    for source in sources:
+        if isinstance(source, str) and source:
+            match = _CONVERSATION_ID_RE.search(source)
+            if match:
+                return match.group(0)
+    return None
 
 
 def _is_page_usable(page: Any) -> bool:
@@ -3046,9 +3070,11 @@ class DirectVerificationToken:
                 _latency_mark("page.prepare.end")
             _latency_mark("submit.start")
             eval_task: asyncio.Task[Any] | None = None
+            turn_payload: Mapping[str, Any] | None = None
             if not used_composer:
                 token = await self._mint_token_on_page(page)
                 payload_body = dict(body_factory(token))
+                turn_payload = payload_body
                 serialized = json.dumps(payload_body, separators=(",", ":"))
                 eval_js = _build_browser_fetch_stream_js(endpoint_path, serialized)
                 eval_task = asyncio.create_task(page.evaluate(eval_js))
@@ -3414,16 +3440,25 @@ class DirectVerificationToken:
                     archive_allowed = bool(guard())
                 except Exception:  # noqa: BLE001 - a guard must never break a request
                     archive_allowed = True
-            should_archive = (
+            archive_wanted = (
                 self.options.archive_after_answer
                 and not follow_up
                 and bool(used_composer)
                 and _is_page_usable(page)
-                and archive_allowed
             )
-            if self.options.archive_after_answer and not archive_allowed:
-                # Another prompt is already queued: the chat stays in the list
-                # and gets archived with the next request's turn.
+            should_archive = archive_wanted and archive_allowed
+            # Which chat this turn created: needed to find its row in the
+            # sidebar if the archive has to wait for a later turn.
+            turn_chat_id = _conversation_id_from(
+                (turn_payload or {}).get("id") if turn_payload else None,
+                last_eval_post_data,
+                getattr(page, "url", None),
+            )
+            if archive_wanted and not archive_allowed:
+                # Another prompt is already queued: filing this chat away now
+                # would sit on the critical path of that prompt.  It becomes a
+                # debt of the next turn instead of being dropped -- otherwise
+                # every turn of a tool loop leaves one more chat in the sidebar.
                 _latency_mark("archive.skipped")
 
             if (
@@ -3440,12 +3475,15 @@ class DirectVerificationToken:
                     context,
                     should_archive=should_archive,
                     should_prefetch=bool(prefetch_next),
+                    conversation_id=turn_chat_id,
                 )
             else:
                 if should_archive:
                     _latency_mark("archive.start")
                     try:
-                        archived = await archive_conversation(page)
+                        archived = await archive_conversation(
+                            page, conversation_id=turn_chat_id
+                        )
                     except Exception as exc:  # noqa: BLE001
                         archived = False
                         _latency_mark("archive.error")
@@ -3456,6 +3494,12 @@ class DirectVerificationToken:
                             )
                     _latency_mark("archive.done" if archived else "archive.missed")
                 await self._harvest_refreshed_cookies(context)
+            if archive_wanted and not archive_allowed and turn_chat_id:
+                # Recorded *after* the background task took its snapshot, so the
+                # chat is filed away on a later turn, not now.
+                if turn_chat_id not in state.pending_archive_ids:
+                    state.pending_archive_ids.append(turn_chat_id)
+                    del state.pending_archive_ids[:-16]
         except _RetryInHeadedBrowser:
             discard_state = True
             raise
@@ -3513,12 +3557,20 @@ class DirectVerificationToken:
         *,
         should_archive: bool,
         should_prefetch: bool,
+        conversation_id: str | None = None,
     ) -> None:
         """Run post-answer archive, Direct Chat prefetch, and cookie harvest in the background."""
         goto_fn = getattr(page, "goto", None) if should_prefetch else None
         can_prefetch = bool(should_prefetch and callable(goto_fn))
         can_cookies = callable(getattr(context, "cookies", None))
-        if not should_archive and not can_prefetch and not can_cookies:
+        # A chat whose archive was postponed is a debt: it is paid here even on
+        # a turn that has nothing else to do.
+        if (
+            not should_archive
+            and not can_prefetch
+            and not can_cookies
+            and not state.pending_archive_ids
+        ):
             return
 
         def _swallow(done: asyncio.Task[Any]) -> None:
@@ -3529,7 +3581,15 @@ class DirectVerificationToken:
             except BaseException:  # noqa: BLE001
                 pass
 
-        if not can_prefetch and not should_archive:
+        # Everything this turn owes the sidebar: chats postponed earlier plus
+        # the one that was just answered.  They are filed away by their own id,
+        # so a postponed chat is archived even though another one is on screen.
+        archive_queue: list[str | None] = list(state.pending_archive_ids)
+        state.pending_archive_ids.clear()
+        if should_archive:
+            archive_queue.append(conversation_id)
+
+        if not can_prefetch and not should_archive and not archive_queue:
             # Chat follow-up turns keep the conversation open: prefetch_task
             # stays None while cookies refresh quietly in housekeeping_task.
             if state.housekeeping_task is None or state.housekeeping_task.done():
@@ -3553,13 +3613,21 @@ class DirectVerificationToken:
             state.prefetched_url = None
 
         async def _housekeeping() -> None:
-            archived = False
-            if should_archive and not state.cancel_archive and _is_page_usable(page):
+            archived_any = False
+            retry_later: list[str] = []
+            while archive_queue:
+                if state.cancel_archive or not _is_page_usable(page):
+                    # The next prompt took the tab: every chat still in the
+                    # queue stays a debt, it is filed away on a later turn.
+                    retry_later.extend(item for item in archive_queue if item)
+                    break
+                wanted = archive_queue.pop(0)
                 _latency_mark("archive.start")
                 try:
                     archived = await archive_conversation(
                         page,
                         should_abort=lambda: state.cancel_archive,
+                        conversation_id=wanted,
                     )
                 except Exception as exc:  # noqa: BLE001
                     archived = False
@@ -3570,16 +3638,30 @@ class DirectVerificationToken:
                             file=self.options.output,
                         )
                 _latency_mark("archive.done" if archived else "archive.missed")
-                if archived and can_prefetch and not state.cancel_archive:
-                    # Radix closes [role="menu"] on the very next frame; give
-                    # the archive fetch a brief beat in the background before
-                    # page.goto() tears down the document.
-                    wait_fn = getattr(page, "wait_for_timeout", None)
-                    if callable(wait_fn):
-                        try:
-                            await wait_fn(80)
-                        except Exception:  # noqa: BLE001
-                            pass
+                if archived:
+                    archived_any = True
+                    continue
+                if wanted:
+                    # Keep the debt for the next turn instead of losing the
+                    # chat: it is filed away by id, not by "whatever is open".
+                    retry_later.append(wanted)
+            if retry_later:
+                merged = retry_later + [
+                    item
+                    for item in state.pending_archive_ids
+                    if item not in retry_later
+                ]
+                state.pending_archive_ids[:] = merged[-16:]
+            if archived_any and can_prefetch and not state.cancel_archive:
+                # Radix closes [role="menu"] on the very next frame; give the
+                # archive fetch a brief beat in the background before
+                # page.goto() tears down the document.
+                wait_fn = getattr(page, "wait_for_timeout", None)
+                if callable(wait_fn):
+                    try:
+                        await wait_fn(80)
+                    except Exception:  # noqa: BLE001
+                        pass
             if can_prefetch and callable(goto_fn) and _is_page_usable(page):
                 await goto_fn(self.page_url, wait_until="domcontentloaded")
                 title_fn = getattr(page, "title", None)
