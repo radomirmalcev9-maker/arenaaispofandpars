@@ -898,10 +898,14 @@ class WarmSession:
                     chunks = 0
                     chars = 0
                     longest_gap = 0.0
-                    last_at = time.monotonic()
+                    asked_at = time.monotonic()
+                    first_at: float | None = None
+                    last_at = asked_at
                     with latency.span("warm.ask"):
                         async for chunk in client.astream(prompt, model=model):
                             now = time.monotonic()
+                            if first_at is None:
+                                first_at = now
                             longest_gap = max(longest_gap, now - last_at)
                             last_at = now
                             chunks += 1
@@ -911,6 +915,19 @@ class WarmSession:
                     latency.metric("answer.chunks", chunks)
                     latency.metric("answer.chars", chars)
                     latency.metric("answer.longest_gap_ms", round(longest_gap * 1000.0, 1))
+                    # Where the wall clock really goes: the wait for the first
+                    # token (Arena thinking) and the generation speed after it.
+                    # The streaming rate is the server's, not ours -- knowing it
+                    # keeps "make it faster" an honest conversation.
+                    if first_at is not None:
+                        latency.metric(
+                            "answer.first_delta_ms",
+                            round((first_at - asked_at) * 1000.0, 1),
+                        )
+                        generation = max(1e-6, last_at - first_at)
+                        latency.metric(
+                            "answer.chars_per_s", round(chars / generation, 1)
+                        )
                     self._last_error = None
                     return
                 except (AuthenticationError, ChallengeRequiredError) as exc:

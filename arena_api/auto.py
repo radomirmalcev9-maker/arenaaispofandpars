@@ -1838,6 +1838,9 @@ class _WarmBrowserState:
     #: a one-shot answer finished, so the next prompt finds the page loaded.
     prefetch_task: asyncio.Task[Any] | None = None
     prefetched_url: str | None = None
+    #: Archiving the finished chat, started as soon as the answer was fully
+    #: delivered: the click needs the tab, but not the caller's attention.
+    archive_task: asyncio.Task[Any] | None = None
 
 
 def _is_page_usable(page: Any) -> bool:
@@ -2112,6 +2115,7 @@ class DirectVerificationToken:
         state = self._warm_state
         self._warm_state = None
         if state is not None:
+            await self._drain_archive(state)
             await _close_browser_state(state)
 
     def _ensure_bg_loop(self) -> asyncio.AbstractEventLoop:
@@ -2689,6 +2693,10 @@ class DirectVerificationToken:
         registered_listeners: list[tuple[str, Callable[..., Any]]] = []
         response_tasks: set[asyncio.Task[None]] = set()
         page = state.page
+        # The previous answer may still be archiving itself in this tab: the
+        # click is fast and almost always finished by now, but the page is not
+        # ours until it is.
+        await self._drain_archive(state)
         context = getattr(page, "context", None)
         cdp_pump = state.cdp_pump
         discard_state = not keep_alive
@@ -3305,20 +3313,11 @@ class DirectVerificationToken:
                 and archive_allowed
             ):
                 # The caller consumed the whole answer, so the transcript is
-                # complete: move the chat to the archive now.  Best effort --
-                # a UI change must never fail a finished request.
-                _latency_mark("archive.start")
-                try:
-                    archived = await archive_conversation(page)
-                except Exception as exc:  # noqa: BLE001
-                    archived = False
-                    _latency_mark("archive.error")
-                    if self.options.output is not None:
-                        print(
-                            f"[arena-api] could not archive the chat: {exc}",
-                            file=self.options.output,
-                        )
-                _latency_mark("archive.done" if archived else "archive.missed")
+                # complete: move the chat to the archive.  It runs in the
+                # background -- the click takes a few hundred milliseconds and
+                # the client is already reading the answer -- and the next
+                # request waits for it before touching this tab.
+                self._schedule_archive(state, page)
             elif self.options.archive_after_answer and not archive_allowed:
                 # Another prompt is already queued: the chat stays in the list
                 # and gets archived with the next request's turn.
@@ -3377,6 +3376,54 @@ class DirectVerificationToken:
                     self._warm_state = None
                 await _close_browser_state(state)
 
+    def _schedule_archive(self, state: _WarmBrowserState, page: Any) -> None:
+        """Archive the finished chat without holding up the answer.
+
+        ``archive_conversation`` clicks a menu entry, waits for the menu to
+        close and reports the result: 200-600 ms of pure UI work that used to
+        sit between the last streamed token and ``message_stop``.  The chat is
+        already answered at this point, so the work moves to the background.
+        Best effort -- a UI change must never fail a finished request.
+        """
+        if state.archive_task is not None and not state.archive_task.done():
+            return
+        if not _is_page_usable(page):
+            return
+
+        async def _run() -> None:
+            _latency_mark("archive.start")
+            try:
+                archived = await archive_conversation(page)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                archived = False
+                _latency_mark("archive.error")
+                if self.options.output is not None:
+                    print(
+                        f"[arena-api] could not archive the chat: {exc}",
+                        file=self.options.output,
+                    )
+            _latency_mark("archive.done" if archived else "archive.missed")
+
+        try:
+            state.archive_task = asyncio.get_running_loop().create_task(_run())
+        except RuntimeError:  # no running loop: archive right on the spot
+            state.archive_task = None
+
+    async def _drain_archive(self, state: _WarmBrowserState) -> None:
+        """Wait for a background archive; the tab belongs to it until then."""
+        task, state.archive_task = state.archive_task, None
+        if task is None or task.done():
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise  # the *caller* was cancelled, not the archive
+        except Exception:  # noqa: BLE001 - archive is best effort
+            pass
+
     def _schedule_prefetch(self, state: _WarmBrowserState, page: Any) -> None:
         """Navigate the idle warm tab back to Direct Chat in the background.
 
@@ -3393,10 +3440,15 @@ class DirectVerificationToken:
             return
         state.has_active_conversation = False
         state.prefetched_url = self.page_url
+
+        async def _navigate() -> None:
+            # The archive click happens on the finished conversation, so it has
+            # to win the race against this navigation.
+            await self._drain_archive(state)
+            await goto_fn(self.page_url, wait_until="domcontentloaded")
+
         try:
-            task = asyncio.get_running_loop().create_task(
-                goto_fn(self.page_url, wait_until="domcontentloaded")
-            )
+            task = asyncio.get_running_loop().create_task(_navigate())
         except RuntimeError:
             state.prefetched_url = None
             return

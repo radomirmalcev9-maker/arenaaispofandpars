@@ -25,6 +25,7 @@ import types
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -5915,3 +5916,123 @@ def test_a_broken_archive_guard_does_not_disable_archiving() -> None:
     except Exception:  # noqa: BLE001 - same fallback as the loop in auto.py
         allowed = True
     assert allowed is True
+
+
+# --------------------------------------------------------------------------- #
+# Archiving runs after the answer, in the background
+# --------------------------------------------------------------------------- #
+
+
+class _BackgroundArchivePage:
+    """Minimal page: the archive click and the prefetch navigation use it."""
+
+    def __init__(self, ordering: list[str]) -> None:
+        self.ordering = ordering
+
+    async def goto(self, url: str, wait_until: str | None = None) -> None:
+        self.ordering.append("prefetch.goto")
+
+    def is_closed(self) -> bool:
+        return False
+
+
+def _warm_state(page: Any) -> Any:
+    return auto_module._WarmBrowserState(
+        environment=None,
+        page=page,
+        win_cloaker=None,
+        ua_cdp_session=None,
+        cdp_pump=None,
+        selected_channel=None,
+        headless=True,
+        hide_window=True,
+        user_data_dir=None,
+        loop=asyncio.get_running_loop(),
+    )
+
+
+def test_a_finished_answer_archives_in_the_background(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_archive(page: Any, **_kwargs: Any) -> bool:
+        calls.append("archive")
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(auto_module, "archive_conversation", fake_archive)
+    client = auto_module.DirectVerificationToken()
+
+    async def run() -> None:
+        state = _warm_state(_BackgroundArchivePage(calls))
+        client._schedule_archive(state, state.page)
+        # Scheduling returns immediately: the caller has its answer already.
+        assert calls == []
+        assert state.archive_task is not None
+        await client._drain_archive(state)
+        assert calls == ["archive"]
+        assert state.archive_task is None
+
+    asyncio.run(run())
+
+
+def test_the_next_request_waits_for_a_pending_archive(monkeypatch) -> None:
+    ordering: list[str] = []
+
+    async def fake_archive(page: Any, **_kwargs: Any) -> bool:
+        ordering.append("archive")
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(auto_module, "archive_conversation", fake_archive)
+    client = auto_module.DirectVerificationToken()
+
+    async def run() -> None:
+        state = _warm_state(_BackgroundArchivePage(ordering))
+        client._schedule_archive(state, state.page)
+        # The prefetch navigates the very same tab, so it must not overtake
+        # the archive click.
+        client._schedule_prefetch(state, state.page)
+        assert state.prefetch_task is not None
+        await state.prefetch_task
+        assert ordering == ["archive", "prefetch.goto"]
+
+    asyncio.run(run())
+
+
+def test_a_broken_archive_is_swallowed(monkeypatch) -> None:
+    async def exploding(page: Any, **_kwargs: Any) -> bool:
+        raise RuntimeError("UI changed")
+
+    monkeypatch.setattr(auto_module, "archive_conversation", exploding)
+    client = auto_module.DirectVerificationToken()
+
+    async def run() -> None:
+        state = _warm_state(_BackgroundArchivePage([]))
+        client._schedule_archive(state, state.page)
+        await client._drain_archive(state)  # must not raise
+        assert state.archive_task is None
+
+    asyncio.run(run())
+
+
+def test_a_closed_page_is_not_archived(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_archive(page: Any, **_kwargs: Any) -> bool:
+        calls.append("archive")
+        return True
+
+    monkeypatch.setattr(auto_module, "archive_conversation", fake_archive)
+    client = auto_module.DirectVerificationToken()
+
+    class ClosedPage:
+        def is_closed(self) -> bool:
+            return True
+
+    async def run() -> None:
+        state = _warm_state(ClosedPage())
+        client._schedule_archive(state, state.page)
+        assert state.archive_task is None
+        assert calls == []
+
+    asyncio.run(run())
