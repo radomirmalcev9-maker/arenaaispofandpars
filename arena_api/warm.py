@@ -41,6 +41,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Generator, Iterator, Mapping, Sequence
@@ -54,7 +55,7 @@ from .exceptions import AuthenticationError
 
 #: Bumped whenever the wire protocol changes; a daemon of another version is
 #: replaced instead of being talked to.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 DEFAULT_IDLE_TIMEOUT = 900.0
 DEFAULT_START_TIMEOUT = 90.0
@@ -339,6 +340,8 @@ def _open(
         sock = socket.create_connection((state.host, state.port), timeout=handshake)
     except OSError as exc:
         raise WarmDaemonUnavailable(f"cannot reach {state.host}:{state.port}: {exc}") from exc
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     reader = sock.makefile("rb")
     try:
         _send(
@@ -411,11 +414,27 @@ def describe_daemon(
             sock.close()
 
 
+def _ask_payload(
+    prompt: str,
+    model: str | None = None,
+    config: Mapping[str, Any] | None = None,
+    archive: bool | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"op": "ask", "prompt": prompt, "model": model}
+    if config:
+        payload["config"] = dict(config)
+    if archive is not None:
+        payload["archive"] = bool(archive)
+    return payload
+
+
 def ask_stream(
     prompt: str,
     *,
     state: DaemonState,
     model: str | None = None,
+    config: Mapping[str, Any] | None = None,
+    archive: bool | None = None,
     timeout: float = DEFAULT_ASK_TIMEOUT,
 ) -> Generator[str, None, None]:
     """Yield answer deltas for ``prompt`` from the warm daemon.
@@ -428,7 +447,7 @@ def ask_stream(
     finished = False
     anchor = time.perf_counter()
     try:
-        _send(sock, {"op": "ask", "prompt": prompt, "model": model})
+        _send(sock, _ask_payload(prompt, model, config, archive=archive))
         while True:
             message = _read_message(reader, timeout)
             kind = message.get("type")
@@ -466,6 +485,150 @@ def ask_stream(
             reader.close()
         with contextlib.suppress(Exception):
             sock.close()
+
+
+class WarmConnection:
+    """Persistent, reusable loopback TCP connection to a warm daemon.
+
+    ``_WarmServer._dispatch`` already serves multiple ``ask`` frames over a
+    single authenticated socket.  Reusing that socket across requests avoids
+    per-turn ``warm-daemon.json`` disk reads, TCP handshakes, ``hello`` auth
+    round-trips, and pre-flight ``ping`` connections.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state: DaemonState | None = None
+        self._sock: socket.socket | None = None
+        self._reader: Any | None = None
+
+    def _drop(self) -> None:
+        sock, reader = self._sock, self._reader
+        self._sock = None
+        self._reader = None
+        self._state = None
+        if reader is not None:
+            with contextlib.suppress(Exception):
+                reader.close()
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.close()
+
+    def close(self) -> None:
+        with self._lock:
+            self._drop()
+
+    def _connect(
+        self, state: DaemonState, *, timeout: float
+    ) -> tuple[socket.socket, Any]:
+        if (
+            self._sock is not None
+            and self._reader is not None
+            and self._state is not None
+            and self._state.host == state.host
+            and self._state.port == state.port
+            and self._state.token == state.token
+        ):
+            self._sock.settimeout(timeout)
+            return self._sock, self._reader
+        self._drop()
+        sock, reader = _open(
+            state, timeout=timeout, handshake_timeout=min(timeout, 10.0)
+        )
+        self._sock = sock
+        self._reader = reader
+        self._state = state
+        return sock, reader
+
+    def ask_stream(
+        self,
+        prompt: str,
+        *,
+        ensure_state: Any,
+        model: str | None = None,
+        config: Mapping[str, Any] | None = None,
+        archive: bool | None = None,
+        timeout: float = DEFAULT_ASK_TIMEOUT,
+    ) -> Generator[str, None, None]:
+        """Stream one prompt, reusing the cached socket or reconnecting cleanly."""
+        if not self._lock.acquire(blocking=False):
+            # Concurrent caller while another stream owns the persistent socket:
+            # open an independent stream rather than blocking or interleaving.
+            fresh_state = ensure_state(force_refresh=False)
+            yield from ask_stream(
+                prompt,
+                state=fresh_state,
+                model=model,
+                config=config,
+                archive=archive,
+                timeout=timeout,
+            )
+            return
+
+        finished = False
+        try:
+            state = self._state or ensure_state(force_refresh=False)
+            for attempt in range(2):
+                try:
+                    sock, reader = self._connect(state, timeout=timeout)
+                    _send(sock, _ask_payload(prompt, model, config, archive=archive))
+                    first_msg = _read_message(reader, timeout)
+                    break
+                except (WarmDaemonUnavailable, OSError):
+                    self._drop()
+                    if attempt == 1:
+                        raise
+                    state = ensure_state(force_refresh=True)
+
+            anchor = time.perf_counter()
+            pending: dict[str, Any] | None = first_msg
+            while True:
+                message = (
+                    pending
+                    if pending is not None
+                    else _read_message(reader, timeout)
+                )
+                pending = None
+                kind = message.get("type")
+                if kind == "profile":
+                    latency.extend(
+                        message.get("phases"),
+                        anchor=anchor,
+                        prefix=(
+                            "daemon.startup."
+                            if message.get("kind") == "startup"
+                            else "daemon."
+                        ),
+                    )
+                    latency.set_metrics(message.get("metrics"))
+                    continue
+                if kind == "delta":
+                    text = message.get("text")
+                    if isinstance(text, str) and text:
+                        yield text
+                elif kind == "done":
+                    finished = True
+                    return
+                elif kind == "start":
+                    continue
+                elif kind == "error":
+                    # Server stayed synchronized after writing a single error frame.
+                    finished = True
+                    raise error_from_frame(message)
+                else:
+                    self._drop()
+                    raise WarmDaemonUnavailable(
+                        f"unexpected frame {kind!r} from the warm daemon"
+                    )
+        finally:
+            if not finished:
+                # Abandoned mid-stream: close the socket so unread delta frames
+                # never bleed into the next request.
+                if self._sock is not None:
+                    with contextlib.suppress(Exception):
+                        _send(self._sock, {"op": "cancel"})
+                self._drop()
+            self._lock.release()
 
 
 def error_from_frame(message: Mapping[str, Any]) -> BaseException:
@@ -754,6 +917,7 @@ def ensure_daemon(
 
     deadline = time.monotonic() + budget
     spawned: subprocess.Popen[bytes] | None = None
+    poll_sleep = 0.005
     while time.monotonic() < deadline:
         candidate = DaemonState.read(path)
         if candidate is not None and _compatible(
@@ -782,7 +946,8 @@ def ensure_daemon(
                     spawned = spawn_daemon(
                         state_file=path, payload=payload, idle_timeout=idle
                     )
-        time.sleep(0.03)
+        time.sleep(poll_sleep)
+        poll_sleep = min(0.025, poll_sleep * 1.5)
     detail = _tail(_log_path(path))
     suffix = f" (log: {detail.splitlines()[-1]})" if detail else ""
     raise WarmDaemonUnavailable(
@@ -820,7 +985,7 @@ def stop_daemon(
                 _close_quietly(reader, sock)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and _pid_alive(state.pid) and ping(state, timeout=0.2):
-            time.sleep(0.05)
+            time.sleep(0.015)
     for path_to_remove in (
         path,
         _options_path(path),
@@ -875,23 +1040,64 @@ class WarmSession:
             with contextlib.suppress(Exception):
                 await client.aclose()
 
-    async def ask(self, prompt: str, model: str | None = None) -> AsyncIterator[str]:
+    _accepts_config: bool = True
+
+    async def ask(
+        self,
+        prompt: str,
+        model: str | None = None,
+        *,
+        config: Mapping[str, Any] | None = None,
+        archive: bool | None = None,
+    ) -> AsyncIterator[str]:
         self._waiting += 1
         try:
-            async for delta in self._ask_locked(prompt, model=model):
+            async for delta in self._ask_locked(
+                prompt, model=model, config=config, archive=archive
+            ):
                 yield delta
         finally:
             self._waiting -= 1
 
     async def _ask_locked(
-        self, prompt: str, *, model: str | None
+        self,
+        prompt: str,
+        *,
+        model: str | None,
+        config: Mapping[str, Any] | None = None,
+        archive: bool | None = None,
     ) -> AsyncIterator[str]:
         from .exceptions import ArenaError, AuthenticationError, ChallengeRequiredError
+        from .models import GenerationConfig
+
+        gen_config: GenerationConfig | None = None
+        if config:
+            cfg_kwargs: dict[str, Any] = {}
+            if isinstance(config.get("max_tokens"), int):
+                cfg_kwargs["max_tokens"] = int(config["max_tokens"])
+            if isinstance(config.get("temperature"), (int, float)):
+                cfg_kwargs["temperature"] = float(config["temperature"])
+            if isinstance(config.get("top_p"), (int, float)):
+                cfg_kwargs["top_p"] = float(config["top_p"])
+            if cfg_kwargs:
+                gen_config = GenerationConfig(**cfg_kwargs)
 
         async with self._lock:
             for attempt in range(2):
                 try:
                     client = await self._client_or_create()
+                    tok: Any = getattr(client, "_verification_token", None)
+                    prev_tok_options = (
+                        getattr(tok, "options", None)
+                        if archive is not None and tok is not None
+                        else None
+                    )
+                    if prev_tok_options is not None and tok is not None:
+                        with contextlib.suppress(Exception):
+                            tok.options = replace(
+                                prev_tok_options,
+                                archive_after_answer=bool(archive),
+                            )
                     # How much of the answer time was the server *thinking*, and
                     # how much was it trickling tokens?  Recorded per request and
                     # shown by `arena-api --warm-profile`.
@@ -901,17 +1107,25 @@ class WarmSession:
                     asked_at = time.monotonic()
                     first_at: float | None = None
                     last_at = asked_at
-                    with latency.span("warm.ask"):
-                        async for chunk in client.astream(prompt, model=model):
-                            now = time.monotonic()
-                            if first_at is None:
-                                first_at = now
-                            longest_gap = max(longest_gap, now - last_at)
-                            last_at = now
-                            chunks += 1
-                            chars += len(chunk.delta or "")
-                            if chunk.delta:
-                                yield chunk.delta
+                    stream_kwargs: dict[str, Any] = {"model": model}
+                    if gen_config is not None:
+                        stream_kwargs["config"] = gen_config
+                    try:
+                        with latency.span("warm.ask"):
+                            async for chunk in client.astream(prompt, **stream_kwargs):
+                                now = time.monotonic()
+                                if first_at is None:
+                                    first_at = now
+                                longest_gap = max(longest_gap, now - last_at)
+                                last_at = now
+                                chunks += 1
+                                chars += len(chunk.delta or "")
+                                if chunk.delta:
+                                    yield chunk.delta
+                    finally:
+                        if prev_tok_options is not None and tok is not None:
+                            with contextlib.suppress(Exception):
+                                tok.options = prev_tok_options
                     latency.metric("answer.chunks", chunks)
                     latency.metric("answer.chars", chars)
                     latency.metric("answer.longest_gap_ms", round(longest_gap * 1000.0, 1))
@@ -1102,6 +1316,10 @@ class _WarmServer:
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        raw_sock = writer.get_extra_info("socket")
+        if raw_sock is not None:
+            with contextlib.suppress(OSError, AttributeError):
+                raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
             await self._dispatch(reader, writer)
         except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
@@ -1266,8 +1484,28 @@ class _WarmServer:
             return True
         model = message.get("model")
         model_value = model if isinstance(model, str) and model else None
+        raw_config = message.get("config")
+        config_value = (
+            dict(raw_config)
+            if isinstance(raw_config, Mapping) and raw_config
+            else None
+        )
+        raw_archive = message.get("archive")
+        archive_value = raw_archive if isinstance(raw_archive, bool) else None
         self._active += 1
-        stream = self.session.ask(prompt, model_value)
+        extra_ask_kwargs: dict[str, Any] = {}
+        if config_value is not None:
+            extra_ask_kwargs["config"] = config_value
+        if archive_value is not None:
+            extra_ask_kwargs["archive"] = archive_value
+        if extra_ask_kwargs and getattr(
+            self.session, "_accepts_config", False
+        ):
+            stream = self.session.ask(
+                prompt, model_value, **extra_ask_kwargs
+            )
+        else:
+            stream = self.session.ask(prompt, model_value)
         try:
             await self._write(writer, {"type": "start"})
             await self._send_startup_profile(writer)
@@ -1446,6 +1684,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 class _WarmArgs:
     prompt: str | None = None
     model: str | None = None
+    fast_model: bool | None = None
+    archive_after_answer: bool | None = None
     rest: list[str] = field(default_factory=list)
     base_url: str = DEFAULT_BASE_URL
     state_file: str | None = None
@@ -1487,6 +1727,16 @@ def scan_argv(argv: Sequence[str]) -> _WarmArgs:
             continue
         if arg in ("--warm", "--no-warm"):
             parsed.force = arg == "--warm"
+            index += 1
+            continue
+        if arg in ("--fast-model", "--no-fast-model"):
+            parsed.fast_model = arg == "--fast-model"
+            parsed.rest.append(arg)
+            index += 1
+            continue
+        if arg in ("--archive-after-answer", "--no-archive-after-answer"):
+            parsed.archive_after_answer = arg == "--archive-after-answer"
+            parsed.rest.append(arg)
             index += 1
             continue
         if arg in ("--warm-start", "--warm-stop", "--warm-status", "--warm-profile"):
@@ -1652,6 +1902,24 @@ def _stop_if_running(parsed: _WarmArgs) -> None:
         stop_daemon(parsed.state_file)
 
 
+_DEFAULT_ENSURE_DAEMON = ensure_daemon
+_DEFAULT_ASK_STREAM = ask_stream
+
+
+def _optimistic_live_state(parsed: _WarmArgs) -> DaemonState | None:
+    """Read a live compatible daemon state from disk without a TCP ping round-trip."""
+    path = state_path(parsed.state_file)
+    current = DaemonState.read(path)
+    if current is None:
+        return None
+    wanted = session_signature(parsed.rest)
+    if not _compatible(current, base_url=parsed.base_url, session=wanted):
+        return None
+    if current.pid and not _pid_alive(current.pid):
+        return None
+    return current
+
+
 def fast_prompt_main(argv: Sequence[str]) -> int | None:
     """Answer ``--prompt`` through the daemon; ``None`` means "fall back".
 
@@ -1671,28 +1939,68 @@ def fast_prompt_main(argv: Sequence[str]) -> int | None:
         return None
     if parsed.force is not True and supplied_verification_token():
         return None
-    state = _ensure_for_cli(parsed)
+    wire_model = parsed.model
+    if wire_model is None and parsed.fast_model is not None:
+        wire_model = "fast" if parsed.fast_model else "max"
+
+    unpatched = (
+        ensure_daemon is _DEFAULT_ENSURE_DAEMON
+        and ask_stream is _DEFAULT_ASK_STREAM
+    )
+    used_optimistic = False
+    state: DaemonState | None = None
+    if unpatched:
+        state = _optimistic_live_state(parsed)
+        if state is not None:
+            used_optimistic = True
+            latency.mark("warm.reuse")
     if state is None:
-        return None
+        state = _ensure_for_cli(parsed)
+        if state is None:
+            return None
     latency.mark("cli.warm.ready")
     try:
-        stream = ask_stream(parsed.prompt, state=state, model=parsed.model)
-        try:
-            first = next(stream)
-        except StopIteration:
-            first = ""
-        except (WarmDaemonUnavailable, AuthenticationError) as exc:
-            # A rejected/absent session is reported much better by the ordinary
-            # path (it lists every cookie source it checked), and nothing has
-            # been printed yet, so hand the request over.
-            _mark_skipped()
-            if isinstance(exc, AuthenticationError):
-                reason = "no usable session"
-            else:
+        stream: Iterator[str] | None = None
+        first = ""
+        for connect_attempt in range(2 if used_optimistic else 1):
+            ask_kwargs: dict[str, Any] = {
+                "state": state,
+                "model": wire_model,
+            }
+            if parsed.archive_after_answer is not None:
+                ask_kwargs["archive"] = parsed.archive_after_answer
+            stream = ask_stream(parsed.prompt, **ask_kwargs)
+            try:
+                first = next(stream)
+                break
+            except StopIteration:
+                first = ""
+                break
+            except WarmDaemonUnavailable as exc:
+                close_fn = getattr(stream, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                if connect_attempt == 0 and used_optimistic:
+                    state = _ensure_for_cli(parsed)
+                    if state is None:
+                        return None
+                    continue
+                _mark_skipped()
                 reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-            log(f"warm daemon could not start the answer ({reason}); using the one-shot path")
-            stream.close()
-            return None
+                log(
+                    f"warm daemon could not start the answer ({reason}); using the one-shot path"
+                )
+                return None
+            except AuthenticationError:
+                close_fn = getattr(stream, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                _mark_skipped()
+                log(
+                    "warm daemon could not start the answer (no usable session); using the one-shot path"
+                )
+                return None
+        assert stream is not None
         latency.mark("cli.first_delta")
         if parsed.model:
             print(f"model             : {parsed.model}")

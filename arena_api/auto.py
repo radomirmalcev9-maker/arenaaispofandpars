@@ -155,6 +155,8 @@ from .constants import CONFIG_PATH, DEFAULT_BASE_URL, DEFAULT_TIMEOUT
 from .latency import mark as _latency_mark
 from .direct import (
     DIRECT_PAGE_PATH,
+    FAST_MODEL_SENTINEL,
+    NATIVE_MAX_SENTINEL,
     AsyncDirectArenaClient,
     DirectArenaClient,
     model_chat_score,
@@ -323,6 +325,15 @@ class ProbeResult:
 # Options
 # --------------------------------------------------------------------------- #
 
+ARENA_FAST_MODEL_ENV = "ARENA_FAST_MODEL"
+
+
+def _default_fast_model() -> bool:
+    raw = os.environ.get(ARENA_FAST_MODEL_ENV)
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
 
 @dataclass
 class AutoOptions:
@@ -455,6 +466,12 @@ class AutoOptions:
     #: the probe window instead, and Arena escalates to an invisible v2
     #: challenge on some accounts.
     fast_submit: bool = False
+
+    #: Prefer low-latency non-thinking Direct Chat models (``flash-lite``,
+    #: ``flash``, ``haiku``, ``mini``, ``fast``) when no explicit ``model=``
+    #: was requested, cutting model generation latency from ~11-22s to ~0.4-1.3s.
+    #: Set ``ARENA_FAST_MODEL=0`` or ``--no-fast-model`` to keep ``max``.
+    fast_model: bool = field(default_factory=_default_fast_model)
 
     def __post_init__(self) -> None:
         if self.storage_path is not None:
@@ -1838,9 +1855,10 @@ class _WarmBrowserState:
     #: a one-shot answer finished, so the next prompt finds the page loaded.
     prefetch_task: asyncio.Task[Any] | None = None
     prefetched_url: str | None = None
-    #: Archiving the finished chat, started as soon as the answer was fully
-    #: delivered: the click needs the tab, but not the caller's attention.
-    archive_task: asyncio.Task[Any] | None = None
+    housekeeping_task: asyncio.Task[Any] | None = None
+    cancel_archive: bool = False
+    last_page_title: str = ""
+    fast_model_disabled: bool = False
 
 
 def _is_page_usable(page: Any) -> bool:
@@ -1961,7 +1979,9 @@ def _status_means_challenge(
     return status == 429 and solver_ready
 
 
-async def _warm_page_responds(page: Any) -> bool:
+async def _warm_page_responds(
+    page: Any, state: _WarmBrowserState | None = None
+) -> bool:
     """Cheap liveness probe: a crashed/detached renderer fails ``page.title()``."""
     title_fn = getattr(page, "title", None)
     if not callable(title_fn):
@@ -1969,22 +1989,26 @@ async def _warm_page_responds(page: Any) -> bool:
     try:
         # A live renderer answers in a few milliseconds; waiting longer only
         # delays a restart that is about to happen anyway.
-        await asyncio.wait_for(title_fn(), timeout=2.0)
+        raw_title = await asyncio.wait_for(title_fn(), timeout=2.0)
     except Exception:  # noqa: BLE001
         return False
+    if state is not None:
+        state.last_page_title = str(raw_title or "").lower()
     return True
 
 
 async def _close_browser_state(state: _WarmBrowserState) -> None:
     state.win_cloaker.stop()
-    if state.prefetch_task is not None:
-        if not state.prefetch_task.done():
-            state.prefetch_task.cancel()
-        try:
-            await state.prefetch_task
-        except BaseException:  # noqa: BLE001
-            pass
-        state.prefetch_task = None
+    for bg_task in (state.prefetch_task, state.housekeeping_task):
+        if bg_task is not None:
+            if not bg_task.done():
+                bg_task.cancel()
+            try:
+                await bg_task
+            except BaseException:  # noqa: BLE001
+                pass
+    state.prefetch_task = None
+    state.housekeeping_task = None
     if state.cdp_pump is not None:
         try:
             await state.cdp_pump.aclose()
@@ -2080,6 +2104,9 @@ class DirectVerificationToken:
     #: Lets :mod:`arena_api.direct` pass ``prefetch_next=`` without probing
     #: signatures of third-party runner objects.
     supports_prefetch_hint: bool = True
+    #: Lets :mod:`arena_api.direct` forward ``fast``/``max`` mode sentinels
+    #: without fetching and parsing the full HTML model catalog.
+    supports_model_mode_hints: bool = True
 
     def _should_keep_browser_alive(self) -> bool:
         if isinstance(self.keep_browser_alive, bool):
@@ -2115,7 +2142,6 @@ class DirectVerificationToken:
         state = self._warm_state
         self._warm_state = None
         if state is not None:
-            await self._drain_archive(state)
             await _close_browser_state(state)
 
     def _ensure_bg_loop(self) -> asyncio.AbstractEventLoop:
@@ -2667,14 +2693,18 @@ class DirectVerificationToken:
 
         state: _WarmBrowserState | None = None
         reused_warm_page = False
+        prefetch_was_idle = False
         if keep_alive and self._warm_state is not None:
             candidate = self._warm_state
+            prefetch_was_idle = (
+                candidate.prefetch_task is None or candidate.prefetch_task.done()
+            )
             if (
                 candidate.loop is running_loop
                 and candidate.headless == headless
                 and candidate.hide_window == hide_window
                 and _is_page_usable(candidate.page)
-                and await _warm_page_responds(candidate.page)
+                and await _warm_page_responds(candidate.page, candidate)
             ):
                 state = candidate
                 reused_warm_page = True
@@ -2693,10 +2723,6 @@ class DirectVerificationToken:
         registered_listeners: list[tuple[str, Callable[..., Any]]] = []
         response_tasks: set[asyncio.Task[None]] = set()
         page = state.page
-        # The previous answer may still be archiving itself in this tab: the
-        # click is fast and almost always finished by now, but the page is not
-        # ours until it is.
-        await self._drain_archive(state)
         context = getattr(page, "context", None)
         cdp_pump = state.cdp_pump
         discard_state = not keep_alive
@@ -2866,17 +2892,35 @@ class DirectVerificationToken:
 
             wait_for_timeout = getattr(page, "wait_for_timeout", None)
             fast_submit = bool(getattr(self.options, "fast_submit", False))
+            if model_id_override == NATIVE_MAX_SENTINEL:
+                effective_model_override: str | None = None
+                use_auto_fast_model = False
+            elif model_id_override == FAST_MODEL_SENTINEL:
+                effective_model_override = None
+                use_auto_fast_model = not state.fast_model_disabled
+            elif model_id_override is None:
+                effective_model_override = None
+                use_auto_fast_model = (
+                    bool(getattr(self.options, "fast_model", True))
+                    and not state.fast_model_disabled
+                )
+            else:
+                effective_model_override = model_id_override
+                use_auto_fast_model = False
+            auto_picked_models: list[str] = []
             used_composer = False
             can_reuse_open_conversation = (
                 reused_warm_page
                 and follow_up
                 and state.has_active_conversation
                 and prompt is not None
-                and not model_id_override
+                and not effective_model_override
                 and not generation_params
                 and not _arena_auth_jwt_expired(raw_cookies)
             )
             if can_reuse_open_conversation:
+                if state.prefetch_task is not None:
+                    await self._consume_prefetched_page(state, page)
                 assert prompt is not None
                 used_composer = await _submit_prompt_via_composer(
                     page,
@@ -2886,12 +2930,14 @@ class DirectVerificationToken:
                     has_submitted=lambda: eval_request_seen,
                     install_legacy_tap_flags=not has_network_events,
                     fast_submit=fast_submit,
+                    auto_fast_model=False,
                     mark=_latency_mark,
                 )
 
             if not used_composer:
                 _latency_mark("page.prepare.start")
                 state.has_active_conversation = False
+                did_navigate_now = False
                 if not state.direct_page_ready:
                     # A background prefetch (started right after the previous
                     # one-shot answer) may already have the page loaded.
@@ -2899,14 +2945,27 @@ class DirectVerificationToken:
                         await page.goto(
                             self.page_url, wait_until="domcontentloaded"
                         )
+                        did_navigate_now = True
+                    elif not prefetch_was_idle:
+                        did_navigate_now = True
                     state.direct_page_ready = True
                 else:
-                    await self._consume_prefetched_page(state, page)
+                    if await self._consume_prefetched_page(state, page) and not prefetch_was_idle:
+                        did_navigate_now = True
                 skip_full_html_check = False
                 title_fn = getattr(page, "title", None)
-                if callable(title_fn):
+                if reused_warm_page and not did_navigate_now and state.last_page_title:
+                    page_title = state.last_page_title
+                    if (
+                        "arena" in page_title
+                        and "moment" not in page_title
+                        and "attention" not in page_title
+                    ):
+                        skip_full_html_check = True
+                elif callable(title_fn):
                     try:
                         page_title = str(await title_fn() or "").lower()
+                        state.last_page_title = page_title
                         if (
                             "arena" in page_title
                             and "moment" not in page_title
@@ -2973,11 +3032,13 @@ class DirectVerificationToken:
                     used_composer = await _submit_prompt_via_composer(
                         page,
                         prompt,
-                        model_id_override=model_id_override,
+                        model_id_override=effective_model_override,
                         generation_params=generation_params,
                         has_submitted=lambda: eval_request_seen,
                         install_legacy_tap_flags=not has_network_events,
                         fast_submit=fast_submit,
+                        auto_fast_model=use_auto_fast_model,
+                        resolved_model_out=auto_picked_models,
                         mark=_latency_mark,
                     )
 
@@ -3013,6 +3074,7 @@ class DirectVerificationToken:
             challenge_cleared_at: float | None = None
             retried_send_after_clear = False
             replayed_v2_payload = False
+            retried_without_fast_model = False
 
             while True:
                 now = time.monotonic()
@@ -3051,6 +3113,40 @@ class DirectVerificationToken:
                     }
                     lowered_err = err_body.lower()
                     if (
+                        used_composer
+                        and auto_picked_models
+                        and not retried_without_fast_model
+                        and status in (400, 404, 422)
+                        and prompt is not None
+                    ):
+                        retried_without_fast_model = True
+                        state.fast_model_disabled = True
+                        auto_picked_models.clear()
+                        eval_fn = getattr(page, "evaluate", None)
+                        if callable(eval_fn):
+                            try:
+                                await eval_fn(
+                                    "() => { window.__arenaFastModelId = null; window.__arenaBodyPatch = null; }"
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                        eval_request_seen = False
+                        await page.goto(
+                            self.page_url, wait_until="domcontentloaded"
+                        )
+                        await _submit_prompt_via_composer(
+                            page,
+                            prompt,
+                            model_id_override=None,
+                            generation_params=generation_params,
+                            has_submitted=lambda: eval_request_seen,
+                            install_legacy_tap_flags=not has_network_events,
+                            fast_submit=fast_submit,
+                            auto_fast_model=False,
+                            mark=_latency_mark,
+                        )
+                        continue
+                    if (
                         allow_headed_retry
                         and status in (401, 403)
                         and not any(m in lowered_err for m in _AUTH_REJECT_MARKERS)
@@ -3081,7 +3177,17 @@ class DirectVerificationToken:
                             status, err_body, resp_headers
                         )
 
-                if used_composer and (window_visible or solver_ready):
+                should_probe_challenge = (
+                    in_flight_eval_requests == 0
+                    or pending_verification_err is not None
+                    or challenge_active
+                    or challenge_cleared_at is not None
+                )
+                if (
+                    used_composer
+                    and (window_visible or solver_ready)
+                    and should_probe_challenge
+                ):
                     obs = await _detect_post_submit_challenge(page)
                     obs_kind = obs.get("kind")
                     if isinstance(obs_kind, str) and obs_kind:
@@ -3108,7 +3214,10 @@ class DirectVerificationToken:
                             clicked_checkbox_kinds.add(obs_kind)
                             await _click_challenge_checkbox(page, obs, bring_to_front=window_visible)
                             if callable(wait_for_timeout):
-                                await wait_for_timeout(700)
+                                for _ in range(14):
+                                    if not async_q.empty() or in_flight_eval_requests > 0:
+                                        break
+                                    await wait_for_timeout(50)
                             obs = await _detect_post_submit_challenge(page)
                             obs_kind = obs.get("kind")
 
@@ -3305,48 +3414,48 @@ class DirectVerificationToken:
                     archive_allowed = bool(guard())
                 except Exception:  # noqa: BLE001 - a guard must never break a request
                     archive_allowed = True
-            if (
+            should_archive = (
                 self.options.archive_after_answer
                 and not follow_up
                 and bool(used_composer)
                 and _is_page_usable(page)
                 and archive_allowed
-            ):
-                # The caller consumed the whole answer, so the transcript is
-                # complete: move the chat to the archive.  It runs in the
-                # background -- the click takes a few hundred milliseconds and
-                # the client is already reading the answer -- and the next
-                # request waits for it before touching this tab.
-                self._schedule_archive(state, page)
-            elif self.options.archive_after_answer and not archive_allowed:
+            )
+            if self.options.archive_after_answer and not archive_allowed:
                 # Another prompt is already queued: the chat stays in the list
                 # and gets archived with the next request's turn.
                 _latency_mark("archive.skipped")
+
             if (
-                prefetch_next
-                and keep_alive
+                keep_alive
                 and self._warm_state is state
                 and _is_page_usable(page)
             ):
-                self._schedule_prefetch(state, page)
-
-            cookies_fn = getattr(context, "cookies", None)
-            if callable(cookies_fn):
-                try:
-                    browser_cookies = await cookies_fn([self.options.base_url])
-                except Exception:  # noqa: BLE001
-                    browser_cookies = None
-                if isinstance(browser_cookies, Sequence):
-                    updated = {
-                        str(c["name"]): str(c["value"])
-                        for c in browser_cookies
-                        if isinstance(c, Mapping)
-                        and isinstance(c.get("name"), str)
-                        and c["name"].startswith("arena-auth-")
-                        and isinstance(c.get("value"), str)
-                    }
-                    if updated:
-                        self._refreshed_cookies = updated
+                # Offload archiving, cookie harvesting, and Direct Chat prefetch
+                # onto the warm browser's background task so completion returns
+                # immediately with zero post-token delay (saving 0.6-3.5s/turn).
+                self._schedule_post_turn_housekeeping(
+                    state,
+                    page,
+                    context,
+                    should_archive=should_archive,
+                    should_prefetch=bool(prefetch_next),
+                )
+            else:
+                if should_archive:
+                    _latency_mark("archive.start")
+                    try:
+                        archived = await archive_conversation(page)
+                    except Exception as exc:  # noqa: BLE001
+                        archived = False
+                        _latency_mark("archive.error")
+                        if self.options.output is not None:
+                            print(
+                                f"[arena-api] could not archive the chat: {exc}",
+                                file=self.options.output,
+                            )
+                    _latency_mark("archive.done" if archived else "archive.missed")
+                await self._harvest_refreshed_cookies(context)
         except _RetryInHeadedBrowser:
             discard_state = True
             raise
@@ -3376,83 +3485,41 @@ class DirectVerificationToken:
                     self._warm_state = None
                 await _close_browser_state(state)
 
-    def _schedule_archive(self, state: _WarmBrowserState, page: Any) -> None:
-        """Archive the finished chat without holding up the answer.
-
-        ``archive_conversation`` clicks a menu entry, waits for the menu to
-        close and reports the result: 200-600 ms of pure UI work that used to
-        sit between the last streamed token and ``message_stop``.  The chat is
-        already answered at this point, so the work moves to the background.
-        Best effort -- a UI change must never fail a finished request.
-        """
-        if state.archive_task is not None and not state.archive_task.done():
-            return
-        if not _is_page_usable(page):
-            return
-
-        async def _run() -> None:
-            _latency_mark("archive.start")
-            try:
-                archived = await archive_conversation(page)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                archived = False
-                _latency_mark("archive.error")
-                if self.options.output is not None:
-                    print(
-                        f"[arena-api] could not archive the chat: {exc}",
-                        file=self.options.output,
-                    )
-            _latency_mark("archive.done" if archived else "archive.missed")
-
-        try:
-            state.archive_task = asyncio.get_running_loop().create_task(_run())
-        except RuntimeError:  # no running loop: archive right on the spot
-            state.archive_task = None
-
-    async def _drain_archive(self, state: _WarmBrowserState) -> None:
-        """Wait for a background archive; the tab belongs to it until then."""
-        task, state.archive_task = state.archive_task, None
-        if task is None or task.done():
+    async def _harvest_refreshed_cookies(self, context: Any) -> None:
+        cookies_fn = getattr(context, "cookies", None)
+        if not callable(cookies_fn):
             return
         try:
-            await task
-        except asyncio.CancelledError:
-            if not task.cancelled():
-                raise  # the *caller* was cancelled, not the archive
-        except Exception:  # noqa: BLE001 - archive is best effort
-            pass
+            browser_cookies = await cookies_fn([self.options.base_url])
+        except Exception:  # noqa: BLE001
+            browser_cookies = None
+        if isinstance(browser_cookies, Sequence):
+            updated = {
+                str(c["name"]): str(c["value"])
+                for c in browser_cookies
+                if isinstance(c, Mapping)
+                and isinstance(c.get("name"), str)
+                and c["name"].startswith("arena-auth-")
+                and isinstance(c.get("value"), str)
+            }
+            if updated:
+                self._refreshed_cookies = updated
 
-    def _schedule_prefetch(self, state: _WarmBrowserState, page: Any) -> None:
-        """Navigate the idle warm tab back to Direct Chat in the background.
-
-        A one-shot ``complete()``/``stream()`` leaves the tab on the finished
-        conversation; the next prompt would start with a full ``page.goto``.
-        Doing that navigation now, while the caller is busy with the answer,
-        takes it off the next request's critical path. Follow-up turns of a
-        chat session never ask for this (they need the conversation open).
-        """
-        goto_fn = getattr(page, "goto", None)
-        if not callable(goto_fn):
+    def _schedule_post_turn_housekeeping(
+        self,
+        state: _WarmBrowserState,
+        page: Any,
+        context: Any,
+        *,
+        should_archive: bool,
+        should_prefetch: bool,
+    ) -> None:
+        """Run post-answer archive, Direct Chat prefetch, and cookie harvest in the background."""
+        goto_fn = getattr(page, "goto", None) if should_prefetch else None
+        can_prefetch = bool(should_prefetch and callable(goto_fn))
+        can_cookies = callable(getattr(context, "cookies", None))
+        if not should_archive and not can_prefetch and not can_cookies:
             return
-        if state.prefetch_task is not None and not state.prefetch_task.done():
-            return
-        state.has_active_conversation = False
-        state.prefetched_url = self.page_url
-
-        async def _navigate() -> None:
-            # The archive click happens on the finished conversation, so it has
-            # to win the race against this navigation.
-            await self._drain_archive(state)
-            await goto_fn(self.page_url, wait_until="domcontentloaded")
-
-        try:
-            task = asyncio.get_running_loop().create_task(_navigate())
-        except RuntimeError:
-            state.prefetched_url = None
-            return
-        state.prefetch_task = task
 
         def _swallow(done: asyncio.Task[Any]) -> None:
             if done.cancelled():
@@ -3462,19 +3529,113 @@ class DirectVerificationToken:
             except BaseException:  # noqa: BLE001
                 pass
 
+        if not can_prefetch and not should_archive:
+            # Chat follow-up turns keep the conversation open: prefetch_task
+            # stays None while cookies refresh quietly in housekeeping_task.
+            if state.housekeeping_task is None or state.housekeeping_task.done():
+                try:
+                    hk = asyncio.get_running_loop().create_task(
+                        self._harvest_refreshed_cookies(context)
+                    )
+                    hk.add_done_callback(_swallow)
+                    state.housekeeping_task = hk
+                except RuntimeError:
+                    pass
+            return
+
+        if state.prefetch_task is not None and not state.prefetch_task.done():
+            return
+        state.cancel_archive = False
+        if can_prefetch:
+            state.has_active_conversation = False
+            state.prefetched_url = self.page_url
+        else:
+            state.prefetched_url = None
+
+        async def _housekeeping() -> None:
+            archived = False
+            if should_archive and not state.cancel_archive and _is_page_usable(page):
+                _latency_mark("archive.start")
+                try:
+                    archived = await archive_conversation(
+                        page,
+                        should_abort=lambda: state.cancel_archive,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    archived = False
+                    _latency_mark("archive.error")
+                    if self.options.output is not None:
+                        print(
+                            f"[arena-api] could not archive the chat: {exc}",
+                            file=self.options.output,
+                        )
+                _latency_mark("archive.done" if archived else "archive.missed")
+                if archived and can_prefetch and not state.cancel_archive:
+                    # Radix closes [role="menu"] on the very next frame; give
+                    # the archive fetch a brief beat in the background before
+                    # page.goto() tears down the document.
+                    wait_fn = getattr(page, "wait_for_timeout", None)
+                    if callable(wait_fn):
+                        try:
+                            await wait_fn(80)
+                        except Exception:  # noqa: BLE001
+                            pass
+            if can_prefetch and callable(goto_fn) and _is_page_usable(page):
+                await goto_fn(self.page_url, wait_until="domcontentloaded")
+                title_fn = getattr(page, "title", None)
+                if callable(title_fn):
+                    try:
+                        state.last_page_title = str(await title_fn() or "").lower()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if can_cookies:
+                await self._harvest_refreshed_cookies(context)
+
+        try:
+            task = asyncio.get_running_loop().create_task(_housekeeping())
+        except RuntimeError:
+            state.prefetched_url = None
+            return
+        if can_prefetch:
+            state.prefetch_task = task
+        else:
+            state.housekeeping_task = task
         task.add_done_callback(_swallow)
+
+    def _schedule_prefetch(self, state: _WarmBrowserState, page: Any) -> None:
+        """Navigate the idle warm tab back to Direct Chat in the background."""
+        self._schedule_post_turn_housekeeping(
+            state,
+            page,
+            getattr(page, "context", None),
+            should_archive=False,
+            should_prefetch=True,
+        )
 
     async def _consume_prefetched_page(
         self, state: _WarmBrowserState, page: Any
     ) -> bool:
-        """Wait for a background prefetch; ``True`` when the tab is already on Direct Chat."""
+        """Wait for background housekeeping/prefetch; ``True`` when the tab is already on Direct Chat."""
+        hk = state.housekeeping_task
+        state.housekeeping_task = None
+        state.cancel_archive = True
+        if hk is not None and not hk.done():
+            try:
+                await asyncio.wait_for(hk, timeout=0.5)
+            except BaseException:  # noqa: BLE001
+                hk.cancel()
         task = state.prefetch_task
         target = state.prefetched_url
         state.prefetch_task = None
         state.prefetched_url = None
-        if task is None or target != self.page_url:
-            if task is not None and not task.done():
-                task.cancel()
+        if task is None:
+            return False
+        if target != self.page_url:
+            if not task.done():
+                try:
+                    await asyncio.wait_for(task, timeout=0.5)
+                except BaseException:  # noqa: BLE001
+                    task.cancel()
             return False
         try:
             await asyncio.wait_for(task, timeout=20.0)
@@ -3837,6 +3998,7 @@ def auto_direct_client(
         verification_token=verification_token,
         http_transport=options.http_transport,
         max_auth_refreshes=options.max_auth_refreshes,
+        fast_model=options.fast_model,
     )
     if prewarm:
         start_prewarm = getattr(verification_token, "prewarm", None)
@@ -3880,6 +4042,7 @@ async def auto_async_direct_client(
         verification_token=verification_token,
         http_transport=options.http_transport,
         max_auth_refreshes=options.max_auth_refreshes,
+        fast_model=options.fast_model,
     )
     if prewarm:
         start_prewarm = getattr(verification_token, "aprewarm", None)
@@ -4096,6 +4259,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(~200-300 ms faster per warm prompt; off by default)"
         ),
     )
+    parser.add_argument(
+        "--fast-model",
+        dest="fast_model",
+        action="store_true",
+        default=None,
+        help=(
+            "auto-select low-latency Direct Chat models when --model is not "
+            "set (default; ARENA_FAST_MODEL=0 turns it off)"
+        ),
+    )
+    parser.add_argument(
+        "--no-fast-model",
+        dest="fast_model",
+        action="store_false",
+        help="use Arena's heaviest max model instead of low-latency auto-selection",
+    )
     parser.add_argument("--prompt", default=None, help="send one prompt and print the answer")
     parser.add_argument(
         "--warm",
@@ -4199,6 +4378,11 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         profile_name=args.profile,
         show_browser=bool(getattr(args, "show_browser", False)),
         fast_submit=bool(getattr(args, "fast_submit", False)),
+        fast_model=(
+            _default_fast_model()
+            if getattr(args, "fast_model", None) is None
+            else bool(args.fast_model)
+        ),
     )
 
 

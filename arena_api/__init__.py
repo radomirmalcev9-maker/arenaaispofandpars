@@ -84,6 +84,8 @@ if TYPE_CHECKING:
         AsyncDirectChatSession,
         DirectArenaClient,
         DirectChatSession,
+        model_chat_score,
+        model_fast_score,
     )
     from .exceptions import (
         ArenaError,
@@ -163,6 +165,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "AsyncDirectChatSession": (".direct", "AsyncDirectChatSession"),
     "DirectArenaClient": (".direct", "DirectArenaClient"),
     "DirectChatSession": (".direct", "DirectChatSession"),
+    "model_chat_score": (".direct", "model_chat_score"),
+    "model_fast_score": (".direct", "model_fast_score"),
     # .exceptions
     "ArenaError": (".exceptions", "ArenaError"),
     "AuthenticationError": (".exceptions", "AuthenticationError"),
@@ -326,6 +330,8 @@ __all__ = [
     "inspect_page",
     "inspect_response",
     "login_and_save",
+    "model_chat_score",
+    "model_fast_score",
     "normalize_cookies",
     "parse_cookie_header",
     "stop_daemon",

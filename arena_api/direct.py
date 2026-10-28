@@ -59,6 +59,17 @@ _NEXT_FLIGHT_RE = re.compile(
     r"__next_f\.push\(\[\s*\d+\s*,\s*(\"(?:\\.|[^\"\\])*\")\s*\]\)",
     re.DOTALL,
 )
+_MODEL_ID_HINT_RE = re.compile(r'"(?:id|modelId|model_id)"', re.IGNORECASE)
+_MODEL_NAME_HINT_RE = re.compile(
+    r'"(?:publicName|public_name|displayName|display_name|name)"',
+    re.IGNORECASE,
+)
+_JSON_OBJECT_START_RE = re.compile(r'\{\s*"')
+
+FAST_MODEL_ALIASES: frozenset[str] = frozenset({"fast", "arena-fast"})
+MAX_MODEL_ALIASES: frozenset[str] = frozenset({"max", "arena-max"})
+FAST_MODEL_SENTINEL = "__arena_fast_model__"
+NATIVE_MAX_SENTINEL = "__arena_native_max__"
 
 
 def uuid7() -> str:
@@ -91,9 +102,12 @@ class AIDataStreamParser:
         self._buffer += (
             self._decoder.decode(wire, final=False) if isinstance(wire, bytes) else wire
         )
+        if "\n" not in self._buffer:
+            return []
+        parts = self._buffer.split("\n")
+        self._buffer = parts.pop()
         events: list[tuple[str, Any]] = []
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
+        for line in parts:
             record = self._parse_line(line.rstrip("\r"))
             if record is not None:
                 events.append(record)
@@ -198,42 +212,76 @@ def _decode_json_string(value: str) -> str:
         return html.unescape(value.replace(r"\"", '"').replace(r"\\", "\\"))
 
 
+def _scan_json_candidate(
+    candidate: str,
+    decoder: json.JSONDecoder,
+    result: dict[str, ModelInfo],
+) -> None:
+    if not candidate or "{" not in candidate:
+        return
+    if not (
+        _MODEL_ID_HINT_RE.search(candidate) and _MODEL_NAME_HINT_RE.search(candidate)
+    ):
+        return
+    parsed = _try_json(candidate)
+    if parsed is not None:
+        _walk_models(parsed, result)
+        return
+    # Next.js may serialize model objects inside a string rather than a
+    # standalone JSON script; jump only to JSON object starts ``{"`` so
+    # minified JavaScript code blocks ``{if(a){...}}`` are skipped in O(1).
+    position = 0
+    while True:
+        match = _JSON_OBJECT_START_RE.search(candidate, position)
+        if match is None:
+            break
+        start = match.start()
+        try:
+            value, end = decoder.raw_decode(candidate, start)
+        except json.JSONDecodeError:
+            position = start + 1
+        else:
+            _walk_models(value, result)
+            position = max(end, start + 1)
+
+
 def _models_from_markup(markup: str) -> list[ModelInfo]:
     """Extract model records from Next.js JSON and escaped flight payloads."""
     result: dict[str, ModelInfo] = {}
     collector = _ScriptCollector()
     collector.feed(markup)
 
-    candidates = [markup, html.unescape(markup), *collector.scripts]
+    flight_candidates: list[str] = []
     for match in _NEXT_FLIGHT_RE.finditer(markup):
         try:
-            candidates.append(json.loads(match.group(1)))
+            decoded = json.loads(match.group(1))
         except json.JSONDecodeError:
             continue
+        if isinstance(decoded, str):
+            flight_candidates.append(decoded)
+
+    script_candidates: list[str] = list(flight_candidates)
+    for script in collector.scripts:
+        script_candidates.append(script)
+        if "&quot;" in script or "&#" in script:
+            script_candidates.append(html.unescape(script))
 
     decoder = json.JSONDecoder()
-    for candidate in candidates:
-        _walk_models(_try_json(candidate), result)
-        # Next.js may serialize model objects inside a string rather than a
-        # standalone JSON script; scan object starts without relying on a fixed
-        # React/Next payload version.
-        position = 0
-        while True:
-            start = candidate.find("{", position)
-            if start < 0:
-                break
-            try:
-                value, end = decoder.raw_decode(candidate, start)
-            except json.JSONDecodeError:
-                position = start + 1
-            else:
-                _walk_models(value, result)
-                position = max(end, start + 1)
+    for candidate in script_candidates:
+        _scan_json_candidate(candidate, decoder, result)
+
+    fallback_candidates: list[str] = [markup]
+    if "&" in markup:
+        fallback_candidates.append(html.unescape(markup))
+
+    if not result:
+        for candidate in fallback_candidates:
+            _scan_json_candidate(candidate, decoder, result)
 
     # Use regex only as a last-resort fallback; parsing JSON first avoids a
     # loosely matched escaped string overriding a structured model record.
     if not result:
-        for candidate in candidates:
+        for candidate in [*script_candidates, *fallback_candidates]:
             _regex_models(candidate, result)
 
     return sorted(
@@ -485,6 +533,52 @@ def model_chat_score(item: ModelInfo) -> int:
     return score
 
 
+_SLOW_REASONING_RE = re.compile(
+    r"(?:^|[-_.\s/])(?:thinking|reasoning|reasoner|max|opus|o1|o3|o4|qwq|r1|"
+    r"pro|ultra|heavy|deep[-_]?research)(?:$|[-_.\s/0-9])",
+    re.IGNORECASE,
+)
+_ULTRA_FAST_RE = re.compile(
+    r"(?:^|[-_.\s/])(?:flash[-_]?lite|nano|8b|7b|4b|3b)(?:$|[-_.\s/0-9])",
+    re.IGNORECASE,
+)
+_FAST_TIER_RE = re.compile(
+    r"(?:^|[-_.\s/])(?:flash|haiku|mini|instant|turbo|fast|scout|maverick|small|lite)"
+    r"(?:$|[-_.\s/0-9])",
+    re.IGNORECASE,
+)
+
+
+def model_fast_score(item: ModelInfo) -> int:
+    """Rank how suitable ``item`` is for low-latency text Direct Chat (lower is better).
+
+    Preserves all selectability and text-capability guards of
+    :func:`model_chat_score`, while preferring fast non-thinking models
+    (``flash-lite``, ``flash``, ``haiku``, ``mini``, ``instant``, ``turbo``,
+    ``fast``, ``scout``, ``small``) ahead of standard chat models and heavily
+    penalizing multi-second reasoning/heavy models (``thinking``, ``opus``,
+    ``max``, ``o1``/``o3``/``o4``, ``deepseek-r1``, ``qwq``, ``pro``).
+    """
+    base = model_chat_score(item)
+    if base >= 20_000:
+        return base
+    meta = item.metadata or {}
+    parts = [
+        item.display_name or "",
+        str(meta.get("publicName") or ""),
+        str(meta.get("public_name") or ""),
+        str(meta.get("name") or ""),
+    ]
+    label = " ".join(p for p in parts if p).strip() or item.id
+    if _SLOW_REASONING_RE.search(label):
+        return base + 8_000
+    if _ULTRA_FAST_RE.search(label):
+        return base
+    if _FAST_TIER_RE.search(label):
+        return base + 50
+    return base + 2_000
+
+
 def _iter_wire_records(
     chunks: Iterator[bytes],
     *,
@@ -607,6 +701,7 @@ class _DirectMixin:
     conversation_id: str | None
     direct_page_path: str
     direct_stream_path: str
+    fast_model: bool
 
     def _token(self, supplied: str | None) -> str:
         token: VerificationToken | None = (
@@ -649,7 +744,10 @@ class _DirectMixin:
         return body
 
     @staticmethod
-    def _resolve_model(model: str | None, known: list[ModelInfo]) -> str:
+    def _resolve_model(
+        model: str | None, known: list[ModelInfo], *, fast: bool = True
+    ) -> str:
+        score_fn = model_fast_score if fast else model_chat_score
         if model is not None and _UUID_RE.fullmatch(model):
             # A UUID is already the wire identifier.  Do not make callers fetch
             # and parse the whole Direct Chat page just to prove that it is one.
@@ -668,7 +766,7 @@ class _DirectMixin:
                 raise ModelUnavailableError(
                     "No available Direct Chat models were found."
                 )
-            return min(available_all, key=model_chat_score).id
+            return min(available_all, key=score_fn).id
         for item in known:
             if model == item.id:
                 if not item.available:
@@ -676,7 +774,7 @@ class _DirectMixin:
                         f"Model {model!r} is currently unavailable."
                     )
                 return item.id
-        folded = model.casefold()
+        folded = model.strip().casefold()
         matches: list[ModelInfo] = []
         for item in known:
             meta = item.metadata or {}
@@ -700,9 +798,19 @@ class _DirectMixin:
                     f"Model {model!r} is currently unavailable."
                 )
             return min(available, key=model_chat_score).id
+        if folded in FAST_MODEL_ALIASES or folded in MAX_MODEL_ALIASES:
+            available_all = [item for item in known if item.available]
+            if not available_all:
+                raise ModelUnavailableError(
+                    "No available Direct Chat models were found."
+                )
+            alias_score = (
+                model_fast_score if folded in FAST_MODEL_ALIASES else model_chat_score
+            )
+            return min(available_all, key=alias_score).id
         examples: list[str] = []
         for item in sorted(
-            (m for m in known if m.available), key=model_chat_score
+            (m for m in known if m.available), key=score_fn
         ):
             label = str(item.display_name or item.id)
             if label not in examples:
@@ -756,6 +864,7 @@ class DirectArenaClient(_DirectMixin):
         http_transport: httpx.BaseTransport | None = None,
         impersonate: str | bool | None = None,
         max_auth_refreshes: int = 2,
+        fast_model: bool = True,
     ) -> None:
         session = _resolve_session_source(session_source, base_url)
         merged_headers: dict[str, str] = {}
@@ -790,6 +899,7 @@ class DirectArenaClient(_DirectMixin):
         self.verification_token = verification_token
         self.direct_page_path = direct_page_path
         self.direct_stream_path = direct_stream_path
+        self.fast_model = bool(fast_model)
         self._models = None
         self.conversation_id: str | None = None
 
@@ -834,13 +944,26 @@ class DirectArenaClient(_DirectMixin):
         )
         explicit_model_id: str | None = None
         _latency_mark("direct.stream.begin")
+        supports_mode_hints = bool(
+            use_browser
+            and getattr(self.verification_token, "supports_model_mode_hints", False)
+        )
         if model is not None:
+            folded_model = model.strip().casefold()
             # Supplying the UUID itself is the zero-request fast path.  Names
             # still need the catalog for their public-name -> UUID mapping.
             if _UUID_RE.fullmatch(model):
-                explicit_model_id = self._resolve_model(model, self._models or [])
+                explicit_model_id = self._resolve_model(
+                    model, self._models or [], fast=self.fast_model
+                )
+            elif supports_mode_hints and folded_model in FAST_MODEL_ALIASES:
+                explicit_model_id = FAST_MODEL_SENTINEL
+            elif supports_mode_hints and folded_model in MAX_MODEL_ALIASES:
+                explicit_model_id = NATIVE_MAX_SENTINEL
             else:
-                explicit_model_id = self._resolve_model(model, self.get_models())
+                explicit_model_id = self._resolve_model(
+                    model, self.get_models(), fast=self.fast_model
+                )
             _latency_mark("direct.model")
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
@@ -851,9 +974,25 @@ class DirectArenaClient(_DirectMixin):
         deadline = time.monotonic() + generation.queue_timeout
         if use_browser:
             browser_runner: Any = self.verification_token
-            cached_default_id: str | None = explicit_model_id
+            cached_default_id: str | None = (
+                explicit_model_id
+                if explicit_model_id
+                not in {FAST_MODEL_SENTINEL, NATIVE_MAX_SENTINEL}
+                else None
+            )
             if cached_default_id is None and self._models is not None:
-                cached_default_id = self._resolve_model(None, self._models)
+                use_fast_for_fallback = (
+                    False
+                    if explicit_model_id == NATIVE_MAX_SENTINEL
+                    else (
+                        True
+                        if explicit_model_id == FAST_MODEL_SENTINEL
+                        else self.fast_model
+                    )
+                )
+                cached_default_id = self._resolve_model(
+                    None, self._models, fast=use_fast_for_fallback
+                )
 
             def _fallback_body(tok: str) -> dict[str, Any]:
                 resolved_id = (
@@ -897,7 +1036,9 @@ class DirectArenaClient(_DirectMixin):
                 )
             return
 
-        model_id = explicit_model_id or self._resolve_model(None, self.get_models())
+        model_id = explicit_model_id or self._resolve_model(
+            None, self.get_models(), fast=self.fast_model
+        )
         initial_token: str | None = self._token(verification_token)
 
         def build_content() -> str:
@@ -1074,6 +1215,7 @@ class AsyncDirectArenaClient(_DirectMixin):
         http_transport: httpx.AsyncBaseTransport | None = None,
         impersonate: str | bool | None = None,
         max_auth_refreshes: int = 2,
+        fast_model: bool = True,
     ) -> None:
         session = _resolve_session_source(session_source, base_url)
         merged_headers: dict[str, str] = {}
@@ -1108,6 +1250,7 @@ class AsyncDirectArenaClient(_DirectMixin):
         self.verification_token = verification_token
         self.direct_page_path = direct_page_path
         self.direct_stream_path = direct_stream_path
+        self.fast_model = bool(fast_model)
         self._models = None
         self.conversation_id: str | None = None
 
@@ -1155,12 +1298,23 @@ class AsyncDirectArenaClient(_DirectMixin):
             custom_http_transport=self.transport._custom_http_transport,
         )
         explicit_model_id: str | None = None
+        supports_mode_hints = bool(
+            use_browser
+            and getattr(self.verification_token, "supports_model_mode_hints", False)
+        )
         if model is not None:
+            folded_model = model.strip().casefold()
             if _UUID_RE.fullmatch(model):
-                explicit_model_id = self._resolve_model(model, self._models or [])
+                explicit_model_id = self._resolve_model(
+                    model, self._models or [], fast=self.fast_model
+                )
+            elif supports_mode_hints and folded_model in FAST_MODEL_ALIASES:
+                explicit_model_id = FAST_MODEL_SENTINEL
+            elif supports_mode_hints and folded_model in MAX_MODEL_ALIASES:
+                explicit_model_id = NATIVE_MAX_SENTINEL
             else:
                 explicit_model_id = self._resolve_model(
-                    model, await self.get_models()
+                    model, await self.get_models(), fast=self.fast_model
                 )
         chat_id = conversation_id or uuid7()
         if conversation_id is None:
@@ -1170,9 +1324,25 @@ class AsyncDirectArenaClient(_DirectMixin):
         deadline = time.monotonic() + generation.queue_timeout
         if use_browser:
             browser_runner: Any = self.verification_token
-            cached_default_id: str | None = explicit_model_id
+            cached_default_id: str | None = (
+                explicit_model_id
+                if explicit_model_id
+                not in {FAST_MODEL_SENTINEL, NATIVE_MAX_SENTINEL}
+                else None
+            )
             if cached_default_id is None and self._models is not None:
-                cached_default_id = self._resolve_model(None, self._models)
+                use_fast_for_fallback = (
+                    False
+                    if explicit_model_id == NATIVE_MAX_SENTINEL
+                    else (
+                        True
+                        if explicit_model_id == FAST_MODEL_SENTINEL
+                        else self.fast_model
+                    )
+                )
+                cached_default_id = self._resolve_model(
+                    None, self._models, fast=use_fast_for_fallback
+                )
 
             def _fallback_body(tok: str) -> dict[str, Any]:
                 resolved_id = cached_default_id or "00000000-0000-0000-0000-000000000000"
@@ -1211,7 +1381,7 @@ class AsyncDirectArenaClient(_DirectMixin):
             )
 
         model_id = explicit_model_id or self._resolve_model(
-            None, await self.get_models()
+            None, await self.get_models(), fast=self.fast_model
         )
         initial_token: str | None = self._token(verification_token)
 

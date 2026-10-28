@@ -33,9 +33,11 @@ one.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -102,6 +104,7 @@ def _session_argv(
     profile: str | None = None,
     profile_root: str | None = None,
     archive: bool | None = None,
+    fast_model: bool | None = None,
 ) -> list[str]:
     """Turn the session knobs into the CLI arguments the daemon parses."""
     argv: list[str] = []
@@ -113,6 +116,10 @@ def _session_argv(
         argv.extend(["--profile-root", profile_root.strip()])
     if archive:
         argv.append("--archive-after-answer")
+    if fast_model is True:
+        argv.append("--fast-model")
+    elif fast_model is False:
+        argv.append("--no-fast-model")
     return argv
 
 _TOOL_CALL_RE = re.compile(
@@ -398,6 +405,13 @@ def parse_tool_calls(text: str) -> list[tuple[int, int, ToolCall]]:
     and finally a bare JSON object that names a tool.  Everything else is left
     alone so prose that merely mentions ``{"name": ...}`` is not executed.
     """
+    if (
+        '"name"' not in text
+        and '"tool"' not in text
+        and '"tool_name"' not in text
+        and "<tool_call" not in text.lower()
+    ):
+        return []
     spans: list[tuple[int, int, ToolCall]] = []
     for match in _TOOL_CALL_RE.finditer(text):
         body = match.group("body")
@@ -644,6 +658,7 @@ class _WarmEngine:
         profile: str | None = None,
         profile_root: str | None = None,
         archive: bool | None = None,
+        fast_model: bool | None = None,
     ) -> None:
         self._base_url = base_url
         self._argv = _session_argv(
@@ -651,10 +666,38 @@ class _WarmEngine:
             profile=profile,
             profile_root=profile_root,
             archive=archive,
+            fast_model=fast_model,
         )
+        self._conn: Any = None
+        self._cached_state: Any = None
+
+    def _ensure_state(self, *, force_refresh: bool = False) -> Any:
+        from .. import warm
+
+        if not force_refresh and self._cached_state is not None:
+            return self._cached_state
+        state = warm.ensure_daemon(
+            payload={"argv": list(self._argv), "base_url": self._base_url},
+            base_url=self._base_url,
+        )
+        self._cached_state = state
+        return state
 
     def answer(self, prompt: str, *, model: str | None = None) -> Iterator[str]:
         from .. import warm
+
+        if (
+            warm.ensure_daemon is warm._DEFAULT_ENSURE_DAEMON
+            and warm.ask_stream is warm._DEFAULT_ASK_STREAM
+        ):
+            if self._conn is None:
+                self._conn = warm.WarmConnection()
+            yield from self._conn.ask_stream(
+                prompt,
+                ensure_state=self._ensure_state,
+                model=model,
+            )
+            return
 
         state = warm.ensure_daemon(
             payload={"argv": list(self._argv), "base_url": self._base_url},
@@ -663,7 +706,13 @@ class _WarmEngine:
         yield from warm.ask_stream(prompt, state=state, model=model)
 
     def close(self) -> None:
-        return None
+        conn = self._conn
+        self._conn = None
+        self._cached_state = None
+        if conn is not None:
+            close_fn = getattr(conn, "close", None)
+            if callable(close_fn):
+                close_fn()
 
 
 class _HttpEngine:
@@ -679,6 +728,7 @@ class _HttpEngine:
         profile: str | None = None,
         profile_root: str | None = None,
         archive: bool | None = None,
+        fast_model: bool | None = None,
         log: Any = None,
     ) -> None:
         self._base_url = base_url
@@ -686,6 +736,7 @@ class _HttpEngine:
         self._profile = profile
         self._profile_root = profile_root
         self._archive = bool(archive)
+        self._fast_model = fast_model
         self._log = log
         self._client: Any = None
         self._lock = threading.Lock()
@@ -693,15 +744,18 @@ class _HttpEngine:
     def _build(self, session: str | None) -> Any:
         from ..auto import auto_direct_client
 
-        return auto_direct_client(
-            base_url=self._base_url,
-            verification_token="auto",
-            prewarm=True,
-            session_source=session,
-            profile_name=self._profile,
-            profiles_root=self._profile_root,
-            archive_after_answer=self._archive,
-        )
+        kwargs: dict[str, Any] = {
+            "base_url": self._base_url,
+            "verification_token": "auto",
+            "prewarm": True,
+            "session_source": session,
+            "profile_name": self._profile,
+            "profiles_root": self._profile_root,
+            "archive_after_answer": self._archive,
+        }
+        if self._fast_model is not None:
+            kwargs["fast_model"] = self._fast_model
+        return auto_direct_client(**kwargs)
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -780,6 +834,7 @@ class ArenaEngine:
         profile: str | None = None,
         profile_root: str | None = None,
         archive: bool | None = DEFAULT_ARCHIVE,
+        fast_model: bool | None = None,
         log: Any = None,
     ) -> None:
         if engine not in ENGINES:
@@ -793,12 +848,14 @@ class ArenaEngine:
         self.profile = profile
         self.profile_root = profile_root
         self.archive = bool(archive)
+        self.fast_model = fast_model
         self.model_hint = prompt
         self.log = log
         self.verbose = False
         #: Timings of the last answer, for the ``--verbose`` log and the doctor.
         self.last_timings: dict[str, Any] = {}
         self._lock = threading.Lock()
+        self._unknown_models: set[str] = set()
         self._primary: Any
         self._fallback: Any = None
         if engine == "echo":
@@ -810,6 +867,7 @@ class ArenaEngine:
                 profile=profile,
                 profile_root=profile_root,
                 archive=archive,
+                fast_model=fast_model,
                 log=self._note,
             )
         else:
@@ -819,6 +877,7 @@ class ArenaEngine:
                 profile=profile,
                 profile_root=profile_root,
                 archive=archive,
+                fast_model=fast_model,
             )
             # A cold or unavailable daemon must not turn into a 500: the same
             # direct client the CLI falls back to answers instead.
@@ -828,6 +887,7 @@ class ArenaEngine:
                 profile=profile,
                 profile_root=profile_root,
                 archive=archive,
+                fast_model=fast_model,
                 log=self._note,
             )
 
@@ -855,10 +915,15 @@ class ArenaEngine:
           in-process client, which is exactly what the CLI does.
         """
         last_error: BaseException | None = None
+        initial_model = (
+            None
+            if model is not None and model in self._unknown_models
+            else model
+        )
         for engine in (self._primary, self._fallback):
             if engine is None:
                 continue
-            active_model = model
+            active_model = initial_model
             for attempt in (0, 1):
                 stream = engine.answer(prompt, model=active_model)
                 try:
@@ -874,11 +939,13 @@ class ArenaEngine:
                         and active_model is not None
                         and _looks_like_unknown_model(exc)
                     ):
+                        self._unknown_models.add(active_model)
                         self._note(
                             f"Arena не знает модель {active_model!r} ({exc}); "
                             "отвечаю моделью Arena по умолчанию"
                         )
                         active_model = None
+                        initial_model = None
                         continue
                     self._note(f"{engine.name} engine failed ({exc}); falling back")
                     break
@@ -1329,6 +1396,9 @@ class _Handler(BaseHTTPRequestHandler):
             index += 1
 
         try:
+            max_stop_len = max(
+                (len(item) for item in request.stop_sequences if item), default=0
+            )
             try:
                 for delta in self.engine.answer(
                     request.prompt, model=request.arena_model
@@ -1342,9 +1412,13 @@ class _Handler(BaseHTTPRequestHandler):
                         request.stop_sequences,
                         allow_tools=allow_tools,
                     )
-                    for start, end in segments:
-                        emit_text(buffer[start:end])
-                    stop_at, matched = self._find_stop(buffer, request.stop_sequences)
+                    for start, stop in segments:
+                        emit_text(buffer[start:stop])
+                    stop_at, matched = self._find_stop(
+                        buffer,
+                        request.stop_sequences,
+                        start=max(0, cursor - max_stop_len) if max_stop_len else 0,
+                    )
                     if matched is not None:
                         stop_sequence = matched
                         stopped = True
@@ -1424,13 +1498,18 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
 
     @staticmethod
-    def _find_stop(text: str, stops: Sequence[str]) -> tuple[int | None, str | None]:
-        """Earliest stop sequence in ``text``, and which one it is."""
+    def _find_stop(
+        text: str, stops: Sequence[str], *, start: int = 0
+    ) -> tuple[int | None, str | None]:
+        """Earliest stop sequence in ``text`` at or after ``start``."""
+        if not stops:
+            return None, None
         best: tuple[int, str] | None = None
+        origin = max(0, start)
         for stop in stops:
             if not stop:
                 continue
-            index = text.find(stop)
+            index = text.find(stop, origin)
             if index >= 0 and (best is None or index < best[0]):
                 best = (index, stop)
         if best is None:
@@ -1517,16 +1596,21 @@ def _partial_marker_start(lower: str) -> int | None:
     return best
 
 
-def _stop_prefix_start(text: str, stops: Sequence[str]) -> int | None:
-    """Where a *partial* stop sequence starts at the end of ``text``.
+def _stop_cut(text: str, stops: Sequence[str]) -> int | None:
+    """Where the text must stop for a stop sequence: a full hit or a prefix.
 
-    Only that tail has to wait: everything before it is known to be plain text,
-    so the answer streams instead of being held back by a fixed buffer size.
+    A complete sequence cannot be streamed at all, and a half-arrived one (the
+    tail is a prefix of it) must wait for the next delta.  Both are cheap
+    ``str`` operations, so only that tail is held back instead of a fixed
+    buffer size.
     """
     best: int | None = None
     for stop in stops:
         if not stop:
             continue
+        index = text.find(stop)
+        if index >= 0 and (best is None or index < best):
+            best = index
         for size in range(len(stop) - 1, 0, -1):
             if text.endswith(stop[:size]):
                 index = len(text) - size
@@ -1584,7 +1668,7 @@ def stream_window(
         partial = _partial_marker_start(lower)
         if partial is not None and emit_from <= partial < cut:
             cut = partial
-    stop_at = _stop_prefix_start(window, stops)
+    stop_at = _stop_cut(window, stops)
     if stop_at is not None and stop_at >= emit_from:
         cut = min(cut, stop_at)
     if cut > emit_from:
@@ -1613,6 +1697,12 @@ class _Server(ThreadingHTTPServer):
         self.max_prompt_chars = int(config.get("max_prompt_chars") or 200_000)
         self.verbose = bool(config.get("verbose"))
 
+    def get_request(self) -> tuple[Any, Any]:
+        conn, addr = super().get_request()
+        with contextlib.suppress(OSError, AttributeError):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return conn, addr
+
 
 def create_server(
     *,
@@ -1629,6 +1719,7 @@ def create_server(
     profile: str | None = None,
     profile_root: str | None = None,
     archive: bool | None = DEFAULT_ARCHIVE,
+    fast_model: bool | None = None,
     verbose: bool = False,
     log: Any = None,
 ) -> _Server:
@@ -1641,6 +1732,7 @@ def create_server(
         profile=profile,
         profile_root=profile_root,
         archive=archive,
+        fast_model=fast_model,
         log=log,
     )
     server = _Server(
@@ -1739,6 +1831,19 @@ def _serve_parser() -> Any:
         dest="archive",
         action="store_false",
         help="keep the conversations in Arena's sidebar",
+    )
+    parser.add_argument(
+        "--fast-model",
+        dest="fast_model",
+        action="store_true",
+        default=None,
+        help="prefer low-latency Direct Chat models when auto-selecting (default)",
+    )
+    parser.add_argument(
+        "--no-fast-model",
+        dest="fast_model",
+        action="store_false",
+        help="use Arena's heaviest max model instead of low-latency auto-selection",
     )
     parser.add_argument(
         "--profile",
@@ -2186,6 +2291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile=parsed.profile,
         profile_root=parsed.profile_root,
         archive=parsed.archive,
+        fast_model=parsed.fast_model,
         verbose=parsed.verbose,
     )
     bound = server.server_address
