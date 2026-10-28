@@ -15,6 +15,7 @@ import base64
 import io
 import json
 import os
+import pathlib
 import shutil
 import sqlite3
 import subprocess
@@ -25,6 +26,7 @@ import types
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -5915,3 +5917,221 @@ def test_a_broken_archive_guard_does_not_disable_archiving() -> None:
     except Exception:  # noqa: BLE001 - same fallback as the loop in auto.py
         allowed = True
     assert allowed is True
+
+
+# --------------------------------------------------------------------------- #
+# Архивация никогда не теряется: отложенные чаты добираются по id
+# --------------------------------------------------------------------------- #
+
+
+def test_conversation_id_is_taken_from_the_request_body_or_the_url() -> None:
+    chat = "0b7f1c9e-1111-2222-3333-444455556666"
+    assert auto_module._conversation_id_from(chat) == chat
+    assert auto_module._conversation_id_from(
+        None, f'{{"id": "{chat}", "mode": "direct-battle"}}'
+    ) == chat
+    assert auto_module._conversation_id_from(
+        None, None, f"https://arena.ai/c/{chat}?x=1"
+    ) == chat
+    assert auto_module._conversation_id_from(None, "", "/") is None
+
+
+class _HousekeepingPage:
+    """Page that only needs to look alive to the housekeeping task."""
+
+    def __init__(self) -> None:
+        self.url = "https://arena.ai/"
+
+    def is_closed(self) -> bool:
+        return False
+
+    async def goto(self, url: str, wait_until: str | None = None) -> None:
+        self.url = url
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        await asyncio.sleep(0)
+
+    async def title(self) -> str:
+        return "Arena"
+
+
+def _housekeeping_client() -> Any:
+    return auto_module.DirectVerificationToken(
+        auto_module.AutoOptions(
+            archive_after_answer=True, output=io.StringIO()
+        ),
+        keep_browser_alive=True,
+    )
+
+
+def _state(page: Any) -> Any:
+    state = auto_module._WarmBrowserState(
+        environment=None,
+        page=page,
+        win_cloaker=None,
+        ua_cdp_session=None,
+        cdp_pump=None,
+        selected_channel=None,
+        headless=True,
+        hide_window=True,
+        user_data_dir=None,
+        loop=asyncio.get_running_loop(),
+    )
+    state.last_page_title = ""
+    return state
+
+
+def test_a_postponed_chat_is_archived_on_a_later_turn(monkeypatch) -> None:
+    archived: list[str | None] = []
+
+    async def fake_archive(page: Any, *, conversation_id: Any = None, **_: Any) -> bool:
+        archived.append(conversation_id)
+        return True
+
+    monkeypatch.setattr(auto_module, "archive_conversation", fake_archive)
+    client = _housekeeping_client()
+
+    async def run() -> None:
+        state = _state(_HousekeepingPage())
+        state.pending_archive_ids = ["old-chat"]
+        client._schedule_post_turn_housekeeping(
+            state,
+            state.page,
+            None,
+            should_archive=True,
+            should_prefetch=False,
+            conversation_id="new-chat",
+        )
+        task = state.housekeeping_task
+        assert task is not None
+        await task
+        # The postponed chat goes first: it is older.
+        assert archived == ["old-chat", "new-chat"]
+        assert state.pending_archive_ids == []
+
+    asyncio.run(run())
+
+
+def test_a_failed_archive_stays_a_debt_for_the_next_turn(monkeypatch) -> None:
+    async def failing(page: Any, *, conversation_id: Any = None, **_: Any) -> bool:
+        del page, conversation_id
+        return False
+
+    monkeypatch.setattr(auto_module, "archive_conversation", failing)
+    client = _housekeeping_client()
+
+    async def run() -> None:
+        state = _state(_HousekeepingPage())
+        client._schedule_post_turn_housekeeping(
+            state,
+            state.page,
+            None,
+            should_archive=True,
+            should_prefetch=False,
+            conversation_id="chat-a",
+        )
+        task = state.housekeeping_task
+        assert task is not None
+        await task
+        assert state.pending_archive_ids == ["chat-a"]
+
+    asyncio.run(run())
+
+
+def test_a_chat_taken_over_by_the_next_prompt_is_not_lost(monkeypatch) -> None:
+    async def never_called(page: Any, **_: Any) -> bool:
+        raise AssertionError("the tab already belongs to the next prompt")
+
+    monkeypatch.setattr(auto_module, "archive_conversation", never_called)
+    client = _housekeeping_client()
+
+    async def run() -> None:
+        state = _state(_HousekeepingPage())
+        state.pending_archive_ids = ["chat-b"]
+        state.cancel_archive = True
+        client._schedule_post_turn_housekeeping(
+            state,
+            state.page,
+            None,
+            should_archive=True,
+            should_prefetch=False,
+            conversation_id="chat-c",
+        )
+        task = state.housekeeping_task
+        assert task is not None
+        await task
+        assert set(state.pending_archive_ids) == {"chat-b", "chat-c"}
+
+    asyncio.run(run())
+
+
+def test_the_debt_list_is_capped() -> None:
+    state = auto_module._WarmBrowserState(
+        environment=None,
+        page=None,
+        win_cloaker=None,
+        ua_cdp_session=None,
+        cdp_pump=None,
+        selected_channel=None,
+        headless=True,
+        hide_window=True,
+        user_data_dir=None,
+        loop=None,
+    )
+    for index in range(40):
+        state.pending_archive_ids.append(f"chat-{index}")
+        del state.pending_archive_ids[:-16]
+    assert len(state.pending_archive_ids) == 16
+    assert state.pending_archive_ids[-1] == "chat-39"
+
+
+def test_the_launcher_always_archives() -> None:
+    """arena-claude.bat must not leave an opt-out: chats are always filed."""
+    text = pathlib.Path(__file__).resolve().parents[1].joinpath("arena-claude.bat")
+    body = text.read_text(encoding="ascii")
+    assert "--archive" in body
+    assert "--no-archive" not in body
+    assert 'set "ARENA_CLAUDE_ARCHIVE=1"' in body
+
+
+def test_older_debts_are_paid_on_a_turn_that_skips_archiving(monkeypatch) -> None:
+    archived: list[str | None] = []
+
+    async def fake_archive(page: Any, *, conversation_id: Any = None, **_: Any) -> bool:
+        archived.append(conversation_id)
+        return True
+
+    monkeypatch.setattr(auto_module, "archive_conversation", fake_archive)
+    client = _housekeeping_client()
+
+    async def run() -> None:
+        state = _state(_HousekeepingPage())
+        state.pending_archive_ids = ["skipped-chat"]
+        client._schedule_post_turn_housekeeping(
+            state,
+            state.page,
+            None,
+            should_archive=False,  # this turn skips archiving (prompt queued)
+            should_prefetch=False,
+        )
+        task = state.housekeeping_task
+        assert task is not None
+        await task
+        assert archived == ["skipped-chat"]
+        assert state.pending_archive_ids == []
+
+    asyncio.run(run())
+
+
+def test_nothing_to_do_means_no_background_task() -> None:
+    client = _housekeeping_client()
+
+    async def run() -> None:
+        state = _state(_HousekeepingPage())
+        client._schedule_post_turn_housekeeping(
+            state, state.page, None, should_archive=False, should_prefetch=False
+        )
+        assert state.housekeeping_task is None
+        assert state.prefetch_task is None
+
+    asyncio.run(run())
