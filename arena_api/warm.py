@@ -55,7 +55,7 @@ from .exceptions import AuthenticationError
 
 #: Bumped whenever the wire protocol changes; a daemon of another version is
 #: replaced instead of being talked to.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 DEFAULT_IDLE_TIMEOUT = 900.0
 DEFAULT_START_TIMEOUT = 90.0
@@ -418,10 +418,13 @@ def _ask_payload(
     prompt: str,
     model: str | None = None,
     config: Mapping[str, Any] | None = None,
+    archive: bool | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"op": "ask", "prompt": prompt, "model": model}
     if config:
         payload["config"] = dict(config)
+    if archive is not None:
+        payload["archive"] = bool(archive)
     return payload
 
 
@@ -431,6 +434,7 @@ def ask_stream(
     state: DaemonState,
     model: str | None = None,
     config: Mapping[str, Any] | None = None,
+    archive: bool | None = None,
     timeout: float = DEFAULT_ASK_TIMEOUT,
 ) -> Generator[str, None, None]:
     """Yield answer deltas for ``prompt`` from the warm daemon.
@@ -443,7 +447,7 @@ def ask_stream(
     finished = False
     anchor = time.perf_counter()
     try:
-        _send(sock, _ask_payload(prompt, model, config))
+        _send(sock, _ask_payload(prompt, model, config, archive=archive))
         while True:
             message = _read_message(reader, timeout)
             kind = message.get("type")
@@ -543,6 +547,7 @@ class WarmConnection:
         ensure_state: Any,
         model: str | None = None,
         config: Mapping[str, Any] | None = None,
+        archive: bool | None = None,
         timeout: float = DEFAULT_ASK_TIMEOUT,
     ) -> Generator[str, None, None]:
         """Stream one prompt, reusing the cached socket or reconnecting cleanly."""
@@ -555,6 +560,7 @@ class WarmConnection:
                 state=fresh_state,
                 model=model,
                 config=config,
+                archive=archive,
                 timeout=timeout,
             )
             return
@@ -565,7 +571,7 @@ class WarmConnection:
             for attempt in range(2):
                 try:
                     sock, reader = self._connect(state, timeout=timeout)
-                    _send(sock, _ask_payload(prompt, model, config))
+                    _send(sock, _ask_payload(prompt, model, config, archive=archive))
                     first_msg = _read_message(reader, timeout)
                     break
                 except (WarmDaemonUnavailable, OSError):
@@ -1042,11 +1048,12 @@ class WarmSession:
         model: str | None = None,
         *,
         config: Mapping[str, Any] | None = None,
+        archive: bool | None = None,
     ) -> AsyncIterator[str]:
         self._waiting += 1
         try:
             async for delta in self._ask_locked(
-                prompt, model=model, config=config
+                prompt, model=model, config=config, archive=archive
             ):
                 yield delta
         finally:
@@ -1058,6 +1065,7 @@ class WarmSession:
         *,
         model: str | None,
         config: Mapping[str, Any] | None = None,
+        archive: bool | None = None,
     ) -> AsyncIterator[str]:
         from .exceptions import ArenaError, AuthenticationError, ChallengeRequiredError
         from .models import GenerationConfig
@@ -1078,6 +1086,18 @@ class WarmSession:
             for attempt in range(2):
                 try:
                     client = await self._client_or_create()
+                    tok: Any = getattr(client, "_verification_token", None)
+                    prev_tok_options = (
+                        getattr(tok, "options", None)
+                        if archive is not None and tok is not None
+                        else None
+                    )
+                    if prev_tok_options is not None and tok is not None:
+                        with contextlib.suppress(Exception):
+                            tok.options = replace(
+                                prev_tok_options,
+                                archive_after_answer=bool(archive),
+                            )
                     # How much of the answer time was the server *thinking*, and
                     # how much was it trickling tokens?  Recorded per request and
                     # shown by `arena-api --warm-profile`.
@@ -1088,15 +1108,20 @@ class WarmSession:
                     stream_kwargs: dict[str, Any] = {"model": model}
                     if gen_config is not None:
                         stream_kwargs["config"] = gen_config
-                    with latency.span("warm.ask"):
-                        async for chunk in client.astream(prompt, **stream_kwargs):
-                            now = time.monotonic()
-                            longest_gap = max(longest_gap, now - last_at)
-                            last_at = now
-                            chunks += 1
-                            chars += len(chunk.delta or "")
-                            if chunk.delta:
-                                yield chunk.delta
+                    try:
+                        with latency.span("warm.ask"):
+                            async for chunk in client.astream(prompt, **stream_kwargs):
+                                now = time.monotonic()
+                                longest_gap = max(longest_gap, now - last_at)
+                                last_at = now
+                                chunks += 1
+                                chars += len(chunk.delta or "")
+                                if chunk.delta:
+                                    yield chunk.delta
+                    finally:
+                        if prev_tok_options is not None and tok is not None:
+                            with contextlib.suppress(Exception):
+                                tok.options = prev_tok_options
                     latency.metric("answer.chunks", chunks)
                     latency.metric("answer.chars", chars)
                     latency.metric("answer.longest_gap_ms", round(longest_gap * 1000.0, 1))
@@ -1448,12 +1473,19 @@ class _WarmServer:
             if isinstance(raw_config, Mapping) and raw_config
             else None
         )
+        raw_archive = message.get("archive")
+        archive_value = raw_archive if isinstance(raw_archive, bool) else None
         self._active += 1
-        if config_value is not None and getattr(
+        extra_ask_kwargs: dict[str, Any] = {}
+        if config_value is not None:
+            extra_ask_kwargs["config"] = config_value
+        if archive_value is not None:
+            extra_ask_kwargs["archive"] = archive_value
+        if extra_ask_kwargs and getattr(
             self.session, "_accepts_config", False
         ):
             stream = self.session.ask(
-                prompt, model_value, config=config_value
+                prompt, model_value, **extra_ask_kwargs
             )
         else:
             stream = self.session.ask(prompt, model_value)
@@ -1636,6 +1668,7 @@ class _WarmArgs:
     prompt: str | None = None
     model: str | None = None
     fast_model: bool | None = None
+    archive_after_answer: bool | None = None
     rest: list[str] = field(default_factory=list)
     base_url: str = DEFAULT_BASE_URL
     state_file: str | None = None
@@ -1681,6 +1714,11 @@ def scan_argv(argv: Sequence[str]) -> _WarmArgs:
             continue
         if arg in ("--fast-model", "--no-fast-model"):
             parsed.fast_model = arg == "--fast-model"
+            parsed.rest.append(arg)
+            index += 1
+            continue
+        if arg in ("--archive-after-answer", "--no-archive-after-answer"):
+            parsed.archive_after_answer = arg == "--archive-after-answer"
             parsed.rest.append(arg)
             index += 1
             continue
@@ -1908,7 +1946,13 @@ def fast_prompt_main(argv: Sequence[str]) -> int | None:
         stream: Iterator[str] | None = None
         first = ""
         for connect_attempt in range(2 if used_optimistic else 1):
-            stream = ask_stream(parsed.prompt, state=state, model=wire_model)
+            ask_kwargs: dict[str, Any] = {
+                "state": state,
+                "model": wire_model,
+            }
+            if parsed.archive_after_answer is not None:
+                ask_kwargs["archive"] = parsed.archive_after_answer
+            stream = ask_stream(parsed.prompt, **ask_kwargs)
             try:
                 first = next(stream)
                 break

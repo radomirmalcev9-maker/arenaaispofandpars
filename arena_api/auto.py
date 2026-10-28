@@ -3553,6 +3553,7 @@ class DirectVerificationToken:
             state.prefetched_url = None
 
         async def _housekeeping() -> None:
+            archived = False
             if should_archive and not state.cancel_archive and _is_page_usable(page):
                 _latency_mark("archive.start")
                 try:
@@ -3569,6 +3570,16 @@ class DirectVerificationToken:
                             file=self.options.output,
                         )
                 _latency_mark("archive.done" if archived else "archive.missed")
+                if archived and can_prefetch and not state.cancel_archive:
+                    # Radix closes [role="menu"] on the very next frame; give
+                    # the archive fetch a brief beat in the background before
+                    # page.goto() tears down the document.
+                    wait_fn = getattr(page, "wait_for_timeout", None)
+                    if callable(wait_fn):
+                        try:
+                            await wait_fn(80)
+                        except Exception:  # noqa: BLE001
+                            pass
             if can_prefetch and callable(goto_fn) and _is_page_usable(page):
                 await goto_fn(self.page_url, wait_until="domcontentloaded")
                 title_fn = getattr(page, "title", None)

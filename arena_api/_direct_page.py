@@ -586,17 +586,24 @@ async () => {
     window.__arenaFastModelId = bestId;
     return bestId;
   }
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    for (const btn of document.querySelectorAll("button")) {
-      const label = ((btn.textContent || "") + " " + (btn.getAttribute("aria-label") || "")).trim().toLowerCase();
-      if (label === "accept cookies" || label === "accept all") {
-        try { btn.click(); } catch (_) {}
+  const isNextPage = Boolean(
+    document.querySelector &&
+    document.querySelector('script[src*="/_next/static/"]')
+  );
+  function hasReactBinding(el) {
+    if (!el || typeof el !== "object") return false;
+    for (const k of Object.keys(el)) {
+      if (
+        k.indexOf("__reactProps$") === 0 ||
+        k.indexOf("__reactFiber$") === 0 ||
+        k.indexOf("__reactInternalInstance$") === 0
+      ) {
+        return true;
       }
     }
-    for (const old of document.querySelectorAll("[data-arena-composer]")) {
-      old.removeAttribute("data-arena-composer");
-    }
+    return false;
+  }
+  function pickBestComposer() {
     const candidates = Array.from(
       document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"][contenteditable="true"]')
     );
@@ -625,8 +632,67 @@ async () => {
         bestScore = score;
       }
     }
+    return best;
+  }
+  function ensureComposerMarked() {
+    const current = document.querySelector && document.querySelector('[data-arena-composer="1"]');
+    if (current && current.isConnected !== false && !current.disabled && !current.readOnly) {
+      const r = current.getBoundingClientRect();
+      if (r && r.width >= 100 && r.height >= 18) return current;
+    }
+    for (const old of document.querySelectorAll("[data-arena-composer]")) {
+      old.removeAttribute("data-arena-composer");
+    }
+    const next = pickBestComposer();
+    if (next && next.el) {
+      next.el.setAttribute("data-arena-composer", "1");
+      return next.el;
+    }
+    return null;
+  }
+  const deadline = Date.now() + 15000;
+  let firstUnhydratedAt = 0;
+  while (Date.now() < deadline) {
+    if (document.querySelector && document.querySelector('[role="menu"]') && document.body && document.body.dispatchEvent) {
+      try {
+        document.body.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
+        );
+      } catch (_) {}
+    }
+    for (const btn of document.querySelectorAll("button")) {
+      const label = ((btn.textContent || "") + " " + (btn.getAttribute("aria-label") || "")).trim().toLowerCase();
+      if (label === "accept cookies" || label === "accept all") {
+        try { btn.click(); } catch (_) {}
+      }
+    }
+    for (const old of document.querySelectorAll("[data-arena-composer]")) {
+      old.removeAttribute("data-arena-composer");
+    }
+    const best = pickBestComposer();
     if (best) {
+      if (isNextPage && !hasReactBinding(best.el)) {
+        if (!firstUnhydratedAt) firstUnhydratedAt = Date.now();
+        if (Date.now() - firstUnhydratedAt < 1200) {
+          await new Promise((r) => setTimeout(r, 16));
+          continue;
+        }
+      }
+      if (window.__arenaComposerObserver) {
+        try { window.__arenaComposerObserver.disconnect(); } catch (_) {}
+        window.__arenaComposerObserver = null;
+      }
       best.el.setAttribute("data-arena-composer", "1");
+      const rootNode = document.body || document.documentElement;
+      if (typeof MutationObserver === "function" && rootNode) {
+        try {
+          const obs = new MutationObserver(() => {
+            try { ensureComposerMarked(); } catch (_) {}
+          });
+          obs.observe(rootNode, { childList: true, subtree: true });
+          window.__arenaComposerObserver = obs;
+        } catch (_) {}
+      }
       return {
         found: true,
         tag: best.el.tagName.toLowerCase(),
@@ -1031,9 +1097,87 @@ async def archive_conversation(
 
 _CLEANUP_ARENA_DOM_MARKS_JS = (
     "/* arena_cleanup_marks */ () => { "
+    "if (window.__arenaComposerObserver) { "
+    "try { window.__arenaComposerObserver.disconnect(); } catch (_) {} "
+    "window.__arenaComposerObserver = null; } "
     "for (const el of document.querySelectorAll('[data-arena-composer],[data-arena-send]')) { "
     "el.removeAttribute('data-arena-composer'); el.removeAttribute('data-arena-send'); } }"
 )
+
+
+def _build_js_fill_composer(prompt: str) -> str:
+    text_literal = json.dumps(prompt)
+    return f"""
+/* arena_fill_composer_fallback */ () => {{
+  const value = {text_literal};
+  let el = document.querySelector && document.querySelector('[data-arena-composer="1"]');
+  if (!el) {{
+    const list = Array.from(
+      document.querySelectorAll('textarea:not([id*="recaptcha"]):not([name*="recaptcha"]), [contenteditable="true"], [role="textbox"][contenteditable="true"]')
+    );
+    for (const cand of list) {{
+      if (cand.disabled || cand.readOnly || cand.getAttribute("aria-hidden") === "true") continue;
+      const st = window.getComputedStyle(cand);
+      if (!st || st.display === "none" || st.visibility === "hidden" || parseFloat(st.opacity || "1") === 0) continue;
+      const r = cand.getBoundingClientRect();
+      if (r && r.width >= 100 && r.height >= 18) {{
+        el = cand;
+        break;
+      }}
+    }}
+  }}
+  if (!el) return false;
+  el.setAttribute("data-arena-composer", "1");
+  try {{ el.focus(); }} catch (_) {{}}
+  const tag = String(el.tagName || "").toUpperCase();
+  if (tag === "TEXTAREA" || tag === "INPUT") {{
+    const proto = tag === "TEXTAREA"
+      ? (window.HTMLTextAreaElement && window.HTMLTextAreaElement.prototype)
+      : (window.HTMLInputElement && window.HTMLInputElement.prototype);
+    const desc = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
+    const prev = el.value;
+    if (desc && typeof desc.set === "function") {{
+      desc.set.call(el, value);
+    }} else {{
+      el.value = value;
+    }}
+    const tracker = el._valueTracker;
+    if (tracker && typeof tracker.setValue === "function") {{
+      try {{ tracker.setValue(prev); }} catch (_) {{}}
+    }}
+  }} else {{
+    el.textContent = value;
+  }}
+  try {{
+    el.dispatchEvent(new InputEvent("input", {{ bubbles: true, cancelable: true, data: value, inputType: "insertText" }}));
+  }} catch (_) {{
+    el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  }}
+  try {{
+    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  }} catch (_) {{}}
+  return true;
+}}
+""".strip()
+
+
+async def _call_locator_fast(
+    method: Callable[..., Any],
+    *args: Any,
+    timeout_ms: int = 1500,
+    **kwargs: Any,
+) -> Any:
+    """Run a Playwright locator action with a short timeout.
+
+    Unit-test stub locators often omit ``timeout=`` in their signatures, so
+    ``TypeError`` transparently falls back to calling without ``timeout``.
+    """
+    wall = (timeout_ms / 1000.0) + 0.5
+    try:
+        coro = method(*args, timeout=timeout_ms, **kwargs)
+    except TypeError:
+        coro = method(*args, **kwargs)
+    return await asyncio.wait_for(coro, timeout=wall)
 
 
 # --------------------------------------------------------------------------- #
@@ -1324,15 +1468,82 @@ async def _submit_prompt_via_composer(
     # click dispatch -- the composer only needs the caret, and fill()/type()
     # verify the element is editable anyway.  click() stays as a fallback for
     # pages whose composer only reacts to a real pointer event.
+    focused = False
     focus_fn = getattr(composer, "focus", None)
     if callable(focus_fn):
         try:
-            await focus_fn()
+            await _call_locator_fast(focus_fn, timeout_ms=1500)
+            focused = True
         except Exception:  # noqa: BLE001
-            await composer.click()
-    else:
-        await composer.click()
+            focused = False
+    if not focused:
+        try:
+            await _call_locator_fast(composer.click, timeout_ms=1500)
+            focused = True
+        except Exception:  # noqa: BLE001
+            re_info = await eval_fn(_FIND_COMPOSER_JS)
+            if isinstance(re_info, Mapping) and re_info.get("found"):
+                composer = locator_fn('[data-arena-composer="1"]').first
+                focus_fn = getattr(composer, "focus", None)
+                try:
+                    if callable(focus_fn):
+                        await _call_locator_fast(focus_fn, timeout_ms=1500)
+                    else:
+                        await _call_locator_fast(composer.click, timeout_ms=1500)
+                except Exception:  # noqa: BLE001
+                    pass
     _mark("composer.focused")
+
+    async def _fill_composer_resilient(text: str) -> None:
+        nonlocal composer
+        try:
+            await _call_locator_fast(composer.fill, text, timeout_ms=1500)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+        # React hydration or typing the first character can unmount the
+        # originally marked <textarea> and mount a fresh node without
+        # data-arena-composer="1".  Re-mark immediately instead of hanging 30s.
+        re_info = await eval_fn(_FIND_COMPOSER_JS)
+        if isinstance(re_info, Mapping) and re_info.get("found"):
+            composer = locator_fn('[data-arena-composer="1"]').first
+            try:
+                await _call_locator_fast(composer.fill, text, timeout_ms=2000)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        filled_js = False
+        try:
+            filled_js = bool(await eval_fn(_build_js_fill_composer(text)))
+        except Exception:  # noqa: BLE001
+            filled_js = False
+        if not filled_js:
+            raise TimeoutError(
+                "Direct Chat composer disappeared or remained uneditable while filling prompt."
+            )
+
+    async def _press_enter_resilient() -> None:
+        nonlocal composer
+        press_fn = getattr(composer, "press", None)
+        if callable(press_fn):
+            try:
+                await _call_locator_fast(press_fn, "Enter", timeout_ms=1500)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        kb_press = getattr(keyboard, "press", None) if keyboard is not None else None
+        if callable(kb_press):
+            try:
+                await kb_press("Enter")
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        re_info = await eval_fn(_FIND_COMPOSER_JS)
+        if isinstance(re_info, Mapping) and re_info.get("found"):
+            composer = locator_fn('[data-arena-composer="1"]').first
+            press_fn = getattr(composer, "press", None)
+            if callable(press_fn):
+                await _call_locator_fast(press_fn, "Enter", timeout_ms=1500)
 
     keyboard = getattr(page, "keyboard", None)
     single_line = "\n" not in prompt and "\r" not in prompt
@@ -1348,7 +1559,7 @@ async def _submit_prompt_via_composer(
         except Exception:  # noqa: BLE001
             non_empty = True
         if not non_empty:
-            await composer.fill(prompt)
+            await _fill_composer_resilient(prompt)
     else:
         first_line = prompt.splitlines()[0][:1] if prompt else ""
         if (
@@ -1357,7 +1568,7 @@ async def _submit_prompt_via_composer(
             and callable(getattr(keyboard, "type", None))
         ):
             await keyboard.type(first_line, delay=0)
-        await composer.fill(prompt)
+        await _fill_composer_resilient(prompt)
     _mark("prompt.filled")
 
     if fast_submit:
@@ -1368,7 +1579,7 @@ async def _submit_prompt_via_composer(
         press_fn = getattr(composer, "press", None)
         if callable(press_fn):
             try:
-                await press_fn("Enter")
+                await _call_locator_fast(press_fn, "Enter", timeout_ms=1500)
             except Exception:  # noqa: BLE001
                 pass
             else:
@@ -1384,16 +1595,42 @@ async def _submit_prompt_via_composer(
                         await wait_fn(15)
 
     btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
+    if not (isinstance(btn_info, Mapping) and btn_info.get("found")):
+        # If a delayed React remount cleared the controlled input right after
+        # fill(), the Send button stays disabled: re-fill once and re-check.
+        try:
+            still_non_empty = await eval_fn(_COMPOSER_NONEMPTY_JS)
+        except Exception:  # noqa: BLE001
+            still_non_empty = True
+        if still_non_empty is False:
+            await _fill_composer_resilient(prompt)
+            btn_info = await eval_fn(_MARK_SEND_BUTTON_JS)
     try:
         if isinstance(btn_info, Mapping) and btn_info.get("found"):
             send_btn = locator_fn('[data-arena-send="1"]').first
-            await send_btn.click()
+            clicked_send = False
+            try:
+                await _call_locator_fast(send_btn.click, timeout_ms=1500)
+                clicked_send = True
+            except Exception:  # noqa: BLE001
+                btn_retry = await eval_fn(_MARK_SEND_BUTTON_JS)
+                if isinstance(btn_retry, Mapping) and btn_retry.get("found"):
+                    send_btn = locator_fn('[data-arena-send="1"]').first
+                    try:
+                        await _call_locator_fast(
+                            send_btn.click, timeout_ms=1500, force=True
+                        )
+                        clicked_send = True
+                    except Exception:  # noqa: BLE001
+                        clicked_send = False
+            if not clicked_send:
+                await _press_enter_resilient()
             _mark("send.dispatched")
             # Only press Enter as a fallback when no explicit submit/Send button
             # matched and no evaluation request or challenge has started yet;
             # pressing Enter on top of an explicit Send click fires a duplicate
             # submission while grecaptcha.enterprise.execute() is still running.
-            if btn_info.get("confidence") == "fallback":
+            if clicked_send and btn_info.get("confidence") == "fallback":
                 # The button was matched by a heuristic, so the click may have
                 # hit something inert.  Give the submit up to ~180 ms to show up,
                 # but stop as soon as it does instead of always paying the full
@@ -1413,9 +1650,9 @@ async def _submit_prompt_via_composer(
                     except Exception:  # noqa: BLE001
                         still_has_text = False
                     if still_has_text:
-                        await composer.press("Enter")
+                        await _press_enter_resilient()
         else:
-            await composer.press("Enter")
+            await _press_enter_resilient()
     finally:
         try:
             await eval_fn(_CLEANUP_ARENA_DOM_MARKS_JS)
