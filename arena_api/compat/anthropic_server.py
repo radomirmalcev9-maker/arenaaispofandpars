@@ -1288,9 +1288,6 @@ class _Handler(BaseHTTPRequestHandler):
             )
         self._send_json(200, message)
 
-    #: Characters held back while streaming, so a half-written ``<tool_call>``
-    #: or a stop sequence split across two deltas is never emitted as text.
-    HOLDBACK = 64
 
     def _stream_message(self, request: MessagesRequest) -> None:
         started = time.monotonic()
@@ -1319,6 +1316,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         buffer = ""
         streamed = 0
+        #: Up to which index ``buffer`` is decided: everything before it has
+        #: either been streamed as text or is a tool call that must not leak.
+        cursor = 0
         index = 0
         text_open = False
         stopped = False
@@ -1396,9 +1396,8 @@ class _Handler(BaseHTTPRequestHandler):
             index += 1
 
         try:
-            halted = False
             max_stop_len = max(
-                (len(s) for s in request.stop_sequences if s), default=0
+                (len(item) for item in request.stop_sequences if item), default=0
             )
             try:
                 for delta in self.engine.answer(
@@ -1407,38 +1406,22 @@ class _Handler(BaseHTTPRequestHandler):
                     if not delta:
                         continue
                     buffer += delta
-                    if allow_tools:
-                        # Inspect only the unstreamed tail: an ambiguous `````
-                        # prefix halts briefly and un-halts as soon as a
-                        # non-JSON language tag (e.g. ```python) arrives.
-                        halted = _may_be_tool_call(buffer[streamed:])
-                    limit = len(buffer)
-                    if halted:
-                        limit = streamed
-                    else:
-                        holdback = min(
-                            self.HOLDBACK,
-                            _tail_holdback_len(
-                                buffer[streamed:],
-                                allow_tools=allow_tools,
-                                stop_sequences=request.stop_sequences,
-                            ),
-                        )
-                        limit -= holdback
-                    search_start = (
-                        max(0, streamed - max_stop_len) if max_stop_len else 0
+                    segments, _calls, cursor = stream_window(
+                        buffer,
+                        cursor,
+                        request.stop_sequences,
+                        allow_tools=allow_tools,
                     )
+                    for start, stop in segments:
+                        emit_text(buffer[start:stop])
                     stop_at, matched = self._find_stop(
-                        buffer, request.stop_sequences, start=search_start
+                        buffer,
+                        request.stop_sequences,
+                        start=max(0, cursor - max_stop_len) if max_stop_len else 0,
                     )
                     if matched is not None:
                         stop_sequence = matched
-                        if stop_at is not None:
-                            limit = min(limit, stop_at)
                         stopped = True
-                    if limit > streamed:
-                        emit_text(buffer[streamed:limit])
-                    if stopped:
                         break
             except (BrokenPipeError, ConnectionResetError):
                 raise
@@ -1453,8 +1436,8 @@ class _Handler(BaseHTTPRequestHandler):
             if spans:
                 first_start = spans[0][0]
                 last_end = spans[-1][1]
-                if first_start > streamed:
-                    emit_text(buffer[streamed:first_start])
+                if first_start > cursor:
+                    emit_text(buffer[cursor:first_start])
                 close_text()
                 for _, _, call in spans:
                     emit_tool(
@@ -1465,18 +1448,18 @@ class _Handler(BaseHTTPRequestHandler):
                             "input": call.arguments,
                         }
                     )
-                tail = "" if stop_sequence is not None else buffer[last_end:]
+                tail = "" if stop_sequence is not None else buffer[max(cursor, last_end):]
                 if tail.strip():
                     emit_text(tail.strip())
                 close_text()
                 stop_reason = "tool_use"
             else:
                 if stop_sequence is not None:
-                    if stop_at is not None and stop_at > streamed:
-                        emit_text(buffer[streamed:stop_at])
+                    if stop_at is not None and stop_at > cursor:
+                        emit_text(buffer[cursor:stop_at])
                 elif not stopped:
                     # Everything still held back is plain text.
-                    emit_text(buffer[streamed:])
+                    emit_text(buffer[cursor:])
                 close_text()
                 if stop_sequence is not None:
                     stop_reason = "stop_sequence"
@@ -1534,92 +1517,177 @@ class _Handler(BaseHTTPRequestHandler):
         return best[0], best[1]
 
 
-def _tail_holdback_len(
-    text: str,
-    *,
-    allow_tools: bool,
-    stop_sequences: Sequence[str],
-) -> int:
-    """Exact number of trailing characters that could begin a tool marker or stop sequence."""
-    if not text or (not allow_tools and not stop_sequences):
-        return 0
-    max_len = 10 if allow_tools else 0
-    for stop in stop_sequences:
-        if len(stop) - 1 > max_len:
-            max_len = len(stop) - 1
-    max_k = min(len(text), max_len)
-    if max_k <= 0:
-        return 0
-    for k in range(max_k, 0, -1):
-        suffix = text[-k:]
-        if allow_tools:
-            lowered_suffix = suffix.lower()
-            if "<tool_call>".startswith(lowered_suffix) or "```".startswith(
-                suffix
-            ):
-                return k
-        for stop in stop_sequences:
-            if len(stop) > k and stop.startswith(suffix):
-                return k
-    return 0
+_FENCE = "```"
+_TOOL_TAG_OPEN = "<tool_call>"
+_TOOL_TAG_CLOSE = "</tool_call>"
 
 
-def _may_be_tool_call(text: str) -> bool:
-    """True when ``text`` can still turn into a tool call.
+def _tool_span_at(region: str) -> int | None:
+    """End of a trusted tool call that starts at the very beginning of ``region``.
 
-    Only the two shapes :func:`parse_tool_calls` trusts while streaming are
-    held back: ``<tool_call>`` tags and JSON markdown fences whose body starts
-    with ``{`` (or whose fence header is still being streamed, e.g. `````json``).
-    Ordinary code fences such as `````python`` return ``False`` immediately so
-    long code answers stream live instead of buffering until completion.
+    The region is checked with :func:`parse_tool_calls` itself, so the streaming
+    decision and the final answer can never disagree about what a tool call is.
     """
-    lowered = text.lower()
-    if "<tool" in lowered:
-        return True
-    pos = 0
-    while True:
-        fence = lowered.find("```", pos)
-        if fence < 0:
-            return False
-        after = text[fence + 3 :]
-        close_rel = after.find("```")
-        block = after if close_rel < 0 else after[:close_rel]
-        # Split optional fence info string (language tag) from body.
-        nl = block.find("\n")
-        ws_split = nl
-        for idx, ch in enumerate(block):
-            if ch in " \t\r\n{":
-                ws_split = idx
+    spans = parse_tool_calls(region)
+    if spans and spans[0][0] == 0:
+        return spans[0][1]
+    return None
+
+
+def _classify_marker(text: str, lower: str, start: int) -> tuple[str, int]:
+    """Decide what the ``<tool``/fence marker at ``start`` is.
+
+    Returns ``("call", end)`` for a finished tool call (its text must never be
+    streamed), ``("text", resume)`` when the marker turned out to be plain text
+    and ``("wait", start)`` while it is still undecided because the rest of it
+    has not arrived yet.
+    """
+    if text.startswith(_FENCE, start):
+        index = start + 3
+        while index < len(text) and (text[index].isalpha() or text[index] == "_"):
+            index += 1
+        if index >= len(text):
+            return "wait", start
+        cursor = index
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text):
+            return "wait", start
+        if text[cursor] != "{":
+            # ```python, ```bash, ```diff ...: an ordinary code block.
+            return "text", index
+        closing = text.find(_FENCE, cursor)
+        if closing < 0:
+            return "wait", start
+        end = _tool_span_at(text[start : closing + len(_FENCE)])
+        if end is None:
+            return "text", start + len(_FENCE)
+        return "call", start + end
+    if lower.startswith("<tool", start):
+        tag_end = text.find(">", start)
+        if tag_end < 0:
+            return "wait", start
+        if lower[start : tag_end + 1] != _TOOL_TAG_OPEN:
+            return "text", tag_end + 1
+        closing = lower.find(_TOOL_TAG_CLOSE, tag_end + 1)
+        if closing < 0:
+            return "wait", start
+        end = _tool_span_at(text[start : closing + len(_TOOL_TAG_CLOSE)])
+        if end is None:
+            return "text", tag_end + 1
+        return "call", start + end
+    return "text", start + 1
+
+
+def _partial_marker_start(lower: str) -> int | None:
+    """Index of a half-written marker at the very end of ``lower``.
+
+    A lone ``<`` or `` `` `` may still grow into ``<tool_call>``/a fence, and
+    those two characters decide everything: hold them back, do not guess.
+    """
+    best: int | None = None
+    for marker in (_TOOL_TAG_OPEN, _FENCE):
+        for size in range(len(marker) - 1, 0, -1):
+            if lower.endswith(marker[:size]):
+                index = len(lower) - size
+                if best is None or index < best:
+                    best = index
                 break
-        if ws_split < 0:
-            # Header still forming (e.g. "```" or "```js" or "```json").
-            lang_prefix = block.lower()
-            if "json".startswith(lang_prefix):
-                return True
-        else:
-            lang = block[:ws_split].strip().lower()
-            body = block[ws_split:].lstrip()
-            if lang in ("", "json"):
-                if not body:
-                    if close_rel < 0:
-                        return True
-                elif body.startswith("{"):
-                    if close_rel < 0:
-                        return True
-                    if (
-                        '"name"' in body
-                        or '"tool"' in body
-                        or '"tool_name"' in body
-                    ):
-                        return True
-        if close_rel < 0:
-            return False
-        pos = fence + 3 + close_rel + 3
+    return best
+
+
+def _stop_cut(text: str, stops: Sequence[str]) -> int | None:
+    """Where the text must stop for a stop sequence: a full hit or a prefix.
+
+    A complete sequence cannot be streamed at all, and a half-arrived one (the
+    tail is a prefix of it) must wait for the next delta.  Both are cheap
+    ``str`` operations, so only that tail is held back instead of a fixed
+    buffer size.
+    """
+    best: int | None = None
+    for stop in stops:
+        if not stop:
+            continue
+        index = text.find(stop)
+        if index >= 0 and (best is None or index < best):
+            best = index
+        for size in range(len(stop) - 1, 0, -1):
+            if text.endswith(stop[:size]):
+                index = len(text) - size
+                if best is None or index < best:
+                    best = index
+                break
+    return best
+
+
+def stream_window(
+    text: str, cursor: int, stops: Sequence[str] = (), *, allow_tools: bool = True
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], int]:
+    """Decide what of ``text[cursor:]`` may be sent right now.
+
+    Returns ``(emittable, calls, cut)`` with absolute ranges: ``emittable`` is
+    plain text the client can see immediately, ``calls`` are finished tool calls
+    whose text must never leak into the answer, and ``cut`` is the index up to
+    which the buffer is decided.  ``text[cut:]`` waits for the next delta --
+    either a marker is half written or a fence may still become a call.
+
+    The point of the whole exercise is latency: only a genuinely undecidable
+    tail is held back, instead of a fixed ``HOLDBACK`` characters of every
+    answer, so the first token reaches Claude Code as soon as Arena produced it.
+    Only the undecided tail is scanned, so a long answer costs the same per
+    delta as a short one.
+    """
+    cursor = max(0, min(cursor, len(text)))
+    window = text[cursor:]
+    lower = window.lower()
+    size = len(window)
+    emittable: list[tuple[int, int]] = []
+    calls: list[tuple[int, int]] = []
+    pos = 0
+    emit_from = 0
+    cut = size
+    while allow_tools and pos < size:
+        fence = window.find(_FENCE, pos)
+        tag = lower.find("<tool", pos)
+        candidates = [value for value in (fence, tag) if value >= 0]
+        if not candidates:
+            break
+        marker = min(candidates)
+        verdict, resume = _classify_marker(window, lower, marker)
+        if verdict == "wait":
+            cut = marker
+            break
+        if verdict == "call":
+            if marker > emit_from:
+                emittable.append((emit_from, marker))
+            calls.append((marker, resume))
+            pos = emit_from = resume
+            continue
+        pos = max(resume, marker + 1)
+    if cut == size and allow_tools:
+        partial = _partial_marker_start(lower)
+        if partial is not None and emit_from <= partial < cut:
+            cut = partial
+    stop_at = _stop_cut(window, stops)
+    if stop_at is not None and stop_at >= emit_from:
+        cut = min(cut, stop_at)
+    if cut > emit_from:
+        emittable.append((emit_from, cut))
+    shift = cursor
+    return (
+        [(shift + begin, shift + stop) for begin, stop in emittable],
+        [(shift + begin, shift + stop) for begin, stop in calls],
+        shift + cut,
+    )
 
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    #: SSE means "many tiny writes".  With Nagle on, a delta can sit in the
+    #: kernel until the previous segment is acknowledged -- on loopback that is
+    #: a visible stutter in Claude Code's output.
+    disable_nagle_algorithm = True
 
     def __init__(self, address: tuple[str, int], engine: ArenaEngine, **config: Any):
         super().__init__(address, _Handler)

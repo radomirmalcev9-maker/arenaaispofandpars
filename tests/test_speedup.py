@@ -654,14 +654,18 @@ def test_warm_connection_reuses_single_tcp_nodelay_socket_and_forwards_config(
 
 
 def test_claude_shim_streams_immediately_unblocks_code_fences_and_caches_unknown_models() -> None:
-    # 1. _may_be_tool_call unblocks non-JSON code fences while preserving <tool & ```json
-    assert claude_server._may_be_tool_call("просто текст") is False
-    assert claude_server._may_be_tool_call("до <tool") is True
-    assert claude_server._may_be_tool_call("до ```") is True
-    assert claude_server._may_be_tool_call("до ```json") is True
-    assert claude_server._may_be_tool_call("до ```json\n{\"name\":") is True
-    assert claude_server._may_be_tool_call("до ```python\ndef fib(n):\n    return n") is False
-    assert claude_server._may_be_tool_call("```bash\nls -la\n```\nГотово!") is False
+    # 1. stream_window unblocks non-JSON code fences while preserving <tool & ```json
+    def _held(text: str) -> bool:
+        _segments, _calls, cut = claude_server.stream_window(text, 0)
+        return cut < len(text)
+
+    assert _held("просто текст") is False
+    assert _held("до <tool") is True
+    assert _held("до ```") is True
+    assert _held("до ```json") is True
+    assert _held('до ```json\n{"name":') is True
+    assert _held("до ```python\ndef fib(n):\n    return n") is False
+    assert _held("```bash\nls -la\n```\nГотово!") is False
 
     # 2. Unknown foreign model names are cached after the first miss
     seen_models: list[str | None] = []

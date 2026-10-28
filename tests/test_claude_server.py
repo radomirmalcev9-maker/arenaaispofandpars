@@ -958,10 +958,70 @@ def test_echo_engine_is_registered() -> None:
     assert set(shim.ENGINES) == {"warm", "http", "echo"}
 
 
-def test_holdback_marker_detection() -> None:
-    assert shim._may_be_tool_call("до <tool") is True
-    assert shim._may_be_tool_call("до ```json") is True
-    assert shim._may_be_tool_call("обычный текст") is False
+def _joined(text: str, segments: list[tuple[int, int]]) -> str:
+    return "".join(text[start:end] for start, end in segments)
+
+
+def test_stream_window_releases_a_plain_code_block_at_once() -> None:
+    text = "Сначала объясню.\n```python\nprint(1)\n```\nГотово."
+    segments, calls, cut = shim.stream_window(text, 0)
+    assert calls == []
+    assert cut == len(text)
+    assert _joined(text, segments) == text
+
+
+def test_stream_window_waits_only_for_an_unfinished_fence() -> None:
+    text = "вот ```json"
+    segments, _calls, cut = shim.stream_window(text, 0)
+    assert _joined(text, segments) == "вот "
+    assert cut == len("вот ")
+
+
+def test_stream_window_hides_a_tool_call_tag() -> None:
+    call = '<tool_call>{"name": "Bash", "arguments": {"command": "ls"}}</tool_call>'
+    text = "Проверю.\n" + call + "\nготово"
+    segments, calls, _cut = shim.stream_window(text, 0)
+    assert [text[start:end] for start, end in calls] == [call]
+    assert call not in _joined(text, segments)
+    assert _joined(text, segments) == "Проверю.\n\nготово"
+
+
+def test_stream_window_hides_a_fenced_tool_call() -> None:
+    call = '```json\n{"name": "Bash", "arguments": {"command": "ls"}}\n```'
+    text = "Сейчас.\n" + call
+    segments, calls, _cut = shim.stream_window(text, 0)
+    assert [text[start:end] for start, end in calls] == [call]
+    assert _joined(text, segments) == "Сейчас.\n"
+
+
+def test_stream_window_holds_a_partial_stop_sequence() -> None:
+    text = "начало КОН"
+    segments, _calls, cut = shim.stream_window(text, 0, ["КОНЕЦ"])
+    assert _joined(text, segments) == "начало "
+    assert cut == len("начало ")
+
+
+def test_stream_window_sends_everything_when_tools_are_off() -> None:
+    text = '<tool_call>{"name": "Bash", "arguments": {}}</tool_call>'
+    segments, calls, cut = shim.stream_window(text, 0, allow_tools=False)
+    assert calls == []
+    assert cut == len(text)
+    assert _joined(text, segments) == text
+
+
+def test_stream_window_does_not_rewind_below_the_cursor() -> None:
+    text = "ответ " + '<tool_call>{"name": "A", "arguments": {}}</tool_call>'
+    segments, _calls, _cut = shim.stream_window(text, 0)
+    later, calls, cut = shim.stream_window(text, len(text))
+    assert later == []
+    assert calls == []
+    assert cut == len(text)
+
+
+def test_server_disables_nagle_for_streaming() -> None:
+    # Small SSE deltas must not wait for an ACK: on loopback Nagle adds up to
+    # 40 ms per write, which is visible as stutter in the client.
+    assert shim._Server.disable_nagle_algorithm is True
 
 
 def test_server_thread_safety_of_two_parallel_requests(serve: Any) -> None:
@@ -1667,3 +1727,63 @@ def test_engine_records_timings_for_the_last_answer() -> None:
     assert timings["prompt_chars"] == len("привет")
     assert timings["answer_chars"] >= len(text)
     assert timings["total_ms"] >= 0
+
+
+def test_a_tool_call_is_never_streamed_as_text(serve: Any) -> None:
+    call = '<tool_call>{"name": "Bash", "arguments": {"command": "ls"}}</tool_call>'
+    server, _ = serve("Проверю каталог.\n" + call + "\nГотово.")
+    events = _post_stream(
+        server,
+        {
+            "stream": True,
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": "что в папке?"}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "run a command",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+        },
+    )
+    text = "".join(
+        data["delta"].get("text", "")
+        for name, data in events
+        if name == "content_block_delta"
+    )
+    # The raw call is a tool_use block, not prose: no duplicated JSON.
+    assert "<tool_call>" not in text
+    assert "arguments" not in text
+    assert "Проверю каталог." in text
+    assert "Готово." in text
+    kinds = [
+        data["content_block"]["type"]
+        for name, data in events
+        if name == "content_block_start"
+    ]
+    assert kinds == ["text", "tool_use"]
+
+
+def test_a_code_fence_with_tools_is_still_plain_text(serve: Any) -> None:
+    answer = "Пример:\n```python\nprint(1)\n```\nВсё."
+    server, _ = serve(answer)
+    events = _post_stream(
+        server,
+        {
+            "stream": True,
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": "покажи код"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+        },
+    )
+    text = "".join(
+        data["delta"]["text"] for name, data in events if name == "content_block_delta"
+    )
+    assert text == answer
+    kinds = [
+        data["content_block"]["type"]
+        for name, data in events
+        if name == "content_block_start"
+    ]
+    assert kinds == ["text"]
