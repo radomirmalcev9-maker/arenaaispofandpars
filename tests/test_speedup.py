@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -909,4 +910,362 @@ def test_fast_prompt_main_skips_redundant_ping_on_live_daemon_and_flags_parse(
     asyncio.run(_run())
     assert ping_calls == 0
     assert "answer            : fast:pingless:max" in capsys.readouterr().out
+
+
+def test_composer_remount_after_first_keystroke_recovers_without_30s_timeout() -> None:
+    """Reproduces the >32-char prompt remount race (`Locator.fill: Timeout 30000ms exceeded`)."""
+    long_prompt = "привет! как дела? что думаешь насчет esp32?"
+    assert len(long_prompt) > 32
+
+    state = {
+        "composer_marked": False,
+        "filled_value": "",
+        "fill_attempts": 0,
+        "find_calls": 0,
+        "send_clicks": 0,
+    }
+
+    class RemountingKeyboard:
+        async def type(self, text: str, delay: int = 0) -> None:
+            del text, delay
+            # Typing the first character triggers a React remount that wipes
+            # the [data-arena-composer="1"] attribute off the old <textarea>!
+            state["composer_marked"] = False
+
+    class RemountingLocator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        @property
+        def first(self) -> RemountingLocator:
+            return self
+
+        async def focus(self, *, timeout: int = 30000) -> None:
+            if "data-arena-composer" in self.selector and not state["composer_marked"]:
+                await asyncio.sleep(timeout / 1000.0)
+                raise TimeoutError("Locator.focus: Timeout exceeded")
+
+        async def click(self, *, timeout: int = 30000, force: bool = False) -> None:
+            del force
+            if "data-arena-send" in self.selector:
+                state["send_clicks"] += 1
+                return
+            if "data-arena-composer" in self.selector and not state["composer_marked"]:
+                await asyncio.sleep(timeout / 1000.0)
+                raise TimeoutError("Locator.click: Timeout exceeded")
+
+        async def fill(self, value: str, *, timeout: int = 30000) -> None:
+            state["fill_attempts"] += 1
+            if not state["composer_marked"]:
+                # Simulate real Playwright waiting up to min(timeout, 50ms in test)
+                # and raising TimeoutError when [data-arena-composer="1"] is gone!
+                assert timeout <= 2500, f"must not use 30000ms default timeout (got {timeout})"
+                raise TimeoutError(
+                    'Locator.fill: Timeout exceeded waiting for locator("[data-arena-composer=\\"1\\"]").first'
+                )
+            state["filled_value"] = value
+
+        async def press(self, key: str, *, timeout: int = 30000) -> None:
+            del key, timeout
+
+    class RemountingPage:
+        keyboard = RemountingKeyboard()
+
+        def locator(self, selector: str) -> RemountingLocator:
+            return RemountingLocator(selector)
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            del ms
+
+        async def evaluate(self, script: str) -> Any:
+            if "arena_cleanup_marks" in script:
+                state["composer_marked"] = False
+                return None
+            if "composer_nonempty" in script:
+                return bool(state["filled_value"])
+            if "data-arena-composer" in script and "data-arena-send" not in script and "arena_fill_composer_fallback" not in script:
+                state["find_calls"] += 1
+                state["composer_marked"] = True
+                return {"found": True, "tag": "textarea", "x": 400, "y": 700}
+            if "data-arena-send" in script:
+                return {"found": True, "confidence": "explicit", "x": 650, "y": 700}
+            return None
+
+    started = time.perf_counter()
+    ok = asyncio.run(
+        direct_page._submit_prompt_via_composer(RemountingPage(), long_prompt)
+    )
+    elapsed = time.perf_counter() - started
+    assert ok is True
+    assert elapsed < 1.0
+    assert state["fill_attempts"] == 2
+    assert state["find_calls"] == 2
+    assert state["filled_value"] == long_prompt
+    assert state["send_clicks"] == 1
+
+    # Also verify fallback to native JS React _valueTracker fill when Locator.fill
+    # ALWAYS fails (e.g. covered by floating portal / actionability block).
+    js_filled: list[str] = []
+
+    class BlockedFillLocator(RemountingLocator):
+        async def fill(self, value: str, *, timeout: int = 30000) -> None:
+            del value, timeout
+            raise TimeoutError("Locator.fill blocked by overlay")
+
+    class BlockedFillPage(RemountingPage):
+        def locator(self, selector: str) -> BlockedFillLocator:
+            return BlockedFillLocator(selector)
+
+        async def evaluate(self, script: str) -> Any:
+            if "arena_fill_composer_fallback" in script:
+                js_filled.append(script)
+                return True
+            return await super().evaluate(script)
+
+    ok_fallback = asyncio.run(
+        direct_page._submit_prompt_via_composer(BlockedFillPage(), long_prompt)
+    )
+    assert ok_fallback is True
+    assert len(js_filled) == 1
+    assert json.dumps(long_prompt) in js_filled[0]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
+def test_v8_composer_hydration_observer_and_react_value_tracker_fallback() -> None:
+    """Executes _FIND_COMPOSER_JS (hydration + MutationObserver) and _build_js_fill_composer in V8."""
+    prompt = "привет! как дела? что думаешь насчет esp32?"
+    find_js = direct_page._FIND_COMPOSER_JS
+    fill_js = direct_page._build_js_fill_composer(prompt)
+    cleanup_js = direct_page._CLEANUP_ARENA_DOM_MARKS_JS
+
+    harness = f"""
+    let currentComposer = null;
+    let observerCallback = null;
+    let observerDisconnected = false;
+
+    function makeTextarea(label, hydrated) {{
+      const attrs = new Map();
+      const events = [];
+      let rawVal = "";
+      const el = {{
+        id: "",
+        tagName: "TEXTAREA",
+        label,
+        disabled: false,
+        readOnly: false,
+        isConnected: true,
+        events,
+        getAttribute: (k) => attrs.has(k) ? attrs.get(k) : null,
+        setAttribute: (k, v) => {{ attrs.set(k, String(v)); }},
+        removeAttribute: (k) => {{ attrs.delete(k); }},
+        closest: () => ({{ tagName: "FORM" }}),
+        getBoundingClientRect: () => ({{ left: 100, top: 600, width: 700, height: 48 }}),
+        focus: () => {{ el.focused = true; }},
+        dispatchEvent: (ev) => {{ events.push(ev.type); return true; }},
+        _valueTracker: {{
+          tracked: "",
+          setValue(v) {{ this.tracked = v; }}
+        }},
+      }};
+      Object.defineProperty(el, "value", {{
+        get() {{ return rawVal; }},
+        set(v) {{ rawVal = String(v); }},
+        configurable: true,
+      }});
+      if (hydrated) {{
+        el.__reactProps$abc123 = {{ onChange: () => {{}} }};
+      }}
+      return el;
+    }}
+
+    // Start with an UNHYDRATED SSR textarea on a Next.js page; hydrate it after 35ms!
+    const ssrTextarea = makeTextarea("ssr", false);
+    currentComposer = ssrTextarea;
+    let hadAttrBeforeHydration = false;
+    setTimeout(() => {{
+      hadAttrBeforeHydration = ssrTextarea.getAttribute("data-arena-composer") !== null;
+      ssrTextarea.__reactProps$hydrated = {{}};
+    }}, 35);
+
+    global.MutationObserver = class {{
+      constructor(cb) {{ observerCallback = cb; }}
+      observe() {{}}
+      disconnect() {{ observerDisconnected = true; }}
+    }};
+    global.InputEvent = class {{
+      constructor(type, init) {{ this.type = type; Object.assign(this, init || {{}}); }}
+    }};
+    global.Event = class {{
+      constructor(type, init) {{ this.type = type; Object.assign(this, init || {{}}); }}
+    }};
+    global.KeyboardEvent = class {{
+      constructor(type, init) {{ this.type = type; Object.assign(this, init || {{}}); }}
+    }};
+    global.HTMLTextAreaElement = function() {{}};
+    Object.defineProperty(global.HTMLTextAreaElement.prototype, "value", {{
+      set(v) {{ this._protoSet = String(v); this.value = String(v); }},
+      configurable: true,
+    }});
+
+    global.window = {{
+      getComputedStyle: () => ({{ display: "block", visibility: "visible", opacity: "1" }}),
+      HTMLTextAreaElement: global.HTMLTextAreaElement,
+    }};
+    global.document = {{
+      body: {{ dispatchEvent: () => true }},
+      documentElement: {{}},
+      scripts: [],
+      querySelector: (sel) => {{
+        if (sel.includes("/_next/static/")) return {{ src: "/_next/static/chunks/main.js" }};
+        if (sel === '[data-arena-composer="1"]') {{
+          return (currentComposer && currentComposer.getAttribute("data-arena-composer") === "1")
+            ? currentComposer
+            : null;
+        }}
+        return null;
+      }},
+      querySelectorAll: (sel) => {{
+        if (sel.includes("button")) return [];
+        if (sel.includes("data-arena-composer")) {{
+          return (currentComposer && currentComposer.getAttribute("data-arena-composer") !== null)
+            ? [currentComposer]
+            : [];
+        }}
+        if (sel.includes("textarea")) return currentComposer ? [currentComposer] : [];
+        return [];
+      }},
+    }};
+
+    (async () => {{
+      const findFn = {find_js};
+      const found = await findFn();
+      // Simulate React remounting <textarea> when first character is typed!
+      ssrTextarea.isConnected = false;
+      const remountedTextarea = makeTextarea("remounted", true);
+      remountedTextarea.value = "п";
+      remountedTextarea._valueTracker.setValue("п");
+      currentComposer = remountedTextarea;
+      if (observerCallback) observerCallback();
+      const autoRestamped = remountedTextarea.getAttribute("data-arena-composer") === "1";
+
+      // Now run _build_js_fill_composer fallback on the remounted textarea!
+      remountedTextarea.removeAttribute("data-arena-composer");
+      const fillFn = {fill_js};
+      const fillOk = fillFn();
+
+      const cleanupFn = {cleanup_js};
+      cleanupFn();
+
+      console.log(JSON.stringify({{
+        found: found.found,
+        hadAttrBeforeHydration,
+        autoRestamped,
+        fillOk,
+        finalValue: remountedTextarea.value,
+        trackerPrev: remountedTextarea._valueTracker.tracked,
+        events: remountedTextarea.events,
+        observerDisconnected,
+        cleanedUp: remountedTextarea.getAttribute("data-arena-composer") === null,
+      }}));
+    }})();
+    """
+    proc = subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    out = json.loads(proc.stdout.strip())
+    assert out["found"] is True
+    assert out["hadAttrBeforeHydration"] is False
+    assert out["autoRestamped"] is True
+    assert out["fillOk"] is True
+    assert out["finalValue"] == prompt
+    assert out["trackerPrev"] == "п"
+    assert "input" in out["events"]
+    assert "change" in out["events"]
+    assert out["observerDisconnected"] is True
+    assert out["cleanedUp"] is True
+
+
+def test_warm_forwards_archive_after_answer_per_request_and_bumps_protocol(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert warm.PROTOCOL_VERSION >= 2
+    scanned = warm.scan_argv(
+        [
+            "--prompt",
+            "привет! как дела? что думаешь насчет esp32?",
+            "--archive-after-answer",
+        ]
+    )
+    assert scanned.archive_after_answer is True
+    assert "--archive-after-answer" in scanned.rest
+
+    # Stale protocol=1 daemon state is never optimistically reused
+    stale_path = tmp_path / "stale-daemon.json"
+    warm.DaemonState(
+        pid=os.getpid(),
+        port=65500,
+        token="old",
+        protocol=1,
+        api_version=warm.api_version(),
+        base_url=warm.DEFAULT_BASE_URL,
+    ).write(stale_path)
+    stale_parsed = warm.scan_argv(
+        ["--prompt", "hi", "--warm-state", str(stale_path)]
+    )
+    assert warm._optimistic_live_state(stale_parsed) is None
+
+    # Live protocol=2 daemon receives per-request archive=True even if started earlier
+    seen_archive: list[bool | None] = []
+
+    class ArchiveAwareSession:
+        _accepts_config = True
+
+        async def ask(
+            self,
+            prompt: str,
+            model: str | None = None,
+            *,
+            config: dict[str, Any] | None = None,
+            archive: bool | None = None,
+        ):
+            del model, config
+            seen_archive.append(archive)
+            yield f"ok:{len(prompt)}"
+
+        async def aclose(self) -> None:
+            return None
+
+    live_path = tmp_path / "live-daemon.json"
+
+    async def _run() -> None:
+        server = warm._WarmServer(
+            ArchiveAwareSession(),
+            state_file=live_path,
+            token="tok2",
+        )
+        await server.start()
+        try:
+            rc = await asyncio.to_thread(
+                warm.fast_prompt_main,
+                [
+                    "--prompt",
+                    "привет! как дела? что думаешь насчет esp32?",
+                    "--archive-after-answer",
+                    "--warm-state",
+                    str(live_path),
+                ],
+            )
+            assert rc == 0
+        finally:
+            await server._shutdown()
+
+    asyncio.run(_run())
+    assert seen_archive == [True]
+    assert "answer            : ok:43" in capsys.readouterr().out
+
 

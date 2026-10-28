@@ -5,6 +5,24 @@
 
 ## Unreleased
 
+### Защита композера от React-гидратации и перемонтирования DOM (`Locator.fill: Timeout 30000ms`)
+
+- **Исправлено зависание `Locator.fill` на промптах длиннее 32 символов**:
+  при быстром входе после `domcontentloaded` или при вводе первого символа
+  (`keyboard.type`) фронтенд Next.js/React на `arena.ai` перемонтирует узел
+  `<textarea>`, сбрасывая атрибут `data-arena-composer="1"`. Теперь
+  `_FIND_COMPOSER_JS` дожидается привязки React-пропсов (`__reactProps$` /
+  `__reactFiber$`), закрывает зависшие меню Radix (`[role="menu"]`), вешает
+  `MutationObserver` (`window.__arenaComposerObserver`) для мгновенной
+  перемаркировки нового `<textarea>` в том же тике, а `_submit_prompt_via_composer`
+  ограничивает таймаут локаторов до `1.5 с` с повторной маркировкой и
+  резервной записью через нативный сеттер `HTMLTextAreaElement.prototype.value`
+  (`_valueTracker`).
+- **Передача `--archive-after-answer` в уже запущенный тёплый демон
+  (`PROTOCOL_VERSION = 2`)**: флаг архивации передаётся в каждом `ask`-запросе
+  без холодного перезапуска браузера, а устаревшие демоны старого протокола
+  автоматически перезапускаются при обновлении кода.
+
 ### ~14x ускорение любых ответов (CLI, тёплый демон, Direct Chat, шим Claude Code)
 
 - **Автовыбор быстрой текстовой модели по умолчанию (`model_fast_score`,
