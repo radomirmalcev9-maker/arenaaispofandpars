@@ -694,11 +694,19 @@ def session_signature(argv: Sequence[str]) -> str:
 
 
 def _compatible(state: DaemonState, *, base_url: str, session: str = "") -> bool:
+    """Whether ``state`` can answer for a caller with this session signature.
+
+    A caller that names no source (``session == ""``) is happy with any warm
+    daemon: it wanted the discovery ladder, and a daemon started with an
+    explicit source already holds *a* usable session.  Being strict here cost a
+    full cold start (browser launch included) every time the CLI and the Claude
+    Code shim alternated, which looked exactly like "sending takes forever".
+    """
     return (
         state.protocol == PROTOCOL_VERSION
         and state.api_version == api_version()
         and (not base_url or state.base_url == base_url)
-        and state.session == session
+        and (not session or state.session == session)
     )
 
 
@@ -832,7 +840,13 @@ class WarmSession:
     """Owns one warm :class:`AsyncDirectArenaClient` and serialises prompts."""
 
     def __init__(self, options: Any) -> None:
-        self.options = options
+        #: How many prompts are queued on the lock.  Claude Code sends the next
+        #: request the moment an answer ends, so an archive step must not sit
+        #: between them: it is skipped while somebody is waiting.
+        self._waiting = 0
+        self.options = replace(
+            options, archive_if_idle=lambda: self._waiting <= 1
+        )
         self._client: Any | None = None
         self._lock = asyncio.Lock()
         self._last_error: str | None = None
@@ -862,6 +876,16 @@ class WarmSession:
                 await client.aclose()
 
     async def ask(self, prompt: str, model: str | None = None) -> AsyncIterator[str]:
+        self._waiting += 1
+        try:
+            async for delta in self._ask_locked(prompt, model=model):
+                yield delta
+        finally:
+            self._waiting -= 1
+
+    async def _ask_locked(
+        self, prompt: str, *, model: str | None
+    ) -> AsyncIterator[str]:
         from .exceptions import ArenaError, AuthenticationError, ChallengeRequiredError
 
         async with self._lock:

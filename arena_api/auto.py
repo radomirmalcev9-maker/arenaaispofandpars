@@ -396,6 +396,11 @@ class AutoOptions:
     #: to disable, or a profile name (``"firefox147"``) to force one.
     impersonate: str | None = "auto"
 
+    #: Asked right before the archive step: return ``False`` to skip it because
+    #: somebody is already waiting for the browser (the warm daemon sets this so
+    #: an archive never delays the next prompt of a tool loop).
+    archive_if_idle: Callable[[], bool] | None = None
+
     #: Delete the persistent Chromium profile before the first launch (fixes a
     #: profile a crash or an old build left unusable; session cookies are
     #: re-seeded from your browser anyway).
@@ -3285,11 +3290,19 @@ class DirectVerificationToken:
 
             yield content_type, _iter_chunks()
             state.has_active_conversation = bool(used_composer)
+            archive_allowed = True
+            guard = self.options.archive_if_idle
+            if callable(guard):
+                try:
+                    archive_allowed = bool(guard())
+                except Exception:  # noqa: BLE001 - a guard must never break a request
+                    archive_allowed = True
             if (
                 self.options.archive_after_answer
                 and not follow_up
                 and bool(used_composer)
                 and _is_page_usable(page)
+                and archive_allowed
             ):
                 # The caller consumed the whole answer, so the transcript is
                 # complete: move the chat to the archive now.  Best effort --
@@ -3306,6 +3319,10 @@ class DirectVerificationToken:
                             file=self.options.output,
                         )
                 _latency_mark("archive.done" if archived else "archive.missed")
+            elif self.options.archive_after_answer and not archive_allowed:
+                # Another prompt is already queued: the chat stays in the list
+                # and gets archived with the next request's turn.
+                _latency_mark("archive.skipped")
             if (
                 prefetch_next
                 and keep_alive
