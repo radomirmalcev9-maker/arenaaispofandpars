@@ -59,7 +59,7 @@ class FakeSession:
 class ServerThread:
     """Run a real :class:`warm._WarmServer` in its own event loop."""
 
-    def __init__(self, session: FakeSession, state_file: Path) -> None:
+    def __init__(self, session: Any, state_file: Path) -> None:
         self.session = session
         self.state_file = state_file
         self.token = "t" * 64
@@ -632,6 +632,52 @@ def test_an_unforced_caller_reuses_a_forced_daemon() -> None:
         session="--session=firefox",
     )
     assert warm._compatible(state, base_url="https://arena.ai", session="")
+
+
+def test_capri_archives_each_turn_with_an_already_running_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from arena_api.auto import AutoOptions
+    from arena_api.compat import anthropic_server as shim, capri_server as capri
+
+    # Simulate a daemon originally started by the CLI, where archiving is off.
+    session = warm.WarmSession(AutoOptions(archive_after_answer=False))
+    token = SimpleNamespace(options=session.options)
+    seen: list[bool] = []
+
+    class Client:
+        _verification_token = token
+
+        async def astream(self, prompt: str, **_: Any) -> Any:
+            assert prompt
+            seen.append(token.options.archive_after_answer)
+            yield SimpleNamespace(delta="ok")
+
+        async def aclose(self) -> None:
+            pass
+
+    session._client = Client()
+    with ServerThread(session, tmp_path / "state.json") as daemon:
+        ensured: list[bool] = []
+
+        def ensure(_engine: Any, *, force_refresh: bool = False) -> warm.DaemonState:
+            ensured.append(force_refresh)
+            return daemon.published
+
+        monkeypatch.setattr(shim._WarmEngine, "_ensure_state", ensure)
+        server = capri.create_server(token="a" * 64, port=0)
+        try:
+            assert "".join(server.engine.answer("first")) == "ok"
+            assert token.options.archive_after_answer is False  # daemon default restored
+            assert "".join(server.engine.answer("second")) == "ok"
+            assert token.options.archive_after_answer is False
+            assert seen == [True, True]
+            assert ensured == [False]  # second turn reused the authenticated socket
+        finally:
+            server.server_close()
+            server.engine.close()
 
 
 def test_warm_session_asks_for_an_idle_moment_before_archiving() -> None:
