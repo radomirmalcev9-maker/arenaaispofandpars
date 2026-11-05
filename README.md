@@ -14,6 +14,16 @@
 
 ---
 
+## Capri на Android
+
+Для подключения Capri к Arena через ПК из любой сети подготовлены
+[`Capri-Arena.apk`](Capri-Arena.apk) и Windows-батник
+[`arena-capri.bat`](arena-capri.bat). Пошаговая настройка Tailscale, защита
+сервера и ограничения изменённой APK описаны в
+[`CAPRI-SETUP.md`](CAPRI-SETUP.md).
+
+---
+
 ## Установка
 
 ```bash
