@@ -89,10 +89,50 @@ def test_built_apk_keeps_assets_and_has_an_arena_adapter() -> None:
         dex = app.read("classes.dex")
         for marker in (b"Lapp/capri/ArenaBridge;", b"Invalid Arena pairing string", b"arena+"):
             assert marker in dex
-        for filename in ("assets/strings.json", "lib/arm64-v8a/libcapri.so"):
-            assert hashlib.sha256(source.read(filename)).digest() == hashlib.sha256(app.read(filename)).digest()
+        assert source.read("assets/strings.json") == app.read("assets/strings.json")
+        # Every native library must be byte-for-byte identical to the original.
+        source_libs = {name for name in source.namelist() if name.startswith("lib/") and name.endswith(".so")}
+        app_libs = {name for name in app.namelist() if name.startswith("lib/") and name.endswith(".so")}
+        assert source_libs and source_libs == app_libs
+        for filename in source_libs:
+            assert hashlib.sha256(source.read(filename)).digest() == hashlib.sha256(app.read(filename)).digest(), filename
     # A v2/v3 APK signature block exists; apksigner performs full verification.
     assert b"APK Sig Block 42" in patched.read_bytes()
+
+
+def test_built_apk_local_zip_headers_and_descriptors_match_directory() -> None:
+    """Android checks data descriptors that Python's ZipFile.testzip ignores.
+
+    The previous APK had valid CRCs in the central directory but invalid
+    descriptors for compressed entries, including its native libraries.
+    """
+    patched = ROOT / "Capri-Arena.apk"
+    with zipfile.ZipFile(patched) as app, patched.open("rb") as raw:
+        assert app.testzip() is None
+        for info in app.infolist():
+            raw.seek(info.header_offset)
+            header = raw.read(30)
+            assert len(header) == 30, info.filename
+            signature, _version, flags, method, _time, _date, crc, size, usize, name_len, extra_len = (
+                struct.unpack("<IHHHHHIIIHH", header)
+            )
+            assert signature == 0x04034B50, info.filename
+            assert flags == info.flag_bits and method == info.compress_type, info.filename
+            name = raw.read(name_len).decode("utf-8" if flags & 0x800 else "cp437")
+            assert name == info.orig_filename, info.filename
+            if flags & 0x08:
+                # ZIP data descriptors can optionally start with 0x08074b50.
+                raw.seek(info.header_offset + 30 + name_len + extra_len + info.compress_size)
+                descriptor = raw.read(4)
+                if descriptor == b"PK\x07\x08":
+                    descriptor = raw.read(4)
+                descriptor += raw.read(8)
+                assert len(descriptor) == 12, info.filename
+                assert struct.unpack("<III", descriptor) == (
+                    info.CRC, info.compress_size, info.file_size
+                ), info.filename
+            else:
+                assert (crc, size, usize) == (info.CRC, info.compress_size, info.file_size), info.filename
 
 
 def test_built_apk_stored_entries_are_zip_aligned() -> None:
