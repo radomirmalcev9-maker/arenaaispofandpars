@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .attachments import Attachment
+
 from .auth.captcha import RecaptchaToolkitSolver
 from .auth.firefox_session import FirefoxSessionManager
 from .auth.login import DEFAULT_STATE_PATH
@@ -460,6 +462,7 @@ def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
         if (parsed && typeof parsed === "object") {{
           if (activePatch.modelAId) parsed.modelAId = activePatch.modelAId;
           if (activePatch.generationConfig) parsed.generationConfig = activePatch.generationConfig;
+          if (activePatch.experimental_attachments) parsed.experimental_attachments = activePatch.experimental_attachments;
           const nextInit = Object.assign({{}}, init, {{ body: JSON.stringify(parsed) }});
           return origFetch.call(this, input, nextInit);
         }}
@@ -1443,6 +1446,7 @@ async def _submit_prompt_via_composer(
     fast_submit: bool = False,
     auto_fast_model: bool = False,
     resolved_model_out: list[str] | None = None,
+    attachments: Sequence[Attachment] | None = None,
     mark: Callable[[str], None] | None = None,
 ) -> bool:
     locator_fn = getattr(page, "locator", None)
@@ -1489,6 +1493,10 @@ async def _submit_prompt_via_composer(
         patch_obj["modelAId"] = effective_model_id
     if generation_params:
         patch_obj["generationConfig"] = dict(generation_params)
+    if attachments:
+        patch_obj["experimental_attachments"] = [
+            attachment.to_ai_sdk() for attachment in attachments
+        ]
     if patch_obj:
         await eval_fn(_build_main_frame_body_patch_js(patch_obj))
         try:

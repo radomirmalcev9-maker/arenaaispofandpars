@@ -24,6 +24,8 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .attachments import Attachment
+
     from .auth import (
         BrowserEnvironment,
         BrowserEnvironmentOptions,
@@ -167,6 +169,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DirectChatSession": (".direct", "DirectChatSession"),
     "model_chat_score": (".direct", "model_chat_score"),
     "model_fast_score": (".direct", "model_fast_score"),
+    # .attachments
+    "Attachment": (".attachments", "Attachment"),
+    "ATTACHMENT_MAX_SIZE_BYTES": (".attachments", "ATTACHMENT_MAX_SIZE_BYTES"),
+    "from_base64": (".attachments", "from_base64"),
+    "from_bytes": (".attachments", "from_bytes"),
+    "from_path": (".attachments", "from_path"),
+    "from_url": (".attachments", "from_url"),
     # .exceptions
     "ArenaError": (".exceptions", "ArenaError"),
     "AuthenticationError": (".exceptions", "AuthenticationError"),
@@ -220,6 +229,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 
 _SUBMODULES: frozenset[str] = frozenset(
     {
+        "attachments",
         "auth",
         "auto",
         "client",
@@ -262,6 +272,8 @@ __all__ = [
     "AsyncClient",
     "AsyncDirectArenaClient",
     "AsyncDirectChatSession",
+    "ATTACHMENT_MAX_SIZE_BYTES",
+    "Attachment",
     "AuthenticationError",
     "AutoOptions",
     "AutoSessionManager",
@@ -336,4 +348,8 @@ __all__ = [
     "parse_cookie_header",
     "stop_daemon",
     "warm_enabled",
+    "from_base64",
+    "from_bytes",
+    "from_path",
+    "from_url",
 ]

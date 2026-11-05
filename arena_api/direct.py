@@ -27,6 +27,7 @@ from .constants import (
     DIRECT_PAGE_PATH,
     DIRECT_STREAM_PATH,
 )
+from .attachments import Attachment
 from .exceptions import ModelUnavailableError, ProtocolError, QueueTimeoutError
 from .latency import mark as _latency_mark
 from .auth.firefox_session import SessionManager
@@ -722,6 +723,7 @@ class _DirectMixin:
         token: str,
         conversation_id: str,
         config: GenerationConfig,
+        attachments: Sequence[Attachment] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "id": conversation_id,
@@ -731,7 +733,9 @@ class _DirectMixin:
             "modelAMessageId": uuid7(),
             "userMessage": {
                 "content": prompt,
-                "experimental_attachments": [],
+                "experimental_attachments": [
+                    attachment.to_ai_sdk() for attachment in (attachments or [])
+                ],
                 "metadata": {},
             },
             "modality": "chat",
@@ -935,6 +939,7 @@ class DirectArenaClient(_DirectMixin):
         config: GenerationConfig | None = None,
         conversation_id: str | None = None,
         follow_up: bool = False,
+        attachments: Sequence[Attachment] | None = None,
     ) -> Iterator[StreamChunk]:
         generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
         use_browser = _uses_browser_stream(
@@ -999,7 +1004,12 @@ class DirectArenaClient(_DirectMixin):
                     cached_default_id or "00000000-0000-0000-0000-000000000000"
                 )
                 return self._request_body(
-                    prompt, resolved_id, tok, chat_id, generation
+                    prompt,
+                    resolved_id,
+                    tok,
+                    chat_id,
+                    generation,
+                    attachments,
                 )
 
             runner_kwargs: dict[str, Any] = {}
@@ -1013,6 +1023,7 @@ class DirectArenaClient(_DirectMixin):
                 model_id_override=explicit_model_id,
                 generation_params=generation.model_parameters() or None,
                 follow_up=follow_up,
+                attachments=attachments,
                 **runner_kwargs,
             ) as (content_type, wire_chunks):
                 stream_deadline = time.monotonic() + generation.queue_timeout
@@ -1048,7 +1059,7 @@ class DirectArenaClient(_DirectMixin):
                 initial_token = None
             else:
                 tok = self._token(verification_token)
-            body = self._request_body(prompt, model_id, tok, chat_id, generation)
+            body = self._request_body(prompt, model_id, tok, chat_id, generation, attachments)
             return json.dumps(body, separators=(",", ":"))
 
         with self.transport.stream_request(
@@ -1082,6 +1093,7 @@ class DirectArenaClient(_DirectMixin):
         verification_token: str | None = None,
         config: GenerationConfig | None = None,
         conversation_id: str | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> str:
         return "".join(
             chunk.delta
@@ -1091,6 +1103,7 @@ class DirectArenaClient(_DirectMixin):
                 verification_token=verification_token,
                 config=config,
                 conversation_id=conversation_id,
+                attachments=attachments,
             )
         )
 
@@ -1099,8 +1112,11 @@ class DirectArenaClient(_DirectMixin):
         *,
         model: str | None = None,
         config: GenerationConfig | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> DirectChatSession:
-        return DirectChatSession(self, model=model, config=config)
+        return DirectChatSession(
+            self, model=model, config=config, attachments=attachments
+        )
 
 
 def _copy_messages(history: Sequence[Message] | None) -> list[Message]:
@@ -1121,6 +1137,7 @@ class DirectChatSession:
         model: str | None = None,
         config: GenerationConfig | None = None,
         history: Sequence[Message] | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> None:
         self.client = client
         self.model = model
@@ -1132,10 +1149,18 @@ class DirectChatSession:
             None,
         )
         self.conversation_id: str | None = None
+        self.attachments = list(attachments or [])
 
     def stream_message(
-        self, content: str, *, verification_token: str | None = None
+        self,
+        content: str,
+        *,
+        verification_token: str | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> Iterator[StreamChunk]:
+        effective_attachments = (
+            self.attachments if attachments is None else list(attachments)
+        )
         user = Message("user", content, uuid.uuid4().hex)
         self.history.append(user)
         prior_conversation_id = self.conversation_id
@@ -1150,6 +1175,7 @@ class DirectChatSession:
                 config=self.config,
                 conversation_id=self.conversation_id,
                 follow_up=prior_conversation_id is not None,
+                attachments=effective_attachments,
             ):
                 if chunk.delta:
                     collected.append(chunk.delta)
@@ -1175,12 +1201,18 @@ class DirectChatSession:
                 self.conversation_id = prior_conversation_id
 
     def send_message(
-        self, content: str, *, verification_token: str | None = None
+        self,
+        content: str,
+        *,
+        verification_token: str | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> str:
         return "".join(
             chunk.delta
             for chunk in self.stream_message(
-                content, verification_token=verification_token
+                content,
+                verification_token=verification_token,
+                attachments=attachments,
             )
         )
 
@@ -1290,6 +1322,7 @@ class AsyncDirectArenaClient(_DirectMixin):
         config: GenerationConfig | None = None,
         conversation_id: str | None = None,
         follow_up: bool = False,
+        attachments: Sequence[Attachment] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         generation = config or GenerationConfig(queue_timeout=DEFAULT_QUEUE_TIMEOUT)
         use_browser = _uses_browser_stream(
@@ -1347,7 +1380,12 @@ class AsyncDirectArenaClient(_DirectMixin):
             def _fallback_body(tok: str) -> dict[str, Any]:
                 resolved_id = cached_default_id or "00000000-0000-0000-0000-000000000000"
                 return self._request_body(
-                    prompt, resolved_id, tok, chat_id, generation
+                    prompt,
+                    resolved_id,
+                    tok,
+                    chat_id,
+                    generation,
+                    attachments,
                 )
 
             runner_kwargs: dict[str, Any] = {}
@@ -1361,6 +1399,7 @@ class AsyncDirectArenaClient(_DirectMixin):
                 model_id_override=explicit_model_id,
                 generation_params=generation.model_parameters() or None,
                 follow_up=follow_up,
+                attachments=attachments,
                 **runner_kwargs,
             ) as (content_type, wire_chunks):
                 stream_deadline = time.monotonic() + generation.queue_timeout
@@ -1392,7 +1431,7 @@ class AsyncDirectArenaClient(_DirectMixin):
                 initial_token = None
             else:
                 tok = self._token(verification_token)
-            body = self._request_body(prompt, model_id, tok, chat_id, generation)
+            body = self._request_body(prompt, model_id, tok, chat_id, generation, attachments)
             return json.dumps(body, separators=(",", ":"))
 
         async with self.transport.stream_request(
@@ -1424,6 +1463,7 @@ class AsyncDirectArenaClient(_DirectMixin):
         verification_token: str | None = None,
         config: GenerationConfig | None = None,
         conversation_id: str | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> str:
         return "".join(
             [
@@ -1434,6 +1474,7 @@ class AsyncDirectArenaClient(_DirectMixin):
                     verification_token=verification_token,
                     config=config,
                     conversation_id=conversation_id,
+                    attachments=attachments,
                 )
             ]
         )
@@ -1443,8 +1484,11 @@ class AsyncDirectArenaClient(_DirectMixin):
         *,
         model: str | None = None,
         config: GenerationConfig | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> AsyncDirectChatSession:
-        return AsyncDirectChatSession(self, model=model, config=config)
+        return AsyncDirectChatSession(
+            self, model=model, config=config, attachments=attachments
+        )
 
 
 class AsyncDirectChatSession:
@@ -1457,6 +1501,7 @@ class AsyncDirectChatSession:
         model: str | None = None,
         config: GenerationConfig | None = None,
         history: Sequence[Message] | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> None:
         self.client = client
         self.model = model
@@ -1468,13 +1513,18 @@ class AsyncDirectChatSession:
             None,
         )
         self.conversation_id: str | None = None
+        self.attachments = list(attachments or [])
 
     async def stream_message(
         self,
         content: str,
         *,
         verification_token: str | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> AsyncIterator[StreamChunk]:
+        effective_attachments = (
+            self.attachments if attachments is None else list(attachments)
+        )
         user = Message("user", content, uuid.uuid4().hex)
         self.history.append(user)
         prior_conversation_id = self.conversation_id
@@ -1489,6 +1539,7 @@ class AsyncDirectChatSession:
                 config=self.config,
                 conversation_id=self.conversation_id,
                 follow_up=prior_conversation_id is not None,
+                attachments=effective_attachments,
             ):
                 if chunk.delta:
                     collected.append(chunk.delta)
@@ -1514,7 +1565,11 @@ class AsyncDirectChatSession:
                 self.conversation_id = prior_conversation_id
 
     async def send_message(
-        self, content: str, *, verification_token: str | None = None
+        self,
+        content: str,
+        *,
+        verification_token: str | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> str:
         return "".join(
             [
@@ -1522,6 +1577,7 @@ class AsyncDirectChatSession:
                 async for chunk in self.stream_message(
                     content,
                     verification_token=verification_token,
+                    attachments=attachments,
                 )
             ]
         )

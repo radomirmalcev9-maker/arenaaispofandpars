@@ -518,6 +518,7 @@ set ARENA_CLAUDE_FRESH_PROFILE=1                # то же для arena-claude.
 Все готовые скрипты собраны в каталоге [`examples/`](examples/):
 
 - [`examples/quickstart.py`](examples/quickstart.py) — минимальный запуск Direct Chat с потоковым выводом ответа в консоль;
+- [`examples/attach_photo.py`](examples/attach_photo.py) — прикрепление фото/файла к промпту Direct Chat (attachments= в клиенте, --attach/--image в CLI; до 15 МБ на файл);
 - [`examples/firefox_session.py`](examples/firefox_session.py) — прямое чтение сессии и прокси из профиля Firefox (`FirefoxSessionManager`);
 - [`examples/login_save_cookies.py`](examples/login_save_cookies.py) — разовый вход через браузер с сохранением `./state/cookies.json`;
 - [`examples/captcha_autosolve.py`](examples/captcha_autosolve.py) — автономная демонстрация встроенного решателя reCAPTCHA без `ffmpeg`.
