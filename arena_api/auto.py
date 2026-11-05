@@ -3514,6 +3514,15 @@ class DirectVerificationToken:
                 discard_state = True
             raise
         finally:
+            # The composer patch contains inline image bytes. Keep it through
+            # retries, but do not leave it on a reusable page after this turn.
+            if attachments and page is not None:
+                eval_fn = getattr(page, "evaluate", None)
+                if callable(eval_fn):
+                    try:
+                        await eval_fn("() => { window.__arenaBodyPatch = null; }")
+                    except Exception:  # noqa: BLE001 - the page may already be closed
+                        pass
             if state.stream_queue is async_q:
                 state.stream_queue = None
             if cdp_pump is not None:
@@ -3783,7 +3792,7 @@ class DirectVerificationToken:
                         follow_up=follow_up,
                         user_data_dir=profile_dir,
                         hide_window=hide_live_window,
-                        attachments=attachments,
+                        **({"attachments": attachments} if attachments else {}),
                         prefetch_next=prefetch_next,
                     ) as outcome:
                         stream_yielded = True
@@ -3813,7 +3822,7 @@ class DirectVerificationToken:
                 follow_up=follow_up,
                 user_data_dir=profile_dir,
                 hide_window=False,
-                attachments=attachments,
+                **({"attachments": attachments} if attachments else {}),
                 prefetch_next=prefetch_next,
             ) as outcome:
                 yield outcome
@@ -3833,7 +3842,7 @@ class DirectVerificationToken:
                     generation_params=generation_params,
                     follow_up=follow_up,
                     user_data_dir=profile_dir,
-                    attachments=attachments,
+                    **({"attachments": attachments} if attachments else {}),
                     prefetch_next=prefetch_next,
                 ) as outcome:
                     stream_yielded = True
@@ -3868,7 +3877,7 @@ class DirectVerificationToken:
             generation_params=generation_params,
             follow_up=follow_up,
             user_data_dir=profile_dir,
-            attachments=attachments,
+            **({"attachments": attachments} if attachments else {}),
             prefetch_next=prefetch_next,
         ) as outcome:
             yield outcome
@@ -4889,9 +4898,8 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
         attach_files = (args.attach or []) + (args.image or [])
         attachments: list[Attachment] | None = None
         if attach_files:
-            # The warm daemon path cannot carry file attachments yet, so a
-            # --attach/--image prompt always runs the one-shot Direct Client
-            # directly instead of the background daemon.
+            # The CLI's --attach/--image flow uses the one-shot Direct Client.
+            # The Capri shim has its own capability-checked warm transport.
             attachments = [from_path(item) for item in attach_files]
             warm_code = None
         else:
@@ -4914,7 +4922,7 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
                 direct.stream(
                     args.prompt,
                     model=requested_model,
-                    attachments=attachments,
+                    **({"attachments": attachments} if attachments else {}),
                 )
             )
         return 0

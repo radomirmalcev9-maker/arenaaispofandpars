@@ -451,22 +451,41 @@ def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
     const activePatch = window.__arenaBodyPatch;
     if (
       activePatch &&
-      init &&
-      typeof init.body === "string" &&
       (urlStr.indexOf("/nextjs-api/stream/create-evaluation") !== -1 ||
         urlStr.indexOf("/nextjs-api/stream/post-to-evaluation/") !== -1 ||
         urlStr.indexOf("/nextjs-api/stream/create-chat") !== -1)
     ) {{
+      if (!init || typeof init.body !== "string") {{
+        if (activePatch.experimental_attachments) {{
+          return Promise.reject(new Error("Arena request body cannot carry attachments"));
+        }}
+        return origFetch.apply(this, arguments);
+      }}
       try {{
         const parsed = JSON.parse(init.body);
         if (parsed && typeof parsed === "object") {{
           if (activePatch.modelAId) parsed.modelAId = activePatch.modelAId;
           if (activePatch.generationConfig) parsed.generationConfig = activePatch.generationConfig;
-          if (activePatch.experimental_attachments) parsed.experimental_attachments = activePatch.experimental_attachments;
+          if (activePatch.experimental_attachments) {{
+            // Direct Chat puts attachments on the user message, not on the
+            // request root. Refuse an unexpected body rather than silently
+            // sending a prompt without the requested image.
+            if (!parsed.userMessage || typeof parsed.userMessage !== "object" || Array.isArray(parsed.userMessage)) {{
+              return Promise.reject(new Error("Arena request has no userMessage for attachments"));
+            }}
+            parsed.userMessage.experimental_attachments = activePatch.experimental_attachments;
+          }}
           const nextInit = Object.assign({{}}, init, {{ body: JSON.stringify(parsed) }});
           return origFetch.call(this, input, nextInit);
         }}
-      }} catch (_) {{}}
+        if (activePatch.experimental_attachments) {{
+          return Promise.reject(new Error("Arena request body cannot carry attachments"));
+        }}
+      }} catch (_) {{
+        if (activePatch.experimental_attachments) {{
+          return Promise.reject(new Error("Arena request body cannot carry attachments"));
+        }}
+      }}
     }}
     return origFetch.apply(this, arguments);
   }};

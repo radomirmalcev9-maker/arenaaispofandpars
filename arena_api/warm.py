@@ -50,12 +50,19 @@ from pathlib import Path
 from typing import Any
 
 from . import latency
+from .attachments import Attachment, from_base64
 from .constants import DEFAULT_BASE_URL
 from .exceptions import AuthenticationError
 
 #: Bumped whenever the wire protocol changes; a daemon of another version is
 #: replaced instead of being talked to.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
+
+# A single authenticated JSON line may contain a compressed screenshot.
+# Keep the frame bounded, including base64 and a normal text prompt.
+MAX_FRAME_BYTES = 6_000_000
+MAX_INLINE_ATTACHMENT_BYTES = 3 * 1024 * 1024
+MAX_INLINE_ATTACHMENT_COUNT = 4
 
 DEFAULT_IDLE_TIMEOUT = 900.0
 DEFAULT_START_TIMEOUT = 90.0
@@ -333,7 +340,8 @@ def _read_message(reader: Any, timeout: float) -> dict[str, Any]:
 
 
 def _open(
-    state: DaemonState, *, timeout: float, handshake_timeout: float | None = None
+    state: DaemonState, *, timeout: float, handshake_timeout: float | None = None,
+    require_attachments: bool = False,
 ) -> tuple[socket.socket, Any]:
     handshake = handshake_timeout if handshake_timeout is not None else timeout
     try:
@@ -357,6 +365,11 @@ def _open(
         if reply.get("type") != "hello":
             message = str(reply.get("message") or reply.get("type") or "handshake failed")
             raise WarmDaemonUnavailable(message)
+        capabilities = reply.get("capabilities")
+        if require_attachments and (
+            not isinstance(capabilities, list) or "inline_attachments" not in capabilities
+        ):
+            raise WarmDaemonUnavailable("warm daemon does not support attachments")
         sock.settimeout(timeout)
         return sock, reader
     except BaseException:
@@ -419,13 +432,54 @@ def _ask_payload(
     model: str | None = None,
     config: Mapping[str, Any] | None = None,
     archive: bool | None = None,
+    attachments: Sequence[Attachment] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"op": "ask", "prompt": prompt, "model": model}
     if config:
         payload["config"] = dict(config)
     if archive is not None:
         payload["archive"] = bool(archive)
+    if attachments:
+        payload["attachments"] = [item.to_ai_sdk() for item in attachments]
     return payload
+
+
+def _inline_attachments(value: Any) -> list[Attachment]:
+    """Validate bounded, inline attachment frames without logging their data."""
+    if not isinstance(value, list) or not 0 < len(value) <= MAX_INLINE_ATTACHMENT_COUNT:
+        raise ValueError("invalid attachment list")
+    result: list[Attachment] = []
+    total = 0
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ValueError("invalid attachment")
+        name, mime, url, size = (
+            item.get("name"), item.get("contentType"), item.get("url"), item.get("size")
+        )
+        if not isinstance(name, str) or not name or len(name) > 128:
+            raise ValueError("invalid attachment name")
+        if not isinstance(mime, str) or mime not in {
+            "image/jpeg", "image/png", "image/gif", "image/webp"
+        }:
+            raise ValueError("unsupported attachment type")
+        prefix = f"data:{mime};base64,"
+        if not isinstance(url, str) or not url.startswith(prefix):
+            raise ValueError("attachment must be inline base64")
+        encoded = url[len(prefix):]
+        if len(encoded) > ((MAX_INLINE_ATTACHMENT_BYTES + 2) // 3) * 4:
+            raise ValueError("attachments exceed the request size limit")
+        try:
+            attachment = from_base64(encoded, name, mime)
+        except ValueError as exc:
+            raise ValueError("invalid attachment base64") from exc
+        total += attachment.size
+        if (
+            not attachment.size or total > MAX_INLINE_ATTACHMENT_BYTES
+            or not isinstance(size, int) or isinstance(size, bool) or size != attachment.size
+        ):
+            raise ValueError("invalid attachment size")
+        result.append(attachment)
+    return result
 
 
 def ask_stream(
@@ -435,6 +489,7 @@ def ask_stream(
     model: str | None = None,
     config: Mapping[str, Any] | None = None,
     archive: bool | None = None,
+    attachments: Sequence[Attachment] | None = None,
     timeout: float = DEFAULT_ASK_TIMEOUT,
 ) -> Generator[str, None, None]:
     """Yield answer deltas for ``prompt`` from the warm daemon.
@@ -443,11 +498,14 @@ def ask_stream(
     :class:`WarmDaemonUnavailable` on the first :func:`next` call — before the
     caller has printed anything and can still fall back cleanly.
     """
-    sock, reader = _open(state, timeout=timeout, handshake_timeout=min(timeout, 10.0))
+    sock, reader = _open(
+        state, timeout=timeout, handshake_timeout=min(timeout, 10.0),
+        require_attachments=bool(attachments),
+    )
     finished = False
     anchor = time.perf_counter()
     try:
-        _send(sock, _ask_payload(prompt, model, config, archive=archive))
+        _send(sock, _ask_payload(prompt, model, config, archive=archive, attachments=attachments))
         while True:
             message = _read_message(reader, timeout)
             kind = message.get("type")
@@ -1041,6 +1099,7 @@ class WarmSession:
                 await client.aclose()
 
     _accepts_config: bool = True
+    _accepts_attachments: bool = True
 
     async def ask(
         self,
@@ -1049,11 +1108,12 @@ class WarmSession:
         *,
         config: Mapping[str, Any] | None = None,
         archive: bool | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> AsyncIterator[str]:
         self._waiting += 1
         try:
             async for delta in self._ask_locked(
-                prompt, model=model, config=config, archive=archive
+                prompt, model=model, config=config, archive=archive, attachments=attachments
             ):
                 yield delta
         finally:
@@ -1066,6 +1126,7 @@ class WarmSession:
         model: str | None,
         config: Mapping[str, Any] | None = None,
         archive: bool | None = None,
+        attachments: Sequence[Attachment] | None = None,
     ) -> AsyncIterator[str]:
         from .exceptions import ArenaError, AuthenticationError, ChallengeRequiredError
         from .models import GenerationConfig
@@ -1110,6 +1171,8 @@ class WarmSession:
                     stream_kwargs: dict[str, Any] = {"model": model}
                     if gen_config is not None:
                         stream_kwargs["config"] = gen_config
+                    if attachments:
+                        stream_kwargs["attachments"] = attachments
                     try:
                         with latency.span("warm.ask"):
                             async for chunk in client.astream(prompt, **stream_kwargs):
@@ -1145,7 +1208,7 @@ class WarmSession:
                     self._last_error = None
                     return
                 except (AuthenticationError, ChallengeRequiredError) as exc:
-                    self._last_error = str(exc)
+                    self._last_error = "image request failed" if attachments else str(exc)
                     await self._reset()
                     if attempt:
                         raise
@@ -1212,6 +1275,7 @@ class _WarmServer:
             self.host,
             self.port,
             reuse_address=os.name != "nt",
+            limit=MAX_FRAME_BYTES,
         )
         sockets = self._server.sockets or ()
         if sockets:
@@ -1363,6 +1427,11 @@ class _WarmServer:
                 "protocol": PROTOCOL_VERSION,
                 "version": api_version(),
                 "base_url": self.base_url,
+                "capabilities": (
+                    ["inline_attachments"]
+                    if getattr(self.session, "_accepts_attachments", False)
+                    else []
+                ),
             },
         )
         while True:
@@ -1492,14 +1561,30 @@ class _WarmServer:
         )
         raw_archive = message.get("archive")
         archive_value = raw_archive if isinstance(raw_archive, bool) else None
+        attachments_value: list[Attachment] | None = None
+        if "attachments" in message:
+            if not getattr(self.session, "_accepts_attachments", False):
+                await self._write(writer, {
+                    "type": "error", "kind": "usage", "message": "attachments are not supported"
+                })
+                return True
+            try:
+                attachments_value = _inline_attachments(message["attachments"])
+            except ValueError as exc:
+                await self._write(writer, {
+                    "type": "error", "kind": "usage", "message": str(exc)
+                })
+                return True
         self._active += 1
         extra_ask_kwargs: dict[str, Any] = {}
         if config_value is not None:
             extra_ask_kwargs["config"] = config_value
         if archive_value is not None:
             extra_ask_kwargs["archive"] = archive_value
-        if extra_ask_kwargs and getattr(
-            self.session, "_accepts_config", False
+        if attachments_value:
+            extra_ask_kwargs["attachments"] = attachments_value
+        if extra_ask_kwargs and (
+            getattr(self.session, "_accepts_config", False) or attachments_value
         ):
             stream = self.session.ask(
                 prompt, model_value, **extra_ask_kwargs
@@ -1527,7 +1612,9 @@ class _WarmServer:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:  # noqa: BLE001 - reported to the caller
-            detail = str(exc) or type(exc).__name__
+            # An upstream response may echo its input; do not log or send back
+            # the screenshot bytes if this was an attachment-bearing turn.
+            detail = "image request failed" if attachments_value else (str(exc) or type(exc).__name__)
             kind = error_kind(exc)
             with contextlib.suppress(Exception):
                 await self._write(

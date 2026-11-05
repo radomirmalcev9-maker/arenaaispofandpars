@@ -5,7 +5,7 @@ The original APK has no configurable server URL. This small patch adds an
 Arena provider using the existing Anthropic-compatible wire protocol. It never
 modifies the original APK and refuses to patch an unrecognised build.
 
-Usage: python tools/patch_capri.py /path/to/decoded-apk
+Usage: python tools/patch_capri.py /path/to/decoded-apk [--screenshots]
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def patch_provider_list(source: str) -> str:
     )
 
 
-def patch_cloud(source: str) -> str:
+def patch_cloud(source: str, *, screenshots: bool = False) -> str:
     conn_begin = source.index(".method private final conn(")
     chat_begin = source.index(".method public final chat(", conn_begin)
     connect_begin = source.index(".method public final connect(", chat_begin)
@@ -113,6 +113,23 @@ def patch_cloud(source: str) -> str:
             f"    invoke-static {{{register}}}, Lapp/capri/ArenaBridge;->isAnthropic(Ljava/lang/String;)Z",
             label,
         )
+    if screenshots:
+        chat = _replace_once(
+            chat,
+            """    const-string p4, "messages"
+
+    invoke-virtual {p3, p4, p5}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+
+    .line 212""",
+            """    const-string p4, "messages"
+
+    invoke-virtual {p3, p4, p5}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;
+    # Only Arena's correlated user turn is changed to include an image block.
+    invoke-static {p1, p5}, Lapp/capri/ArenaScreen;->inject(Lapp/capri/Provider;Lorg/json/JSONArray;)V
+
+    .line 212""",
+            "screenshot image blocks",
+        )
     connect = _replace_once(
         connect,
         """    invoke-static {v0, v3}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullParameter(Ljava/lang/Object;Ljava/lang/String;)V
@@ -139,14 +156,17 @@ def patch_cloud(source: str) -> str:
     return head + conn + chat + connect
 
 
-def patch_manifest(source: str) -> str:
-    # A new application ID allows the re-signed build to coexist with the
-    # original. The actual Kotlin/JNI classes keep their original package.
-    source = _replace_once(source, ' package="app.capri"', ' package="app.capri.arena"', "application ID")
-    source = _replace_once(source, 'android:label="Capri" android:largeHeap', 'android:label="Capri Arena" android:largeHeap', "application label")
+def patch_manifest(source: str, *, screenshots: bool = False) -> str:
+    # A new ID allows this independently signed screenshot build to coexist
+    # with both the original app and the previous Capri Arena, without deleting
+    # either app's local data. Kotlin/JNI classes keep their original package.
+    app_id = "app.capri.arena.screen" if screenshots else "app.capri.arena"
+    label = "Capri Arena Screen" if screenshots else "Capri Arena"
+    source = _replace_once(source, ' package="app.capri"', f' package="{app_id}"', "application ID")
+    source = _replace_once(source, 'android:label="Capri" android:largeHeap', f'android:label="{label}" android:largeHeap', "application label")
     # Keep the accessibility service and quick-settings tile distinguishable
     # from the original app when both APKs are installed side by side.
-    source = source.replace('android:label="Capri"', 'android:label="Capri Arena"')
+    source = source.replace('android:label="Capri"', f'android:label="{label}"')
     import re
     source, count = re.subn(r'android:name="\.([A-Za-z0-9_$]+)"', r'android:name="app.capri.\1"', source)
     if count != 11:
@@ -154,7 +174,61 @@ def patch_manifest(source: str) -> str:
     return source
 
 
-def patch(decoded: Path) -> None:
+def patch_screen_code(sources: dict[str, str]) -> dict[str, str]:
+    """Wire screenshot capture into all model-driven phone-control paths."""
+    sources = dict(sources)
+    ui = sources["HandUi.smali"]
+    ui = _replace_once(ui, ".field private post:Z", ".field private post:Z\n\n.field private arenaScreenshot:Z", "screen UI flag")
+    ui += """
+.method public final getArenaScreenshot()Z
+    .locals 1
+    iget-boolean v0, p0, Lapp/capri/HandUi;->arenaScreenshot:Z
+    return v0
+.end method
+
+.method public final setArenaScreenshot(Z)V
+    .locals 0
+    iput-boolean p1, p0, Lapp/capri/HandUi;->arenaScreenshot:Z
+    return-void
+.end method
+"""
+    sources["HandUi.smali"] = ui
+    watch = sources["TypeWatch.smali"]
+    watch += """
+.method public final arenaMarks()Ljava/util/ArrayList;
+    .locals 1
+    iget-object v0, p0, Lapp/capri/TypeWatch;->marks:Ljava/util/ArrayList;
+    return-object v0
+.end method
+"""
+    sources["TypeWatch.smali"] = watch
+    hands = sources["Hands.smali"]
+    begin = hands.index(".method private final look(")
+    end = hands.index(".end method", begin) + len(".end method")
+    method = hands[begin:end]
+    method = _replace_once(method, """    :cond_0
+    sget-object p2, Lapp/capri/App;->INSTANCE:Lapp/capri/App;""", """    :cond_0
+    invoke-virtual {p2}, Lapp/capri/HandUi;->getArenaScreenshot()Z
+    move-result v1
+    if-eqz v1, :arena_original_look
+    invoke-static {v0, p1, p3}, Lapp/capri/ArenaScreen;->schedule(Lapp/capri/TypeWatch;Ljava/lang/String;Lkotlin/jvm/functions/Function1;)V
+    return-void
+
+    :arena_original_look
+    sget-object p2, Lapp/capri/App;->INSTANCE:Lapp/capri/App;""", "screen dispatch")
+    sources["Hands.smali"] = hands[:begin] + method + hands[end:]
+    for filename, ui_reg, model_reg, run in (
+        ("PhoneView.smali", "v1", "v8", "{v0, p3, v1, v2}"),
+        ("TalkBox.smali", "v4", "v2", "{v3, p1, v4, v0}"),
+        ("Solo$run$step$act$1.smali", "v8", "v4", "{v0, p1, v8, v9}"),
+    ):
+        call = f"    invoke-virtual {run}, Lapp/capri/Hands;->run(Lapp/capri/HandCall;Lapp/capri/HandUi;Lkotlin/jvm/functions/Function1;)V"
+        replacement = f"    invoke-static {{{ui_reg}, {model_reg}}}, Lapp/capri/ArenaScreen;->configure(Lapp/capri/HandUi;Lapp/capri/ModelEntry;)V\n\n" + call
+        sources[filename] = _replace_once(sources[filename], call, replacement, f"screen provider in {filename}")
+    return sources
+
+
+def patch(decoded: Path, *, screenshots: bool = False) -> None:
     smali = decoded / "smali" / "app" / "capri"
     brain_path, cloud_path = smali / "BrainKt.smali", smali / "Cloud.smali"
     manifest_path = decoded / "AndroidManifest.xml"
@@ -164,20 +238,40 @@ def patch(decoded: Path) -> None:
     # Prepare every string before writing, so unexpected input cannot leave
     # the decoded tree half-patched.
     brain = patch_provider_list(brain_path.read_text(encoding="utf-8"))
-    cloud = patch_cloud(cloud_path.read_text(encoding="utf-8"))
-    manifest = patch_manifest(manifest_path.read_text(encoding="utf-8"))
+    cloud = patch_cloud(cloud_path.read_text(encoding="utf-8"), screenshots=screenshots)
+    manifest = patch_manifest(manifest_path.read_text(encoding="utf-8"), screenshots=screenshots)
     helper = (Path(__file__).parent / "capri" / "ArenaBridge.smali").read_text(encoding="utf-8")
+    extra: dict[str, str] = {}
+    screen_files: dict[str, str] = {}
+    xml_path = decoded / "res" / "xml" / "typewatch.xml"
+    xml = ""
+    if screenshots:
+        names = ("HandUi.smali", "TypeWatch.smali", "Hands.smali", "PhoneView.smali", "TalkBox.smali", "Solo$run$step$act$1.smali")
+        extra = patch_screen_code({name: (smali / name).read_text(encoding="utf-8") for name in names})
+        xml = _replace_once(xml_path.read_text(encoding="utf-8"),
+                            'android:canRetrieveWindowContent="true"',
+                            'android:canRetrieveWindowContent="true" android:canTakeScreenshot="true"',
+                            "Android screenshot capability")
+        screen_dir = Path(__file__).parent / "capri" / "screen"
+        screen_files = {p.name: p.read_text(encoding="utf-8") for p in screen_dir.glob("ArenaScreen*.smali")}
+        if len(screen_files) != 9 or any((smali / name).exists() for name in screen_files):
+            raise ValueError("Missing or conflicting screenshot helper classes")
     brain_path.write_text(brain, encoding="utf-8", newline="\n")
     cloud_path.write_text(cloud, encoding="utf-8", newline="\n")
     manifest_path.write_text(manifest, encoding="utf-8", newline="\n")
     helper_path.write_text(helper, encoding="utf-8", newline="\n")
+    for name, contents in {**extra, **screen_files}.items():
+        (smali / name).write_text(contents, encoding="utf-8", newline="\n")
+    if screenshots:
+        xml_path.write_text(xml, encoding="utf-8", newline="\n")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("decoded", type=Path, help="directory produced by apktool d")
+    parser.add_argument("--screenshots", action="store_true", help="build the separate screenshot-enabled app")
     args = parser.parse_args()
-    patch(args.decoded)
+    patch(args.decoded, screenshots=args.screenshots)
     print("Capri Arena adapter patched successfully.")
 
 
