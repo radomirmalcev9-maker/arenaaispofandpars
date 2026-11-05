@@ -124,6 +124,112 @@ def test_capri_model_list_and_streaming_protocol(running: Any) -> None:
     assert engine.models == [None]
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [([], True), (["--archive"], True), (["--no-archive"], False)],
+)
+def test_cli_archives_by_default_and_accepts_an_explicit_override(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], expected: bool
+) -> None:
+    seen: list[bool] = []
+    monkeypatch.delenv("ARENA_CAPRI_PORT", raising=False)
+    monkeypatch.delenv("ARENA_CAPRI_HTTPS_PORT", raising=False)
+    monkeypatch.setattr(capri, "run", lambda args: seen.append(args.archive) or 0)
+    assert capri.main(argv) == 0
+    assert seen == [expected]
+
+
+def test_programmatic_server_archives_by_default_and_can_opt_out() -> None:
+    for kwargs, expected in (({}, True), ({"archive": False}, False)):
+        server = capri.create_server(token=TOKEN, port=0, **kwargs)
+        try:
+            assert server.engine.archive is expected
+            assert server.engine._primary._archive is expected
+            assert server.engine._fallback._archive is expected
+        finally:
+            server.server_close()
+            server.engine.close()
+
+
+def test_each_capri_request_asks_reused_warm_connection_to_archive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arena_api import warm
+
+    seen: list[bool] = []
+    opened: list[Any] = []
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            opened.append(self)
+
+        def ask_stream(self, prompt: str, **kwargs: Any) -> Iterator[str]:
+            assert prompt
+            seen.append(kwargs["archive"])
+            yield "Ответ Arena"
+
+        def close(self) -> None:
+            pass
+
+    # Keep ensure_daemon/ask_stream unmodified so the production cached-
+    # connection branch is used; only its transport is replaced.
+    monkeypatch.setattr(warm, "WarmConnection", FakeConnection)
+    server = capri.create_server(token=TOKEN, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for stream in (False, True):
+            payload = json.dumps({
+                "model": "arena-auto", "stream": stream, "max_tokens": 512,
+                "messages": [{"role": "user", "content": "Привет"}],
+            }, ensure_ascii=False).encode()
+            status, body, _ = request(
+                server, "/v1/messages", method="POST",
+                headers={"x-api-key": TOKEN}, data=payload,
+            )
+            assert status == 200
+            assert "Ответ Arena".encode() in body
+        assert len(opened) == 1  # both turns reuse the same warm connection
+        assert seen == [True, True]
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.engine.close()
+        thread.join(timeout=5)
+
+
+def test_http_fallback_also_archives_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_api import auto, warm
+
+    built: list[dict[str, Any]] = []
+
+    class Client:
+        def stream(self, prompt: str, *, model: str | None = None) -> Iterator[Any]:
+            assert prompt
+            yield SimpleNamespace(delta="Ответ резервного движка")
+
+        def close(self) -> None:
+            pass
+
+    def fake_client(**kwargs: Any) -> Client:
+        built.append(kwargs)
+        return Client()
+
+    def unavailable(**_kwargs: Any) -> None:
+        raise RuntimeError("warm daemon unavailable")
+
+    monkeypatch.setattr(warm, "ensure_daemon", unavailable)
+    monkeypatch.setattr(auto, "auto_direct_client", fake_client)
+    server = capri.create_server(token=TOKEN, port=0)
+    try:
+        assert "".join(server.engine.answer("Привет")) == "Ответ резервного движка"
+        assert len(built) == 1
+        assert built[0]["archive_after_answer"] is True
+    finally:
+        server.server_close()
+        server.engine.close()
+
+
 def test_body_limit_rejects_before_reading(running: Any) -> None:
     server, engine = running
     status, body, _ = request(
@@ -213,8 +319,17 @@ def test_wait_for_ready_route_and_early_child_exit(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.parametrize("exit_race", [False, True])
+@pytest.mark.parametrize(
+    ("engine", "archive", "status"),
+    [
+        ("warm", True, "enabled (background)"),
+        ("warm", False, "disabled"),
+        ("echo", True, "not applicable in echo mode"),
+    ],
+)
 def test_cli_starts_foreground_serve_and_always_cleans_up(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exit_race: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: Any,
+    exit_race: bool, engine: str, archive: bool, status: str,
 ) -> None:
     child = SimpleNamespace(ended=False, command=None)
     opened: list[Any] = []
@@ -235,9 +350,14 @@ def test_cli_starts_foreground_serve_and_always_cleans_up(
         if exit_race:
             raise ProcessLookupError("already exited")
 
+    def wait(timeout: float) -> int:
+        if child.ended:
+            return 0
+        raise KeyboardInterrupt()
+
     def fake_popen(command: list[str]) -> Any:
         child.command = command
-        return SimpleNamespace(poll=poll, terminate=terminate, wait=lambda timeout: 0)
+        return SimpleNamespace(poll=poll, terminate=terminate, wait=wait)
 
     monkeypatch.setattr(capri, "find_tailscale", lambda: "tailscale")
     monkeypatch.setattr(
@@ -246,12 +366,14 @@ def test_cli_starts_foreground_serve_and_always_cleans_up(
     )
     monkeypatch.setattr(capri.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(capri, "_wait_for_route", lambda **_kwargs: None)
-    monkeypatch.setattr(capri, "_print_pairing", lambda _pairing: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(capri, "_print_pairing", lambda _pairing: None)
     args = SimpleNamespace(
-        port=0, https_port=8443, key_file=tmp_path / "key", engine="echo", session="auto",
-        model="arena-auto", arena_model=[], archive=False, verbose=False,
+        port=0, https_port=8443, key_file=tmp_path / "key", engine=engine, session="auto",
+        model="arena-auto", arena_model=[], archive=archive, verbose=False,
     )
     assert capri.run(args) == 0
+    assert f"Arena chat archiving: {status}." in capsys.readouterr().out
+    assert opened[0].engine.archive is archive
     assert child.command == ["tailscale", "serve", "--https=8443", "http://127.0.0.1:0"]
     assert child.ended
     assert opened[0].socket.fileno() == -1

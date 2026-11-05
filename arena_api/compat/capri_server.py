@@ -26,6 +26,9 @@ from . import anthropic_server as shim
 
 DEFAULT_PORT = 8082
 DEFAULT_HTTPS_PORT = 8443
+# Capri sends each request as a new Arena conversation; file answered chats
+# away so they do not accumulate in the user's Arena sidebar.
+DEFAULT_ARCHIVE = True
 DEFAULT_KEY_FILE = Path("state/capri-key.txt")
 MAX_BODY_BYTES = 4_000_000
 _PAIR_SECRET = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
@@ -118,7 +121,7 @@ def create_server(
     session: str = "auto",
     default_model: str = shim.DEFAULT_MODEL,
     extra_models: Sequence[str] = (),
-    archive: bool = False,
+    archive: bool = DEFAULT_ARCHIVE,
     verbose: bool = False,
 ) -> shim._Server:
     """Build an authenticated loopback-only server (``engine`` is for tests)."""
@@ -275,7 +278,7 @@ def _print_pairing(pairing: str) -> None:
     print(pairing)
     print("Do not post it or send it to anyone. Messages are sent through your tailnet.\n")
     try:
-        import qrcode  # type: ignore[import-not-found]
+        import qrcode
     except ImportError:
         print("Optional: install qrcode to display a scannable QR in this window.")
     else:
@@ -340,6 +343,11 @@ def run(args: argparse.Namespace) -> int:
         process = subprocess.Popen([executable, "serve", f"--https={args.https_port}", target])
         _wait_for_route(process=process, executable=executable, host=host, https_port=args.https_port, target=target)
         _print_pairing(pairing_string(host, args.https_port, token))
+        if args.engine == "echo":
+            print("Arena chat archiving: not applicable in echo mode.", flush=True)
+        else:
+            archive_status = "enabled (background)" if args.archive else "disabled"
+            print(f"Arena chat archiving: {archive_status}.", flush=True)
         while True:
             try:
                 process.wait(timeout=5)
@@ -379,7 +387,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", default=shim.DEFAULT_MODEL, help="default advertised model (default: arena-auto)")
     parser.add_argument("--arena-model", action="append", default=[], help="advertise another Arena model ID")
     parser.add_argument("--key-file", type=Path, default=DEFAULT_KEY_FILE, help="private pairing key file")
-    parser.add_argument("--archive", action="store_true", help="archive completed Arena chats")
+    archive = parser.add_mutually_exclusive_group()
+    archive.add_argument(
+        "--archive", dest="archive", action="store_true", default=DEFAULT_ARCHIVE,
+        help="archive each completed Arena chat (default)",
+    )
+    archive.add_argument(
+        "--no-archive", dest="archive", action="store_false",
+        help="leave completed Arena chats in the sidebar",
+    )
     parser.add_argument("--verbose", action="store_true", help="log request metadata (not the pairing key)")
     args = parser.parse_args(argv)
     try:
