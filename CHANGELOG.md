@@ -5,6 +5,25 @@
 
 ## Unreleased
 
+### Прикрепление фото и файлов в Direct Chat
+
+- **Новый модуль `arena_api.attachments`** с типом `Attachment` в形те Vercel AI SDK
+  (`name`, `contentType`, `url`, `size`) и строителями `from_path`, `from_bytes`,
+  `from_url`, `from_base64`. Локальный файл читается и отправляется инлайн как
+  `data:` URL — никакого собственного хранилища не требуется (в репозитории нет
+  проверенной конечной точки загрузки Arena, поэтому загрузку на файловое
+  хранилище можно подключить через `from_url` со своей ссылкой).
+- **Лимит 15 МБ на файл** (как во всплывающем окне композитора «Up to 15MB per
+  file»): строители выбрасывают `ValueError` на превышение.
+- **`attachments=` прокинуто через всю цепочку Direct Chat**:
+  `DirectArenaClient.stream/complete/chat`, `AsyncDirectArenaClient.astream/
+  acomplete/chat`, `DirectChatSession`/`AsyncDirectChatSession` (сессионные
+  вложения плюс переопределение на ход), и через `arena_api._direct_page` —
+  в `window.fetch`-патч композитора (`experimental_attachments`), так что
+  фото отправляются и в браузерном режиме `auto.py`.
+- **CLI**: повторяемые `--attach FILE` и `--image FILE` для `arena-api --prompt`
+  (файлы уходят в тот же запрос Direct Chat, что и текст).
+
 ### `arena-claude.bat` архивирует чаты всегда
 
 - **В батнике нет опции «не архивировать»**: он передаёт `--archive` и

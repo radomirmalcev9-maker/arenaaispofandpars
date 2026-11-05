@@ -79,6 +79,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .attachments import Attachment, from_path
+
 from ._direct_page import (
     _AUTH_REJECT_MARKERS,
     _CdpEvalStreamPump,
@@ -2705,6 +2707,7 @@ class DirectVerificationToken:
         user_data_dir: str | Path | None = None,
         hide_window: bool = False,
         prefetch_next: bool = False,
+        attachments: Sequence[Attachment] | None = None,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
         resolved_proxy = self._resolve_proxy()
         window_visible = (not headless) and (not hide_window)
@@ -2955,6 +2958,7 @@ class DirectVerificationToken:
                     install_legacy_tap_flags=not has_network_events,
                     fast_submit=fast_submit,
                     auto_fast_model=False,
+                    attachments=attachments,
                     mark=_latency_mark,
                 )
 
@@ -3063,6 +3067,7 @@ class DirectVerificationToken:
                         fast_submit=fast_submit,
                         auto_fast_model=use_auto_fast_model,
                         resolved_model_out=auto_picked_models,
+                        attachments=attachments,
                         mark=_latency_mark,
                     )
 
@@ -3169,6 +3174,7 @@ class DirectVerificationToken:
                             install_legacy_tap_flags=not has_network_events,
                             fast_submit=fast_submit,
                             auto_fast_model=False,
+                            attachments=attachments,
                             mark=_latency_mark,
                         )
                         continue
@@ -3742,6 +3748,7 @@ class DirectVerificationToken:
         generation_params: Mapping[str, Any] | None = None,
         follow_up: bool = False,
         prefetch_next: bool = False,
+        attachments: Sequence[Attachment] | None = None,
     ) -> AsyncIterator[tuple[str, AsyncIterator[bytes]]]:
         """Mint a fresh v3 assertion and stream ``endpoint_path`` inside the same browser tab.
 
@@ -3776,6 +3783,7 @@ class DirectVerificationToken:
                         follow_up=follow_up,
                         user_data_dir=profile_dir,
                         hide_window=hide_live_window,
+                        attachments=attachments,
                         prefetch_next=prefetch_next,
                     ) as outcome:
                         stream_yielded = True
@@ -3805,6 +3813,7 @@ class DirectVerificationToken:
                 follow_up=follow_up,
                 user_data_dir=profile_dir,
                 hide_window=False,
+                attachments=attachments,
                 prefetch_next=prefetch_next,
             ) as outcome:
                 yield outcome
@@ -3824,6 +3833,7 @@ class DirectVerificationToken:
                     generation_params=generation_params,
                     follow_up=follow_up,
                     user_data_dir=profile_dir,
+                    attachments=attachments,
                     prefetch_next=prefetch_next,
                 ) as outcome:
                     stream_yielded = True
@@ -3858,6 +3868,7 @@ class DirectVerificationToken:
             generation_params=generation_params,
             follow_up=follow_up,
             user_data_dir=profile_dir,
+            attachments=attachments,
             prefetch_next=prefetch_next,
         ) as outcome:
             yield outcome
@@ -3874,6 +3885,7 @@ class DirectVerificationToken:
         generation_params: Mapping[str, Any] | None = None,
         follow_up: bool = False,
         prefetch_next: bool = False,
+        attachments: Sequence[Attachment] | None = None,
     ) -> Iterator[tuple[str, Iterator[bytes]]]:
         """Synchronous streaming bridge over :meth:`astream_evaluation`."""
         sync_q: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -3894,6 +3906,7 @@ class DirectVerificationToken:
                     model_id_override=model_id_override,
                     generation_params=generation_params,
                     follow_up=follow_up,
+                    attachments=attachments,
                     prefetch_next=prefetch_next,
                 ) as (content_type, async_chunks):
                     sync_q.put(("meta", content_type))
@@ -4356,6 +4369,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="fast_model",
         action="store_false",
         help="use Arena's heaviest max model instead of low-latency auto-selection",
+    )
+    parser.add_argument(
+        "--attach",
+        action="append",
+        default=None,
+        metavar="FILE",
+        help=(
+            "attach a local file (image/photo/document) to the --prompt "
+            "message. Repeatable; each file up to 15 MB; sent inline as a "
+            "data: URL in experimental_attachments. Implies --no-warm."
+        ),
+    )
+    parser.add_argument(
+        "--image",
+        action="append",
+        default=None,
+        metavar="FILE",
+        help="alias for --attach (an image/photo file).",
     )
     parser.add_argument("--prompt", default=None, help="send one prompt and print the answer")
     parser.add_argument(
@@ -4855,7 +4886,16 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
             and requested_model.strip().lower() == "auto"
         ):
             requested_model = None
-        warm_code = _run_warm_prompt(args, options, requested_model)
+        attach_files = (args.attach or []) + (args.image or [])
+        attachments: list[Attachment] | None = None
+        if attach_files:
+            # The warm daemon path cannot carry file attachments yet, so a
+            # --attach/--image prompt always runs the one-shot Direct Client
+            # directly instead of the background daemon.
+            attachments = [from_path(item) for item in attach_files]
+            warm_code = None
+        else:
+            warm_code = _run_warm_prompt(args, options, requested_model)
         if warm_code is not None:
             return warm_code
         resolved_vtoken = (
@@ -4871,7 +4911,11 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
             if requested_model is not None:
                 print(f"model             : {requested_model}")
             _stream_to_stdout(
-                direct.stream(args.prompt, model=requested_model)
+                direct.stream(
+                    args.prompt,
+                    model=requested_model,
+                    attachments=attachments,
+                )
             )
         return 0
 
