@@ -145,3 +145,36 @@ def test_built_apk_stored_entries_are_zip_aligned() -> None:
             header = raw.read(30)
             name_len, extra_len = struct.unpack_from("<HH", header, 26)
             assert (info.header_offset + 30 + name_len + extra_len) % 4 == 0, info.filename
+
+
+def test_screenshot_apk_is_separate_signed_and_has_capture_bridge() -> None:
+    apk = ROOT / "Capri-Arena-Screen.apk"
+    with zipfile.ZipFile(apk) as app, zipfile.ZipFile(ROOT / "Capri.apk") as original, apk.open("rb") as raw:
+        assert app.testzip() is None
+        assert "app.capri.arena.screen".encode("utf-16-le") in app.read("AndroidManifest.xml")
+        dex = app.read("classes.dex")
+        for marker in (b"Lapp/capri/ArenaScreen;", b"CAPRI_SCREEN_", b"takeScreenshot", b"image/jpeg"):
+            assert marker in dex
+        for name in original.namelist():
+            if name.startswith("lib/") and name.endswith(".so"):
+                assert hashlib.sha256(original.read(name)).digest() == hashlib.sha256(app.read(name)).digest()
+        for info in app.infolist():
+            raw.seek(info.header_offset)
+            h = raw.read(30)
+            _, _, flags, _, _, _, crc, size, usize, name_len, extra_len = struct.unpack("<IHHHHHIIIHH", h)
+            assert not flags & 8, info.filename
+            assert (crc, size, usize) == (info.CRC, info.compress_size, info.file_size)
+            if info.compress_type == zipfile.ZIP_STORED:
+                assert (info.header_offset + 30 + name_len + extra_len) % 4 == 0
+    assert b"APK Sig Block 42" in apk.read_bytes()
+
+
+def test_screenshot_patch_is_opt_in_and_injects_only_correlated_arena_turns() -> None:
+    source = (ROOT / "tools/capri/screen-src/app/capri/ArenaScreen.java").read_text(encoding="utf-8")
+    assert '"arena".equals(model.getCloud())' in source
+    assert 'if (!"arena".equals(provider.getId())) return' in source
+    assert 'watch.look();' in source  # preserves numbered tap/type targets
+    assert 'watch.takeScreenshot' in source and 'Build.VERSION.SDK_INT < 30' in source
+    assert 'PENDING.remove(marker)' in source and 'TTL_MS' in source
+    assert '.put("type", "image")' in source and '.put("type", "base64")' in source
+    assert 'Screenshot unavailable' in source

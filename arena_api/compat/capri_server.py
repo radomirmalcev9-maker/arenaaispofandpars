@@ -30,7 +30,9 @@ DEFAULT_HTTPS_PORT = 8443
 # away so they do not accumulate in the user's Arena sidebar.
 DEFAULT_ARCHIVE = True
 DEFAULT_KEY_FILE = Path("state/capri-key.txt")
-MAX_BODY_BYTES = 4_000_000
+# 3 MiB of image bytes expand to at most ~4.2 MiB in base64, plus the
+# text transcript and JSON overhead. Requests remain bounded after auth.
+MAX_BODY_BYTES = 6_000_000
 _PAIR_SECRET = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 # Keep this in sync with tools/capri/ArenaBridge.smali. MagicDNS normally has
 # exactly <device>.<tailnet>.ts.net; reject URLs/userinfo/ports here.

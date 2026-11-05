@@ -695,3 +695,36 @@ def test_warm_session_asks_for_an_idle_moment_before_archiving() -> None:
     assert guard() is True
     # The rest of the options are untouched: this is the same session config.
     assert replace(session.options, archive_if_idle=None) == AutoOptions()
+
+
+def test_screenshot_warm_protocol_delivers_bytes_and_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+    from arena_api.auto import AutoOptions
+    from arena_api.attachments import from_bytes
+    session = warm.WarmSession(AutoOptions(archive_after_answer=False))
+    token = SimpleNamespace(options=session.options)
+    seen: list[tuple[Any, ...]] = []
+    class Client:
+        _verification_token = token
+        async def astream(self, prompt: str, **kwargs: Any) -> Any:
+            seen.append((prompt, kwargs.get("attachments"), token.options.archive_after_answer))
+            yield SimpleNamespace(delta="ok")
+        async def aclose(self) -> None:
+            pass
+    async def client() -> Any:
+        return Client()
+    monkeypatch.setattr(session, "_client_or_create", client)
+    with ServerThread(session, tmp_path / "state.json") as thread:
+        image = from_bytes(b"\xff\xd8\xff" + b"screenshot" * 10000, "screen.jpg", "image/jpeg")
+        assert image.size > 65536  # larger than asyncio StreamReader's default frame
+        assert list(warm.ask_stream("look", state=thread.published, attachments=[image], archive=True)) == ["ok"]
+        assert seen == [("look", [image], True)]
+        assert token.options.archive_after_answer is False
+
+
+def test_old_daemon_does_not_silently_drop_screenshot(server: ServerThread) -> None:
+    from arena_api.attachments import from_bytes
+    image = from_bytes(b"\xff\xd8\xff" + b"screenshot", "screen.jpg", "image/jpeg")
+    with pytest.raises(warm.WarmDaemonUnavailable, match="does not support attachments"):
+        list(warm.ask_stream("look", state=server.published, attachments=[image]))
+    assert server.session.prompts == []
