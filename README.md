@@ -16,6 +16,11 @@
 
 ## Capri на Android
 
+Экспериментальный единый APK на основе Dolphy с главной вкладкой Capri:
+[`Dolphy-Capri.apk`](Dolphy-Capri.apk). Установка, разрешения и ограничения
+описаны в [`DOLPHY-CAPRI.md`](DOLPHY-CAPRI.md); на Android-устройстве сборка
+ещё не проверена.
+
 Для подключения Capri к Arena через ПК из любой сети подготовлены
 [`Capri-Arena.apk`](Capri-Arena.apk) и Windows-батник
 [`arena-capri.bat`](arena-capri.bat). Пошаговая настройка Tailscale, защита
