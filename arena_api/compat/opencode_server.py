@@ -115,7 +115,7 @@ class OpenCodeEngine(shim.ArenaEngine):
         except Exception as exc:
             self._close_stream(stream)
             if attachments:
-                raise shim.EngineError(shim._safe_image_error(exc)) from exc
+                raise shim.EngineError("image request failed; check the model and session") from exc
             raise shim.EngineError(str(exc)) from exc
         return stream, first
 
