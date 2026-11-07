@@ -170,3 +170,39 @@ def test_scrolls_virtualized_viewport_until_exact_model_is_mounted(monkeypatch):
     asyncio.run(_select_model_in_picker(page, 'model-123'))
     assert page.steps == 2
     assert ('click', 'option') in page.events
+
+
+def test_confirms_exact_visible_model_label_even_with_extra_button_text():
+    class Matches:
+        def __init__(self, page, text):
+            self.page, self.text = page, text
+        async def count(self):
+            return int(self.page.selected == self.text)
+        def nth(self, index):
+            return self
+        async def is_visible(self):
+            return True
+    class Trigger(Node):
+        async def text_content(self):
+            return self.page.selected + ' New Choose model'
+        def get_by_text(self, text, exact=False):
+            assert exact
+            return Matches(self.page, text)
+    class Page(Picker):
+        def locator(self, selector):
+            return Node(self, 'dialog') if '[role="dialog"]' in selector else Trigger(self, 'trigger')
+    asyncio.run(_select_model_in_picker(Page(), 'model-123'))
+
+
+def test_does_not_confirm_similar_model_name(monkeypatch):
+    async def no_wait(_):
+        pass
+    monkeypatch.setattr('arena_api._direct_page.asyncio.sleep', no_wait)
+    class Trigger(Node):
+        async def text_content(self):
+            return 'gemini-test-high'
+    class Page(Picker):
+        def locator(self, selector):
+            return Node(self, 'dialog') if '[role="dialog"]' in selector else Trigger(self, 'trigger')
+    with pytest.raises(ModelUnavailableError, match='did not confirm'):
+        asyncio.run(_select_model_in_picker(Page(), 'model-123'))

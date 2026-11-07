@@ -53,6 +53,10 @@ from urllib.parse import urlsplit
 
 from ..attachments import Attachment, from_bytes
 from ..constants import DEFAULT_BASE_URL
+from ..exceptions import (
+    AuthenticationError, ChallengeRequiredError, ModelUnavailableError,
+    ProtocolError, QueueTimeoutError, RateLimitError,
+)
 
 #: Port Claude Code's ecosystem expects for a local shim.
 DEFAULT_PORT = 8082
@@ -496,6 +500,36 @@ def build_content_blocks(
 # --------------------------------------------------------------------------- #
 # Request translation
 # --------------------------------------------------------------------------- #
+
+
+def _safe_image_error(exc: BaseException) -> str:
+    """Describe the failure category without echoing an upstream request/body."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    errors: list[BaseException] = []
+    while current is not None and id(current) not in seen:
+        errors.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    for error in errors:
+        if isinstance(error, ModelUnavailableError):
+            return "image request failed: Arena could not select or confirm the requested model"
+        if isinstance(error, ChallengeRequiredError):
+            return "image request failed: Arena requires browser verification"
+        if isinstance(error, AuthenticationError):
+            return "image request failed: Arena rejected the session"
+        if isinstance(error, RateLimitError):
+            return "image request failed: Arena rate limit (HTTP 429)"
+        if isinstance(error, (QueueTimeoutError, TimeoutError)):
+            return "image request failed: Arena request timed out"
+    for error in errors:
+        # Only disclose the numeric status; error details can echo image data.
+        status = re.search(r"\bHTTP ([1-5][0-9]{2})\b", str(error))
+        if status:
+            return f"image request failed: Arena returned HTTP {status.group(1)}"
+    if any(isinstance(error, ProtocolError) for error in errors):
+        return "image request failed: unexpected response from Arena"
+    return "image request failed: unknown upstream error; check the connection and model"
 
 
 class BadRequest(ValueError):
@@ -1075,7 +1109,7 @@ class ArenaEngine:
         if attachments and last_error:
             # An upstream error can echo the request body. Do not propagate
             # screenshot data into logs, SSE or the phone's chat history.
-            raise EngineError("image request failed; check the connection and model") from last_error
+            raise EngineError(_safe_image_error(last_error)) from last_error
         raise EngineError(str(last_error) if last_error else "no engine available")
 
     @staticmethod
@@ -1414,8 +1448,13 @@ class _Handler(BaseHTTPRequestHandler):
         answer_kwargs: dict[str, Any] = {"model": request.arena_model}
         if request.attachments:
             answer_kwargs["attachments"] = request.attachments
-        for delta in self.engine.answer(request.prompt, **answer_kwargs):
-            collected.append(delta)
+        try:
+            for delta in self.engine.answer(request.prompt, **answer_kwargs):
+                collected.append(delta)
+        except Exception as exc:
+            if request.attachments:
+                raise EngineError(_safe_image_error(exc)) from exc
+            raise
         text, stop_sequence = apply_stop_sequences(
             "".join(collected), request.stop_sequences
         )
@@ -1647,8 +1686,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "error": {
                             "type": "api_error",
                             "message": (
-                                "image request failed; check the connection and model"
-                                if request.attachments else str(exc)
+                                _safe_image_error(exc) if request.attachments else str(exc)
                             ),
                         },
                     },
