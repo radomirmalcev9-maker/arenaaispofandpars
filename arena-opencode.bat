@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-rem Run from the project directory. Arena must be signed in and OpenCode installed.
+rem Desktop mode starts the local API; use --cli to launch the CLI instead.
 if /I "%CD%"=="%SystemRoot%\System32" cd /d "%~dp0"
 set "PYTHONPATH=%~dp0;%PYTHONPATH%"
 set "PYTHONUTF8=1"
@@ -63,8 +63,8 @@ set "RESULT=1"
 goto finish
 
 :run
-echo [arena] Starting OpenCode using %PY_EXE% %PY_ARGS%...
-"%PY_EXE%" %PY_ARGS% -m arena_api.compat.opencode_server %*
+echo [arena] Starting the local Arena API using %PY_EXE% %PY_ARGS%...
+"%PY_EXE%" %PY_ARGS% -m arena_api.compat.opencode_server --desktop %*
 set "RESULT=%ERRORLEVEL%"
 
 :finish

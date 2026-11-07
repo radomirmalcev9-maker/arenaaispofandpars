@@ -155,3 +155,30 @@ def test_windows_launcher_has_diagnostics_and_checks_interpreters():
     assert 'set "RESULT=%ERRORLEVEL%"' in script
     assert 'ARENA_OPENCODE_NO_PAUSE' in script
     assert 'pause' in script
+
+
+def test_desktop_starts_server_without_cli_and_writes_file_key_reference(tmp_path, monkeypatch, capsys):
+    key_path = tmp_path / 'state' / 'opencode-key.txt'
+    config_path = tmp_path / 'state' / 'opencode-provider.json'
+    monkeypatch.setattr(oc, 'KEY_PATH', key_path)
+    monkeypatch.setattr(oc, 'CONFIG_PATH', config_path)
+    monkeypatch.setattr(oc.shutil, 'which', lambda *_: pytest.fail('Desktop must not look for CLI'))
+    seen = []
+    class Server:
+        def serve_forever(self, **kwargs):
+            seen.append('served')
+        def server_close(self):
+            seen.append('closed')
+    monkeypatch.setattr(oc, 'create_server', lambda **kwargs: Server())
+    assert oc.main(['--desktop', '--engine', 'echo']) == 0
+    assert seen == ['served', 'closed']
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    assert config['provider']['arena-local']['options']['apiKey'] == '{file:' + key_path.resolve().as_posix() + '}'
+    assert key_path.read_text().strip() not in config_path.read_text()
+    assert 'Keep this window open' in capsys.readouterr().out
+
+
+def test_batch_uses_desktop_by_default_and_cli_is_optional():
+    script = (oc.ROOT / 'arena-opencode.bat').read_text(encoding='ascii')
+    assert '-m arena_api.compat.opencode_server --desktop %*' in script
+    assert '--cli' in script
