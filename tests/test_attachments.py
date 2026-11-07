@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from arena_api import Attachment, DirectArenaClient, GenerationConfig, from_bytes, from_path, from_url
+from arena_api import Attachment, DirectArenaClient, from_bytes, from_path
 
 PNG_HEADER = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
 JPEG_HEADER = b"\xff\xd8\xff" + b"\x00" * 100

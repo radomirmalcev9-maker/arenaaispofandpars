@@ -13,9 +13,8 @@ Vercel AI SDK shape Direct Chat already accepts.
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
-from arena_api import Attachment, DirectArenaClient, GenerationConfig, from_path
+from arena_api import DirectArenaClient, GenerationConfig, from_path
 
 
 def main(argv: list[str]) -> int:

@@ -3868,7 +3868,7 @@ class DirectVerificationToken:
                     generation_params=generation_params,
                     follow_up=follow_up,
                     user_data_dir=profile_dir,
-                    **({"attachments": attachments} if attachments else {}),
+                    **({"attachments": attachments} if attachments else {}),  # type: ignore[arg-type]
                     prefetch_next=prefetch_next,
                 ) as outcome:
                     stream_yielded = True
@@ -3903,7 +3903,7 @@ class DirectVerificationToken:
             generation_params=generation_params,
             follow_up=follow_up,
             user_data_dir=profile_dir,
-            **({"attachments": attachments} if attachments else {}),
+            **({"attachments": attachments} if attachments else {}),  # type: ignore[arg-type]
             prefetch_next=prefetch_next,
         ) as outcome:
             yield outcome
@@ -4961,7 +4961,7 @@ def _run(args: argparse.Namespace, options: AutoOptions) -> int:
                 direct.stream(
                     args.prompt,
                     model=requested_model,
-                    **({"attachments": attachments} if attachments else {}),
+                    **({"attachments": attachments} if attachments else {}),  # type: ignore[arg-type]
                 )
             )
         return 0

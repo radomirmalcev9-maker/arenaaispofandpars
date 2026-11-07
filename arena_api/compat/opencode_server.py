@@ -122,7 +122,7 @@ def create_server(*, token: str, port: int = DEFAULT_PORT, engine: Any = None) -
         raise ValueError("invalid local API key")
     server = shim.create_server(host="127.0.0.1", port=port, engine=engine or OpenCodeEngine(),
                                 default_model="text/auto")
-    server.capri_token = token
+    server.capri_token = token  # type: ignore[attr-defined]
     server.RequestHandlerClass = _CapriHandler
     return server
 
@@ -172,6 +172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.server_only:
             server.serve_forever(poll_interval=0.2)
             return 0
+        assert opencode is not None
         env = os.environ.copy()
         env["ARENA_OPENCODE_API_KEY"] = token
         if env.get("OPENCODE_CONFIG"):
