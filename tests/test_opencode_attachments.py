@@ -400,7 +400,7 @@ def test_browser_upload_uses_page_fetch_for_all_three_storage_steps() -> None:
     })().catch(e => { console.error(e); process.exit(1); });
     """ % script
     result = subprocess.run([node, "-e", harness], check=True, text=True,
-                            capture_output=True, timeout=15)
+                            encoding="utf-8", capture_output=True, timeout=15)
     out = json.loads(result.stdout)
     assert [call["method"] for call in out["calls"]] == ["POST", "PUT", "POST"]
     assert out["result"] == {"url": "https://arena.ai/files/signed/shot.png"}
@@ -444,7 +444,7 @@ def test_request_object_body_is_patched_and_failure_is_visible() -> None:
     }})().catch(e => {{ console.error(e); process.exit(1); }});
     """
     result = subprocess.run([node, "-e", script], check=True, text=True,
-                            capture_output=True, timeout=15)
+                            encoding="utf-8", capture_output=True, timeout=15)
     out = json.loads(result.stdout)
     assert out["bodies"][0]["userMessage"]["experimental_attachments"] == [att]
     assert out["applied"] == 1
@@ -504,5 +504,5 @@ def test_forced_model_patch_rejects_unpatchable_body() -> None:
     }})().catch(e => {{ console.error(e); process.exit(1); }});
     """
     result = subprocess.run([node, "-e", script], check=True, text=True,
-                            capture_output=True, timeout=15)
+                            encoding="utf-8", capture_output=True, timeout=15)
     assert json.loads(result.stdout)["failed"] is True

@@ -720,7 +720,6 @@ def test_claude_shim_streams_immediately_unblocks_code_fences_and_caches_unknown
     try:
         host, port = server.server_address[:2]
         arrival_times: list[tuple[float, str]] = []
-        started = time.perf_counter()
         with httpx.Client(timeout=5.0) as http:
             with http.stream(
                 "POST",
@@ -740,6 +739,10 @@ def test_claude_shim_streams_immediately_unblocks_code_fences_and_caches_unknown
                 },
             ) as resp:
                 assert resp.status_code == 200
+                # Count from the response headers, not from before the TCP/HTTP
+                # handshake: connection setup on a loaded CI runner is not part
+                # of the shim's first-token latency.
+                started = time.perf_counter()
                 for line in resp.iter_lines():
                     if line.startswith("data: "):
                         data = json.loads(line[6:])
@@ -1178,6 +1181,8 @@ def test_v8_composer_hydration_observer_and_react_value_tracker_fallback() -> No
         check=True,
         capture_output=True,
         text=True,
+        # Windows defaults to cp1252 here; Node always writes UTF-8.
+        encoding="utf-8",
         timeout=10,
     )
     out = json.loads(proc.stdout.strip())

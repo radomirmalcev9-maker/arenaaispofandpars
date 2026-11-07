@@ -5440,6 +5440,9 @@ def test_cli_prompt_on_arena_ai_skips_gradio_config_probes(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ARENA_COOKIE", "arena-auth-prod-v1.0=jwt")
     monkeypatch.delenv("ARENA_VERIFICATION_TOKEN", raising=False)
+    # Only the one-shot client is mocked. A warm daemon would spawn a real
+    # browser in a child process and time out on slow/Windows runners.
+    monkeypatch.setenv("ARENA_WARM", "0")
 
     probe_calls: list[str] = []
     real_probe = auto_module.probe
@@ -5809,7 +5812,11 @@ def test_stale_profile_locks_are_removed(tmp_path) -> None:
     profile.mkdir()
     dead = 999_999_999  # certainly not a live pid
     (profile / "SingletonLock").write_text(f"DESKTOP-ABC-{dead}", encoding="utf-8")
-    (profile / "SingletonCookie").write_text("123", encoding="utf-8")
+    # A bare number like 123 can be a *live* pid on macOS/Windows CI, which
+    # would correctly keep the lock. Use a dead owner for both lock files.
+    (profile / "SingletonCookie").write_text(
+        f"DESKTOP-ABC-{dead}", encoding="utf-8"
+    )
     removed = browser_module.heal_profile_locks(profile)
     assert "SingletonLock" in removed
     assert "SingletonCookie" in removed
