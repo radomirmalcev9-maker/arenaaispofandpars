@@ -1503,7 +1503,32 @@ async def _select_model_in_picker(
             option = dialog.locator('[role="option"]:has(span:text-is("Max"))').first
         else:
             option = dialog.locator('[role="option"][data-value=' + json.dumps(model_id) + ']').first
-        await _call_locator_fast(option.wait_for, state="visible", timeout_ms=5000)
+        try:
+            await _call_locator_fast(option.wait_for, state="visible", timeout_ms=1500)
+        except Exception as first_error:
+            # Virtualized lists do not mount off-screen options, so Playwright's
+            # scroll_into_view_if_needed cannot reach them until we scroll the
+            # viewport itself. Search from top to bottom, bounded by its height.
+            viewport = dialog.locator('[data-radix-scroll-area-viewport], [role="listbox"]').first
+            found = False
+            try:
+                await viewport.evaluate("el => { el.scrollTop = 0; }")
+                for _ in range(100):
+                    await asyncio.sleep(0.05)
+                    if await option.count() and await option.is_visible():
+                        found = True
+                        break
+                    moved = await viewport.evaluate("""el => {
+                        const before = el.scrollTop;
+                        el.scrollTop += Math.max(100, el.clientHeight * 0.8);
+                        return el.scrollTop > before;
+                    }""")
+                    if not moved:
+                        break
+            except Exception:  # noqa: BLE001 - report original selection failure
+                pass
+            if not found:
+                raise first_error
         if await option.get_attribute("aria-disabled") == "true" or await option.get_attribute("data-disabled") == "true":
             raise ModelUnavailableError(f"Model {model_id or 'Max'!r} is unavailable in the picker.")
         name = (await option.locator('span.font-mono').first.text_content() or "").strip()

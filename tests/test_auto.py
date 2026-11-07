@@ -6054,24 +6054,20 @@ def test_a_chat_taken_over_by_the_next_prompt_is_not_lost(monkeypatch) -> None:
     asyncio.run(run())
 
 
-def test_the_debt_list_is_capped() -> None:
-    state = auto_module._WarmBrowserState(
-        environment=None,
-        page=None,
-        win_cloaker=None,
-        ua_cdp_session=None,
-        cdp_pump=None,
-        selected_channel=None,
-        headless=True,
-        hide_window=True,
-        user_data_dir=None,
-        loop=None,
-    )
-    for index in range(40):
-        state.pending_archive_ids.append(f"chat-{index}")
-        del state.pending_archive_ids[:-16]
-    assert len(state.pending_archive_ids) == 16
-    assert state.pending_archive_ids[-1] == "chat-39"
+def test_archive_queue_does_not_discard_more_than_sixteen_chats(monkeypatch) -> None:
+    async def fails(page: Any, **_: Any) -> bool:
+        return False
+    monkeypatch.setattr(auto_module, "archive_conversation", fails)
+    client = _housekeeping_client()
+    async def run() -> None:
+        state = _state(_HousekeepingPage())
+        state.pending_archive_ids = [f"chat-{i}" for i in range(40)]
+        client._schedule_post_turn_housekeeping(
+            state, state.page, None, should_archive=False, should_prefetch=False
+        )
+        await state.housekeeping_task
+        assert state.pending_archive_ids == [f"chat-{i}" for i in range(40)]
+    asyncio.run(run())
 
 
 def test_launcher_respects_archive_environment() -> None:
@@ -6167,3 +6163,50 @@ def test_composer_passes_category_to_model_picker(monkeypatch) -> None:
         has_submitted=lambda: events['submitted'] == 1,
     ))
     assert selected == [('model-123', 'code')]
+
+
+def test_archive_chat_id_is_not_a_model_or_message_id():
+    model = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    message = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    chat = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    body = json.dumps({'modelAId': model, 'userMessage': {'id': message}, 'id': chat})
+    assert auto_module._conversation_id_from(body, '/c/' + chat) == chat
+    assert auto_module._conversation_id_from(json.dumps({'modelAId': model}), '/c/' + chat) == chat
+    assert auto_module._conversation_id_from(json.dumps({'modelAId': model})) is None
+
+
+def test_archive_cancellation_preserves_inflight_and_remaining_ids(monkeypatch):
+    started = asyncio.Event()
+    async def slow_archive(page, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+        return True
+    monkeypatch.setattr(auto_module, 'archive_conversation', slow_archive)
+    client = _housekeeping_client()
+    async def run():
+        state = _state(_HousekeepingPage())
+        state.pending_archive_ids = ['first', 'second']
+        client._schedule_post_turn_housekeeping(state, state.page, None, should_archive=True,
+                                               should_prefetch=False, conversation_id='third')
+        task = state.housekeeping_task
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert state.pending_archive_ids == ['first', 'second', 'third']
+    asyncio.run(run())
+
+
+def test_archive_cancelled_before_start_keeps_queued_ids():
+    client = _housekeeping_client()
+    async def run():
+        state = _state(_HousekeepingPage())
+        state.pending_archive_ids = ['first']
+        client._schedule_post_turn_housekeeping(state, state.page, None, should_archive=True,
+                                               should_prefetch=True, conversation_id='second')
+        task = state.prefetch_task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert state.pending_archive_ids == ['first', 'second']
+    asyncio.run(run())
