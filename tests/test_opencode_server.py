@@ -145,3 +145,13 @@ def test_text_request_forwards_image_bytes_and_conversation():
         server.shutdown()
         server.server_close()
         t.join()
+
+
+def test_windows_launcher_has_diagnostics_and_checks_interpreters():
+    script = (oc.ROOT / 'arena-opencode.bat').read_text(encoding='ascii')
+    assert '.venv\\Scripts\\python.exe' in script
+    assert 'py -3 -c "import arena_api.compat.opencode_server"' in script
+    assert 'python -c "import arena_api.compat.opencode_server"' in script
+    assert 'set "RESULT=%ERRORLEVEL%"' in script
+    assert 'ARENA_OPENCODE_NO_PAUSE' in script
+    assert 'pause' in script
