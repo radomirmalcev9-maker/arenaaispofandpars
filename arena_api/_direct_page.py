@@ -1539,19 +1539,8 @@ async def _select_model_in_picker(
         # The dialog closing alone is not proof that the model was selected.
         await _call_locator_fast(dialog.wait_for, state="hidden", timeout_ms=5000)
         for _ in range(50):
-            # text_content() includes hidden accessibility labels and badges,
-            # so the button's concatenated text need not equal the model name.
-            # Accept an *exact visible descendant*, never a substring (which
-            # could confuse a model with a similarly named variant).
-            get_by_text = getattr(trigger, "get_by_text", None)
-            if callable(get_by_text):
-                matches = get_by_text(name, exact=True)
-                for index in range(min(await matches.count(), 20)):
-                    if await matches.nth(index).is_visible():
-                        return
-            inner_text = getattr(trigger, "inner_text", None)
-            selected = (await inner_text() if callable(inner_text) else await trigger.text_content()) or ""
-            if " ".join(selected.split()).casefold() == " ".join(name.split()).casefold():
+            selected = (await trigger.text_content() or "").strip()
+            if selected.casefold() == name.casefold():
                 return
             await asyncio.sleep(0.1)
         raise ModelUnavailableError(f"Arena did not confirm selection of model {name!r}.")
