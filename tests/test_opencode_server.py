@@ -182,3 +182,68 @@ def test_batch_uses_desktop_by_default_and_cli_is_optional():
     script = (oc.ROOT / 'arena-opencode.bat').read_text(encoding='ascii')
     assert '-m arena_api.compat.opencode_server --desktop %*' in script
     assert '--cli' in script
+
+
+def test_desktop_config_exposes_images_for_auto_and_unknown_but_not_explicit_no():
+    unknown = ModelInfo(ID, 'Unknown', metadata={'capabilities': {'inputCapabilities': {'text': True}}})
+    no_image_id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    no_image = ModelInfo(no_image_id, 'Text only', metadata={'capabilities': {
+        'inputCapabilities': {'text': True, 'image': False}, 'outputCapabilities': {'text': True}
+    }})
+    entries = oc.model_entries([unknown, no_image])
+    assert entries['text/auto']['attachment'] is True
+    assert entries['text/' + ID]['modalities']['input'] == ['text', 'image']
+    assert 'attachment' not in entries['text/' + no_image_id]
+
+
+def test_opencode_engine_selects_text_filter_and_does_not_force_fast_auto():
+    engine = oc.OpenCodeEngine(engine='http')
+    assert engine._primary._text_picker_for_explicit is True
+    assert engine._primary._fast_model is False
+    engine.close()
+
+
+def test_image_error_reports_model_selection_without_exposing_payload():
+    import base64
+    from arena_api.exceptions import ModelUnavailableError
+    class Engine:
+        engine = 'fake'
+        tools_mode = 'emulate'
+        def answer(self, prompt, **kwargs):
+            raise ModelUnavailableError('secret-image-data')
+            yield ''
+        def close(self):
+            pass
+    server = oc.create_server(token=KEY, port=0, engine=Engine())
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        data = base64.b64encode(b'\x89PNG\r\n\x1a\nexample').decode()
+        for streaming in (False, True):
+            payload = {'model': 'text/' + ID, 'max_tokens': 1000, 'stream': streaming,
+                       'messages': [{'role': 'user', 'content': [
+                           {'type': 'text', 'text': 'describe'},
+                           {'type': 'image', 'source': {'type': 'base64',
+                            'media_type': 'image/png', 'data': data}}]}]}
+            request = urllib.request.Request(
+                f'http://127.0.0.1:{server.server_address[1]}/v1/messages',
+                data=json.dumps(payload).encode(),
+                headers={'content-type': 'application/json', 'x-api-key': KEY})
+            try:
+                with urllib.request.urlopen(request) as response:
+                    wire = response.read().decode()
+            except urllib.error.HTTPError as error:
+                wire = error.read().decode()
+            assert 'could not select or confirm' in wire
+            assert 'secret-image-data' not in wire and data not in wire
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join()
+
+
+def test_image_error_status_never_leaks_upstream_response():
+    from arena_api.exceptions import ArenaError
+    error = ArenaError('Arena returned HTTP 400: secret-image-data')
+    assert shim._safe_image_error(error) == 'image request failed: Arena returned HTTP 400'
+    assert 'secret-image-data' not in shim._safe_image_error(RuntimeError('secret-image-data'))

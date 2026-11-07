@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -19,7 +22,7 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from .attachments import Attachment
 from .exceptions import ModelUnavailableError
@@ -433,7 +436,270 @@ async () => {{
 """
 
 
-_CLEAR_MAIN_FRAME_BODY_PATCH_JS = "() => { window.__arenaBodyPatch = null; }"
+_CLEAR_MAIN_FRAME_BODY_PATCH_JS = (
+    "() => { window.__arenaBodyPatch = null; window.__arenaBodyPatchApplied = 0; "
+    "window.__arenaBodyPatchError = ''; }"
+)
+
+# Arena's own composer uploads a file before submitting a message.  Inline
+# ``data:`` URLs are an AI SDK client-side convention; the backend only ever
+# sees a signed https URL in ``userMessage.experimental_attachments``.  Doing
+# the same three steps here (generate URL -> PUT -> signed URL) is what makes
+# attached photos work with the real site, without guessing a storage schema.
+_STORAGE_UPLOAD_PATH = "/api/storage/generate-upload-url"
+_STORAGE_SIGNED_PATH = "/api/storage/get-signed-url"
+
+
+def _inline_attachment_bytes(attachment: Any) -> bytes | None:
+    """Decode an inline ``data:`` attachment, or return ``None`` for a URL."""
+    url = getattr(attachment, "url", "") or ""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    header, separator, payload = url.partition(",")
+    if not separator or ";base64" not in header.casefold():
+        return None
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Playwright's APIRequestContext is sync in some harnesses, async in others."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _absolute_page_url(page: Any, url: str) -> str:
+    if url.startswith(("http://", "https://")):
+        return url
+    base = str(getattr(page, "url", "") or "")
+    if not base:
+        return url
+    parsed = urlparse(base)
+    origin = (
+        f"{parsed.scheme}://{parsed.netloc}"
+        if parsed.scheme and parsed.netloc
+        else base
+    )
+    # Storage paths are origin-relative, not relative to /text/direct.
+    if url.startswith("/"):
+        return origin + url
+    return urljoin(origin + "/", url)
+
+
+#: Signed URLs expire; do not keep reusing one for the whole browser session.
+_UPLOAD_CACHE_TTL_SECONDS = 300.0
+
+
+async def _arena_storage_json(
+    api: Any, url: str, payload: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    response = await _maybe_await(api.post(url, data=dict(payload)))
+    if getattr(response, "ok", None) is not True:
+        raise RuntimeError(
+            f"Arena storage returned HTTP {getattr(response, 'status', '?')}"
+        )
+    value = await _maybe_await(response.json())
+    if not isinstance(value, Mapping):
+        raise RuntimeError("Arena storage returned an unexpected reply")
+    return value
+
+
+def _browser_upload_js(attachment: Any, raw: bytes) -> str:
+    """Upload through the page's own fetch (browser TLS, cookies and CORS)."""
+    payload = json.dumps(
+        {
+            "name": str(getattr(attachment, "name", "") or "attachment"),
+            "contentType": str(
+                getattr(attachment, "content_type", "") or "application/octet-stream"
+            ),
+            "base64": base64.b64encode(raw).decode("ascii"),
+        },
+        separators=(",", ":"),
+    )
+    return f"""
+async () => {{
+  const item = {payload};
+  const postJson = async (path, body) => {{
+    try {{
+      const resp = await fetch(path, {{
+        method: "POST", credentials: "include",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(body)
+      }});
+      if (!resp.ok) return {{ error: "HTTP " + resp.status }};
+      return {{ data: await resp.json() }};
+    }} catch (err) {{ return {{ error: "storage request failed" }}; }}
+  }};
+  const generated = await postJson("/api/storage/generate-upload-url", {{
+    fileName: item.name, contentType: item.contentType
+  }});
+  if (generated.error) return generated;
+  const info = generated.data || {{}};
+  const uploadUrl = info.uploadUrl || info.url;
+  const key = info.key || info.path || info.fileKey;
+  if (!uploadUrl || !key) return {{ error: "Arena did not return an upload URL" }};
+  let bytes;
+  try {{
+    const binary = atob(item.base64);
+    bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  }} catch (err) {{ return {{ error: "invalid attachment data" }}; }}
+  try {{
+    const put = await fetch(uploadUrl, {{
+      method: "PUT", credentials: "same-origin",
+      headers: {{ "Content-Type": item.contentType }},
+      body: bytes
+    }});
+    if (!put.ok) return {{ error: "Attachment upload returned HTTP " + put.status }};
+  }} catch (err) {{ return {{ error: "attachment upload was blocked" }}; }}
+  const signed = await postJson("/api/storage/get-signed-url", {{
+    key: String(key).replace(/^\\/+/, "")
+  }});
+  if (signed.error) return signed;
+  const result = signed.data || {{}};
+  const url = result.url || result.signedUrl;
+  if (!url || !/^https?:\\/\\//.test(url)) {{
+    return {{ error: "Arena did not return a file URL" }};
+  }}
+  return {{ url: url }};
+}}
+""".strip()
+
+
+async def _upload_inline_attachment(
+    page: Any, attachment: Any, raw: bytes
+) -> dict[str, Any] | None:
+    """Upload one inline attachment through Arena's storage flow.
+
+    The page's own ``fetch`` is preferred (same TLS fingerprint and cookies as
+    the chat request). Playwright's API request context is the fallback when a
+    cross-origin PUT is blocked by CORS. Returns the hosted attachment dict, or
+    ``None`` when neither path is available: the inline data URL then remains a
+    last resort, never a text-only prompt.
+    """
+    name = str(getattr(attachment, "name", "") or "attachment")
+    content_type = str(
+        getattr(attachment, "content_type", "") or "application/octet-stream"
+    )
+    eval_fn = getattr(page, "evaluate", None)
+    if callable(eval_fn):
+        try:
+            outcome = await _maybe_await(eval_fn(_browser_upload_js(attachment, raw)))
+        except Exception:  # noqa: BLE001 - try the API request context next
+            outcome = None
+        if isinstance(outcome, Mapping):
+            url = outcome.get("url")
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                return {
+                    "name": name,
+                    "contentType": content_type,
+                    "url": url,
+                    "size": len(raw),
+                }
+    api = getattr(page, "request", None)
+    if api is None or not callable(getattr(api, "post", None)):
+        return None
+    generated = await _arena_storage_json(
+        api,
+        _absolute_page_url(page, _STORAGE_UPLOAD_PATH),
+        {"fileName": name, "contentType": content_type},
+    )
+    upload_url = generated.get("uploadUrl") or generated.get("url")
+    key = generated.get("key") or generated.get("path") or generated.get("fileKey")
+    if not isinstance(upload_url, str) or not upload_url or not key:
+        raise RuntimeError("Arena did not return an upload URL")
+    uploaded = await _maybe_await(
+        api.put(
+            _absolute_page_url(page, upload_url),
+            data=raw,
+            headers={"Content-Type": content_type},
+        )
+    )
+    if getattr(uploaded, "ok", None) is not True:
+        raise RuntimeError(
+            f"Attachment upload returned HTTP {getattr(uploaded, 'status', '?')}"
+        )
+    signed = await _arena_storage_json(
+        api,
+        _absolute_page_url(page, _STORAGE_SIGNED_PATH),
+        {"key": str(key).lstrip("/")},
+    )
+    url = signed.get("url") or signed.get("signedUrl")
+    if isinstance(url, str) and url.startswith("/"):
+        url = _absolute_page_url(page, url)
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise RuntimeError("Arena did not return a file URL")
+    return {
+        "name": name,
+        "contentType": content_type,
+        "url": url,
+        "size": len(raw),
+    }
+
+
+def _attachment_as_dict(attachment: Any) -> dict[str, Any]:
+    if isinstance(attachment, Mapping):
+        return dict(attachment)
+    to_ai_sdk = getattr(attachment, "to_ai_sdk", None)
+    if callable(to_ai_sdk):
+        result = to_ai_sdk()
+        return dict(result) if isinstance(result, Mapping) else {}
+    return {}
+
+
+async def _prepare_arena_attachments(
+    page: Any,
+    attachments: Sequence[Attachment] | None,
+    *,
+    mark: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Turn caller attachments into the exact wire objects Arena expects."""
+    prepared: list[dict[str, Any]] = []
+    cache: dict[str, dict[str, Any]] = dict(
+        getattr(page, "_arena_upload_cache", {}) or {}
+    )
+    cached_at: dict[str, float] = dict(
+        getattr(page, "_arena_upload_cache_times", {}) or {}
+    )
+    now = time.monotonic()
+    for attachment in attachments or ():
+        raw = _inline_attachment_bytes(attachment)
+        if raw is None:
+            prepared.append(_attachment_as_dict(attachment))
+            continue
+        digest = hashlib.sha256(raw).hexdigest()
+        hosted = (
+            cache.get(digest)
+            if now - cached_at.get(digest, -_UPLOAD_CACHE_TTL_SECONDS)
+            < _UPLOAD_CACHE_TTL_SECONDS
+            else None
+        )
+        if hosted is None:
+            try:
+                hosted = await _upload_inline_attachment(page, attachment, raw)
+            except Exception:  # noqa: BLE001 - inline data URL remains a fallback
+                hosted = None
+            if hosted is not None:
+                cache[digest] = hosted
+                cached_at[digest] = now
+        if hosted is None:
+            prepared.append(_attachment_as_dict(attachment))
+        else:
+            prepared.append(dict(hosted))
+    try:
+        setattr(page, "_arena_upload_cache", cache)
+        setattr(page, "_arena_upload_cache_times", cached_at)
+    except Exception:  # noqa: BLE001 - cache is an optimization only
+        pass
+    if mark is not None:
+        try:
+            mark("attachments.ready")
+        except Exception:  # noqa: BLE001
+            pass
+    return prepared
 
 
 def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
@@ -441,54 +707,82 @@ def _build_main_frame_body_patch_js(patch_obj: Mapping[str, Any]) -> str:
     return f"""
 () => {{
   window.__arenaBodyPatch = {patch_literal};
+  window.__arenaBodyPatchApplied = 0;
+  window.__arenaBodyPatchError = "";
   const origFetch = window.fetch;
   if (typeof origFetch !== "function" || window.__arenaPatchInstalled) return;
   window.__arenaPatchInstalled = true;
+  const isEvalUrl = (url) =>
+    url.indexOf("/nextjs-api/stream/create-evaluation") !== -1 ||
+    url.indexOf("/nextjs-api/stream/post-to-evaluation/") !== -1 ||
+    url.indexOf("/nextjs-api/stream/create-chat") !== -1;
+  const hasAttachments = (p) =>
+    Boolean(p && p.experimental_attachments && p.experimental_attachments.length);
+  const mustKeep = (p) => Boolean(p && (p.requirePatch || hasAttachments(p)));
+  const needsBody = (p) =>
+    Boolean(p && (p.modelAId || p.generationConfig || hasAttachments(p)));
+  const fail = (reason) => {{
+    window.__arenaBodyPatchError = String(reason);
+    return Promise.reject(new Error(String(reason)));
+  }};
+  const patchBodyText = (body, p) => {{
+    let parsed;
+    try {{ parsed = JSON.parse(body); }} catch (_) {{
+      throw new Error("Arena request body cannot carry attachments");
+    }}
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {{
+      throw new Error("Arena request body cannot carry attachments");
+    }}
+    if (p.modelAId) parsed.modelAId = p.modelAId;
+    if (p.generationConfig) parsed.generationConfig = p.generationConfig;
+    if (hasAttachments(p)) {{
+      // Direct Chat puts attachments on the user message, not on the request
+      // root. Refuse an unexpected body rather than silently sending a prompt
+      // without the requested image.
+      if (!parsed.userMessage || typeof parsed.userMessage !== "object" || Array.isArray(parsed.userMessage)) {{
+        throw new Error("Arena request has no userMessage for attachments");
+      }}
+      parsed.userMessage.experimental_attachments = p.experimental_attachments;
+    }}
+    return JSON.stringify(parsed);
+  }};
   window.fetch = function (input, init) {{
     let urlStr = "";
     try {{
       urlStr = typeof input === "string" ? input : (input && input.url) || "";
     }} catch (_) {{}}
     const activePatch = window.__arenaBodyPatch;
-    if (
-      activePatch &&
-      (urlStr.indexOf("/nextjs-api/stream/create-evaluation") !== -1 ||
-        urlStr.indexOf("/nextjs-api/stream/post-to-evaluation/") !== -1 ||
-        urlStr.indexOf("/nextjs-api/stream/create-chat") !== -1)
-    ) {{
-      if (!init || typeof init.body !== "string") {{
-        if (activePatch.experimental_attachments) {{
-          return Promise.reject(new Error("Arena request body cannot carry attachments"));
-        }}
-        return origFetch.apply(this, arguments);
-      }}
-      try {{
-        const parsed = JSON.parse(init.body);
-        if (parsed && typeof parsed === "object") {{
-          if (activePatch.modelAId) parsed.modelAId = activePatch.modelAId;
-          if (activePatch.generationConfig) parsed.generationConfig = activePatch.generationConfig;
-          if (activePatch.experimental_attachments) {{
-            // Direct Chat puts attachments on the user message, not on the
-            // request root. Refuse an unexpected body rather than silently
-            // sending a prompt without the requested image.
-            if (!parsed.userMessage || typeof parsed.userMessage !== "object" || Array.isArray(parsed.userMessage)) {{
-              return Promise.reject(new Error("Arena request has no userMessage for attachments"));
-            }}
-            parsed.userMessage.experimental_attachments = activePatch.experimental_attachments;
-          }}
-          const nextInit = Object.assign({{}}, init, {{ body: JSON.stringify(parsed) }});
-          return origFetch.call(this, input, nextInit);
-        }}
-        if (activePatch.experimental_attachments) {{
-          return Promise.reject(new Error("Arena request body cannot carry attachments"));
-        }}
-      }} catch (_) {{
-        if (activePatch.experimental_attachments) {{
-          return Promise.reject(new Error("Arena request body cannot carry attachments"));
-        }}
-      }}
+    if (!activePatch || !isEvalUrl(urlStr) || !needsBody(activePatch)) {{
+      return origFetch.apply(this, arguments);
     }}
-    return origFetch.apply(this, arguments);
+    const cannotPatch = (reason, args) => {{
+      if (mustKeep(activePatch)) return fail(reason);
+      return origFetch.apply(this, args);
+    }};
+    // Next.js may pass a Request object instead of (url, init). Its body is a
+    // stream, so read a clone before rebuilding the request asynchronously.
+    if (
+      (!init || typeof init.body !== "string") &&
+      input && typeof input.clone === "function" &&
+      typeof Request !== "undefined" && input instanceof Request
+    ) {{
+      return input.clone().text().then((body) => {{
+        let patched;
+        try {{ patched = patchBodyText(body, activePatch); }}
+        catch (err) {{ return fail(err.message || "Arena request body cannot carry attachments"); }}
+        window.__arenaBodyPatchApplied += 1;
+        return origFetch.call(this, new Request(input, {{ body: patched }}));
+      }}).catch((err) => fail(err.message || "Arena request body cannot carry attachments"));
+    }}
+    if (!init || typeof init.body !== "string") {{
+      return cannotPatch("Arena request body cannot carry attachments", arguments);
+    }}
+    let patched;
+    try {{ patched = patchBodyText(init.body, activePatch); }}
+    catch (err) {{ return cannotPatch(err.message || "Arena request body cannot carry attachments", arguments); }}
+    window.__arenaBodyPatchApplied += 1;
+    const nextInit = Object.assign({{}}, init, {{ body: patched }});
+    return origFetch.call(this, input, nextInit);
   }};
 }}
 """.strip()
@@ -1460,6 +1754,80 @@ async def _replay_eval_with_v2_token(
         return False
 
 
+class _ModelSelectionUnconfirmed(ModelUnavailableError):
+    """The exact option was clicked, but Arena's trigger label stayed ambiguous.
+
+    The caller can still guarantee the requested UUID in the outgoing request
+    body. A missing or disabled option is a different (hard) failure.
+    """
+
+
+def _normal_label(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+# Playwright mocks and Radix both return string sentinels for missing
+# attributes. Never let "false"/"true" become a model label.
+_LABEL_SENTINELS = frozenset({"", "false", "true", "null", "none", "undefined", "0", "1"})
+
+
+def _usable_label(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if cleaned.casefold() in _LABEL_SENTINELS:
+        return None
+    return cleaned or None
+
+
+async def _trigger_shows_model(
+    trigger: Any, labels: Sequence[str], model_id: str | None
+) -> bool:
+    """Confirm the picker trigger shows the exact model we just clicked.
+
+    ``text_content()`` may concatenate hidden accessibility labels, badges and
+    filter names, so accept only exact visible descendants, exact normalized
+    text, or an attribute carrying the exact UUID. Substring matches are never
+    used: ``gemini-test-high`` is not ``gemini-test``.
+    """
+    clean_labels = [_normal_label(label) for label in labels if label]
+    get_by_text = getattr(trigger, "get_by_text", None)
+    if callable(get_by_text):
+        for label in labels:
+            if not _usable_label(label):
+                continue
+            try:
+                matches = get_by_text(label, exact=True)
+                for index in range(min(await matches.count(), 20)):
+                    if await matches.nth(index).is_visible():
+                        return True
+            except Exception:  # noqa: BLE001 - other signals still apply
+                pass
+    for attr in ("data-value", "data-model-id", "aria-label", "title", "data-model"):
+        try:
+            value = await trigger.get_attribute(attr)
+        except Exception:  # noqa: BLE001
+            continue
+        if _usable_label(value) is None:
+            continue
+        folded = _normal_label(value)
+        if model_id and model_id.casefold() in folded:
+            return True
+        if any(label == folded for label in clean_labels):
+            return True
+    for method in ("inner_text", "text_content"):
+        fn = getattr(trigger, method, None)
+        if not callable(fn):
+            continue
+        try:
+            selected = _normal_label(await fn())
+        except Exception:  # noqa: BLE001
+            continue
+        if any(label == selected for label in clean_labels):
+            return True
+    return False
+
+
 async def _select_model_in_picker(
     page: Any, model_id: str | None = None, *, category: str | None = None
 ) -> None:
@@ -1503,22 +1871,79 @@ async def _select_model_in_picker(
             option = dialog.locator('[role="option"]:has(span:text-is("Max"))').first
         else:
             option = dialog.locator('[role="option"][data-value=' + json.dumps(model_id) + ']').first
-        await _call_locator_fast(option.wait_for, state="visible", timeout_ms=5000)
+        try:
+            await _call_locator_fast(option.wait_for, state="visible", timeout_ms=1500)
+        except Exception as first_error:
+            # Virtualized lists do not mount off-screen options, so Playwright's
+            # scroll_into_view_if_needed cannot reach them until we scroll the
+            # viewport itself. Search from top to bottom, bounded by its height.
+            viewport = dialog.locator('[data-radix-scroll-area-viewport], [role="listbox"]').first
+            found = False
+            try:
+                await viewport.evaluate("el => { el.scrollTop = 0; }")
+                for _ in range(100):
+                    await asyncio.sleep(0.05)
+                    if await option.count() and await option.is_visible():
+                        found = True
+                        break
+                    moved = await viewport.evaluate("""el => {
+                        const before = el.scrollTop;
+                        el.scrollTop += Math.max(100, el.clientHeight * 0.8);
+                        return el.scrollTop > before;
+                    }""")
+                    if not moved:
+                        break
+            except Exception:  # noqa: BLE001 - report original selection failure
+                pass
+            if not found:
+                raise first_error
         if await option.get_attribute("aria-disabled") == "true" or await option.get_attribute("data-disabled") == "true":
             raise ModelUnavailableError(f"Model {model_id or 'Max'!r} is unavailable in the picker.")
         name = (await option.locator('span.font-mono').first.text_content() or "").strip()
         if not name:
             raise ModelUnavailableError(f"Model {model_id or 'Max'!r} has no name in the picker.")
+        # The picker option may expose a public name ("Claude Sonnet 5.5") in
+        # addition to the mono id ("claude-sonnet-5-5-high"). Either one may be
+        # what the trigger displays, so both are valid confirmation labels.
+        confirm_labels: list[str] = [name]
+        for attr in ("aria-label", "data-label", "title"):
+            try:
+                value = await option.get_attribute(attr)
+            except Exception:  # noqa: BLE001
+                value = None
+            if _usable_label(value):
+                confirm_labels.append(str(value).strip())
+        whole_label_fn = getattr(option, "inner_text", None)
+        if callable(whole_label_fn):
+            try:
+                whole = await whole_label_fn()
+            except Exception:  # noqa: BLE001
+                whole = None
+            if _usable_label(whole):
+                confirm_labels.append(str(whole).strip())
         await _call_locator_fast(option.scroll_into_view_if_needed, timeout_ms=5000)
         await _call_locator_fast(option.click, timeout_ms=5000)
+        # Radix marks the chosen option itself. The option carries the exact
+        # data-value, so this is stronger evidence than reading a label.
+        option_selected = False
+        for attr in ("aria-selected", "data-selected"):
+            try:
+                value = await option.get_attribute(attr)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(value, str) and value.casefold() == "true":
+                option_selected = True
         # The dialog closing alone is not proof that the model was selected.
         await _call_locator_fast(dialog.wait_for, state="hidden", timeout_ms=5000)
+        if option_selected:
+            return
         for _ in range(50):
-            selected = (await trigger.text_content() or "").strip()
-            if selected.casefold() == name.casefold():
+            if await _trigger_shows_model(trigger, confirm_labels, model_id):
                 return
             await asyncio.sleep(0.1)
-        raise ModelUnavailableError(f"Arena did not confirm selection of model {name!r}.")
+        raise _ModelSelectionUnconfirmed(
+            f"Arena did not confirm selection of model {name!r}."
+        )
     except ModelUnavailableError:
         raise
     except Exception as exc:
@@ -1574,16 +1999,59 @@ async def _submit_prompt_via_composer(
         return False
     _mark("composer.visible")
 
+    forced_model_id: str | None = None
     if model_id_override or select_native_max:
-        if model_picker_category is None:
-            await _select_model_in_picker(page, model_id_override)
-        else:
-            await _select_model_in_picker(page, model_id_override, category=model_picker_category)
+
+        async def _try_select(cat: str | None) -> None:
+            # Keep the positional form for the no-category case: callers and
+            # test doubles rely on the two-argument signature.
+            if cat is None:
+                await _select_model_in_picker(page, model_id_override)
+            else:
+                await _select_model_in_picker(page, model_id_override, category=cat)
+
+        # A forced "Text" filter only narrows the list. If the exact UUID is
+        # not mounted under it, look again in the unfiltered picker instead of
+        # reporting the model as missing.
+        categories: tuple[str | None, ...] = (
+            (model_picker_category, None)
+            if model_picker_category is not None
+            else (None,)
+        )
+        selection_error: BaseException | None = None
+        for cat in categories:
+            try:
+                await _try_select(cat)
+                selection_error = None
+                break
+            except ModelUnavailableError as exc:
+                selection_error = exc
+                if isinstance(exc, _ModelSelectionUnconfirmed):
+                    break
+        if selection_error is not None:
+            if (
+                isinstance(selection_error, _ModelSelectionUnconfirmed)
+                and not select_native_max
+                and isinstance(model_id_override, str)
+                and model_id_override
+            ):
+                # The exact option was clicked, only the label stayed
+                # ambiguous. Force its UUID into the outgoing request: that is
+                # stronger than a UI label and never answers with another model.
+                forced_model_id = model_id_override
+                _mark("model.forced_in_body")
+            else:
+                raise selection_error
 
     # Explicit models are selected by the UI; only the automatic fast-model
-    # optimization still uses a request override.
-    effective_model_id = None
-    if auto_fast_model and not model_id_override and not select_native_max:
+    # optimization (and an unconfirmed picker label) uses a request override.
+    effective_model_id = forced_model_id
+    if (
+        effective_model_id is None
+        and auto_fast_model
+        and not model_id_override
+        and not select_native_max
+    ):
         candidate_fast = info.get("fastModelId")
         if isinstance(candidate_fast, str) and candidate_fast.strip():
             effective_model_id = candidate_fast.strip()
@@ -1593,12 +2061,16 @@ async def _submit_prompt_via_composer(
     patch_obj: dict[str, Any] = {}
     if effective_model_id:
         patch_obj["modelAId"] = effective_model_id
+    if forced_model_id:
+        # Never let a forced model silently disappear if the page changes the
+        # shape of its create-evaluation request.
+        patch_obj["requirePatch"] = True
     if generation_params:
         patch_obj["generationConfig"] = dict(generation_params)
     if attachments:
-        patch_obj["experimental_attachments"] = [
-            attachment.to_ai_sdk() for attachment in attachments
-        ]
+        patch_obj["experimental_attachments"] = await _prepare_arena_attachments(
+            page, attachments, mark=_mark
+        )
     if patch_obj:
         await eval_fn(_build_main_frame_body_patch_js(patch_obj))
         try:

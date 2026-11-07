@@ -38,7 +38,9 @@ def model_entries(models: Sequence[ModelInfo]) -> dict[str, dict[str, Any]]:
     remains authoritative and a failed selection is returned to the caller.
     """
     result: dict[str, dict[str, Any]] = {
-        "text/auto": {"name": "Arena Auto", "tool_call": True, "limit": {"context": 32768, "output": 4096}},
+        "text/auto": {"name": "Arena Auto", "tool_call": True, "attachment": True,
+                      "modalities": {"input": ["text", "image"], "output": ["text"]},
+                      "limit": {"context": 32768, "output": 4096}},
     }
     for item in sorted(models, key=lambda m: (model_chat_score(m), m.display_name or "", m.id)):
         if not item.available or not _UUID.fullmatch(item.id):
@@ -51,7 +53,11 @@ def model_entries(models: Sequence[ModelInfo]) -> dict[str, dict[str, Any]]:
             "limit": {"context": 32768, "output": 4096},
         }
         caps = item.metadata.get("capabilities")
-        if isinstance(caps, Mapping) and _has_capability(caps.get("inputCapabilities"), "image"):
+        input_caps = caps.get("inputCapabilities") if isinstance(caps, Mapping) else None
+        # Missing capability metadata does not mean images are unsupported.
+        # Allow an attempt; Arena will reject it if the selected model cannot.
+        image_unknown = input_caps is None or (isinstance(input_caps, Mapping) and "image" not in input_caps)
+        if image_unknown or _has_capability(input_caps, "image"):
             entry["attachment"] = True
             entry["modalities"] = {"input": ["text", "image"], "output": ["text"]}
         result[f"text/{item.id}"] = entry
@@ -82,7 +88,9 @@ class OpenCodeEngine(shim.ArenaEngine):
     """Keep tool translation but never silently substitute another model."""
 
     def __init__(self, *, engine: str = "http", session: str = "auto", archive: bool = True) -> None:
-        super().__init__(engine=engine, session=session, archive=archive, tools_mode="emulate")
+        super().__init__(engine=engine, session=session, archive=archive, tools_mode="emulate", fast_model=False)
+        if engine == "http":
+            self._primary._text_picker_for_explicit = True
 
     def _open(
         self, prompt: str, model: str | None, attachments: Sequence[Attachment] | None = None,
@@ -107,7 +115,7 @@ class OpenCodeEngine(shim.ArenaEngine):
         except Exception as exc:
             self._close_stream(stream)
             if attachments:
-                raise shim.EngineError("image request failed; check the model and session") from exc
+                raise shim.EngineError(shim._safe_image_error(exc)) from exc
             raise shim.EngineError(str(exc)) from exc
         return stream, first
 

@@ -53,6 +53,10 @@ from urllib.parse import urlsplit
 
 from ..attachments import Attachment, from_bytes
 from ..constants import DEFAULT_BASE_URL
+from ..exceptions import (
+    AuthenticationError, ChallengeRequiredError, ModelUnavailableError,
+    ProtocolError, QueueTimeoutError, RateLimitError,
+)
 
 #: Port Claude Code's ecosystem expects for a local shim.
 DEFAULT_PORT = 8082
@@ -498,6 +502,90 @@ def build_content_blocks(
 # --------------------------------------------------------------------------- #
 
 
+#: Only these fixed strings may be shown for an image failure. An upstream
+#: error can echo the request body (and therefore the image bytes), so no raw
+#: exception text ever reaches the client, the SSE stream or the logs.
+_SAFE_IMAGE_MESSAGES = frozenset(
+    {
+        "image request failed: Arena could not select or confirm the requested model",
+        "image request failed: Arena requires browser verification",
+        "image request failed: Arena rejected the session",
+        "image request failed: Arena rate limit (HTTP 429)",
+        "image request failed: Arena request timed out",
+        "image request failed: unexpected response from Arena",
+        "image request failed: Arena changed the chat request format",
+        "image request failed: Arena rejected the attachment payload",
+        "image request failed: Arena could not store the attachment",
+        "image request failed: unknown upstream error; check the connection and model",
+    }
+)
+
+_SAFE_IMAGE_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "did not confirm selection of model",
+        "image request failed: Arena could not select or confirm the requested model",
+    ),
+    (
+        "arena request has no usermessage",
+        "image request failed: Arena changed the chat request format",
+    ),
+    (
+        "arena request body cannot carry attachments",
+        "image request failed: Arena rejected the attachment payload",
+    ),
+    (
+        "arena storage returned http",
+        "image request failed: Arena could not store the attachment",
+    ),
+    (
+        "attachment upload returned http",
+        "image request failed: Arena could not store the attachment",
+    ),
+    (
+        "arena did not return a file url",
+        "image request failed: Arena could not store the attachment",
+    ),
+)
+
+
+def _safe_image_error(exc: BaseException) -> str:
+    """Describe the failure category without echoing an upstream request/body."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    errors: list[BaseException] = []
+    while current is not None and id(current) not in seen:
+        errors.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    for error in errors:
+        text = str(error)
+        if text in _SAFE_IMAGE_MESSAGES:
+            return text
+        if isinstance(error, ModelUnavailableError):
+            return "image request failed: Arena could not select or confirm the requested model"
+        if isinstance(error, ChallengeRequiredError):
+            return "image request failed: Arena requires browser verification"
+        if isinstance(error, AuthenticationError):
+            return "image request failed: Arena rejected the session"
+        if isinstance(error, RateLimitError):
+            return "image request failed: Arena rate limit (HTTP 429)"
+        if isinstance(error, (QueueTimeoutError, TimeoutError)):
+            return "image request failed: Arena request timed out"
+    for error in errors:
+        # Only disclose the numeric status; error details can echo image data.
+        status = re.search(r"\bHTTP ([1-5][0-9]{2})\b", str(error))
+        if status:
+            return f"image request failed: Arena returned HTTP {status.group(1)}"
+    for error in errors:
+        folded = str(error).casefold()
+        for marker, message in _SAFE_IMAGE_HINTS:
+            if marker in folded:
+                return message
+    if any(isinstance(error, ProtocolError) for error in errors):
+        return "image request failed: unexpected response from Arena"
+    return "image request failed: unknown upstream error; check the connection and model"
+
+
 class BadRequest(ValueError):
     """A request the shim cannot answer as sent."""
 
@@ -541,13 +629,43 @@ def _extract_images(
                 raise BadRequest("images are supported only in user messages")
             if len(attachments) >= MAX_IMAGE_COUNT:
                 raise BadRequest("too many images in one request")
-            source = block.get("source")
-            if not isinstance(source, Mapping) or source.get("type") != "base64":
+            raw_source = block.get("source")
+            # AI SDK 5 sends either an inline base64 source or a URL source
+            # whose URL is itself a data: URL. Both are inline image bytes;
+            # remote URLs are still rejected instead of being fetched. Some
+            # clients put the fields directly on the image block instead.
+            if isinstance(raw_source, Mapping):
+                source: Mapping[str, Any] = raw_source
+                source_type = str(raw_source.get("type") or "").strip().casefold()
+            else:
+                source = block
+                raw_direct_url = block.get("url")
+                source_type = (
+                    "url"
+                    if isinstance(raw_direct_url, str)
+                    and raw_direct_url.startswith("data:")
+                    else "base64"
+                )
+            mime: Any = None
+            data: Any = None
+            if source_type == "url":
+                raw_url = source.get("url")
+                if not isinstance(raw_url, str) or not raw_url.startswith("data:"):
+                    raise BadRequest("images must use an inline base64 source")
+                header, separator, encoded = raw_url.partition(",")
+                if not separator or ";base64" not in header.casefold():
+                    raise BadRequest("images must use an inline base64 source")
+                mime = header[5:].split(";", 1)[0].strip().casefold()
+                data = encoded
+            elif source_type == "base64":
+                mime = source.get("media_type") or source.get("mimeType")
+                if isinstance(mime, str):
+                    mime = mime.split(";", 1)[0].strip().casefold()
+                data = source.get("data")
+            else:
                 raise BadRequest("images must use an inline base64 source")
-            mime = source.get("media_type")
             if not isinstance(mime, str) or mime not in _IMAGE_TYPES:
                 raise BadRequest("unsupported image media type")
-            data = source.get("data")
             if not isinstance(data, str) or not data:
                 raise BadRequest("image data must be non-empty base64")
             # Reject an oversized string before allocating a decoded copy.
@@ -846,6 +964,7 @@ class _HttpEngine:
         self._archive = bool(archive)
         self._fast_model = fast_model
         self._log = log
+        self._text_picker_for_explicit = False
         self._client: Any = None
         self._lock = threading.Lock()
 
@@ -863,6 +982,8 @@ class _HttpEngine:
         }
         if self._fast_model is not None:
             kwargs["fast_model"] = self._fast_model
+        if self._text_picker_for_explicit:
+            kwargs["text_picker_for_explicit"] = True
         return auto_direct_client(**kwargs)
 
     def _get_client(self) -> Any:
@@ -1072,7 +1193,7 @@ class ArenaEngine:
         if attachments and last_error:
             # An upstream error can echo the request body. Do not propagate
             # screenshot data into logs, SSE or the phone's chat history.
-            raise EngineError("image request failed; check the connection and model") from last_error
+            raise EngineError(_safe_image_error(last_error)) from last_error
         raise EngineError(str(last_error) if last_error else "no engine available")
 
     @staticmethod
@@ -1411,8 +1532,17 @@ class _Handler(BaseHTTPRequestHandler):
         answer_kwargs: dict[str, Any] = {"model": request.arena_model}
         if request.attachments:
             answer_kwargs["attachments"] = request.attachments
-        for delta in self.engine.answer(request.prompt, **answer_kwargs):
-            collected.append(delta)
+        try:
+            for delta in self.engine.answer(request.prompt, **answer_kwargs):
+                collected.append(delta)
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        except Exception as exc:
+            if request.attachments:
+                detail = _safe_image_error(exc)
+                _log_quiet(detail)
+                raise EngineError(detail) from exc
+            raise
         text, stop_sequence = apply_stop_sequences(
             "".join(collected), request.stop_sequences
         )
@@ -1636,18 +1766,17 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             raise
         except Exception as exc:  # noqa: BLE001 - the client must see a reason
+            if request.attachments:
+                detail = _safe_image_error(exc)
+                _log_quiet(detail)
+            else:
+                detail = str(exc)
             try:
                 self._sse(
                     "error",
                     {
                         "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": (
-                                "image request failed; check the connection and model"
-                                if request.attachments else str(exc)
-                            ),
-                        },
+                        "error": {"type": "api_error", "message": detail},
                     },
                 )
                 self._end_sse()
