@@ -478,8 +478,6 @@ class AutoOptions:
     #: Optional filter in Arena's model picker. Requires browser verification
     #: and an explicit model name/UUID (or ``max``); it is not a generation mode.
     model_picker_category: Literal["text", "code", "image", "search"] | None = None
-    #: Select the Text filter for explicit models without affecting auto mode.
-    text_picker_for_explicit: bool = False
 
     def __post_init__(self) -> None:
         if self.model_picker_category not in (None, "text", "code", "image", "search"):
@@ -1881,25 +1879,17 @@ _CONVERSATION_ID_RE = re.compile(
 
 
 def _conversation_id_from(*sources: Any) -> str | None:
-    """Extract a chat UUID, never a model or message UUID from a JSON body."""
+    """First conversation UUID found in the given strings/metadata.
+
+    The id travels in the request body (``"id"``), in the page URL after the
+    chat is created, and in the intercepted ``post_data`` of the UI submission.
+    Any of them is enough to find the chat's row in the sidebar later.
+    """
     for source in sources:
-        if not isinstance(source, str) or not source:
-            continue
-        try:
-            decoded = json.loads(source)
-        except (ValueError, TypeError):
-            decoded = None
-        if isinstance(decoded, Mapping):
-            for key in ("id", "conversationId", "conversation_id", "chatId", "chat_id"):
-                value = decoded.get(key)
-                if isinstance(value, str) and _CONVERSATION_ID_RE.fullmatch(value):
-                    return value
-            continue
-        if _CONVERSATION_ID_RE.fullmatch(source):
-            return source
-        match = re.search(r"/(?:c|chat|conversation|conversations)/(" + _CONVERSATION_ID_RE.pattern + r")(?:[/?#]|$)", source, re.IGNORECASE)
-        if match:
-            return match.group(1)
+        if isinstance(source, str) and source:
+            match = _CONVERSATION_ID_RE.search(source)
+            if match:
+                return match.group(0)
     return None
 
 
@@ -2951,10 +2941,6 @@ class DirectVerificationToken:
                 effective_model_override = model_id_override
                 use_auto_fast_model = False
             picker_category = self.options.model_picker_category
-            if picker_category is None and self.options.text_picker_for_explicit and (
-                model_id_override is not None and model_id_override != FAST_MODEL_SENTINEL
-            ):
-                picker_category = "text"
             if picker_category is not None and prompt is not None and (
                 model_id_override is None or model_id_override == FAST_MODEL_SENTINEL
             ):
@@ -3545,6 +3531,7 @@ class DirectVerificationToken:
                 # chat is filed away on a later turn, not now.
                 if turn_chat_id not in state.pending_archive_ids:
                     state.pending_archive_ids.append(turn_chat_id)
+                    del state.pending_archive_ids[:-16]
         except _RetryInHeadedBrowser:
             discard_state = True
             raise
@@ -3638,15 +3625,12 @@ class DirectVerificationToken:
         # Everything this turn owes the sidebar: chats postponed earlier plus
         # the one that was just answered.  They are filed away by their own id,
         # so a postponed chat is archived even though another one is on screen.
-        if state.prefetch_task is not None and not state.prefetch_task.done():
-            if should_archive and conversation_id and conversation_id not in state.pending_archive_ids:
-                state.pending_archive_ids.append(conversation_id)
-            return
-        if should_archive and conversation_id and conversation_id not in state.pending_archive_ids:
-            state.pending_archive_ids.append(conversation_id)
-        unknown_target = should_archive and not conversation_id
+        archive_queue: list[str | None] = list(state.pending_archive_ids)
+        state.pending_archive_ids.clear()
+        if should_archive:
+            archive_queue.append(conversation_id)
 
-        if not can_prefetch and not should_archive and not state.pending_archive_ids:
+        if not can_prefetch and not should_archive and not archive_queue:
             # Chat follow-up turns keep the conversation open: prefetch_task
             # stays None while cookies refresh quietly in housekeeping_task.
             if state.housekeeping_task is None or state.housekeeping_task.done():
@@ -3660,6 +3644,8 @@ class DirectVerificationToken:
                     pass
             return
 
+        if state.prefetch_task is not None and not state.prefetch_task.done():
+            return
         state.cancel_archive = False
         if can_prefetch:
             state.has_active_conversation = False
@@ -3668,44 +3654,45 @@ class DirectVerificationToken:
             state.prefetched_url = None
 
         async def _housekeeping() -> None:
-            # Claim the queue only after the task starts; if cancelled before
-            # its first instruction the IDs remain in state for the next turn.
-            archive_queue: list[str | None] = list(state.pending_archive_ids)
-            state.pending_archive_ids.clear()
-            if unknown_target:
-                archive_queue.append(None)
             archived_any = False
             retry_later: list[str] = []
-            wanted: str | None = None
-            try:
-                while archive_queue:
-                    if state.cancel_archive or not _is_page_usable(page):
-                        break
-                    wanted = archive_queue.pop(0)
-                    _latency_mark("archive.start")
-                    try:
-                        archived = await archive_conversation(
-                            page, should_abort=lambda: state.cancel_archive,
-                            conversation_id=wanted,
+            while archive_queue:
+                if state.cancel_archive or not _is_page_usable(page):
+                    # The next prompt took the tab: every chat still in the
+                    # queue stays a debt, it is filed away on a later turn.
+                    retry_later.extend(item for item in archive_queue if item)
+                    break
+                wanted = archive_queue.pop(0)
+                _latency_mark("archive.start")
+                try:
+                    archived = await archive_conversation(
+                        page,
+                        should_abort=lambda: state.cancel_archive,
+                        conversation_id=wanted,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    archived = False
+                    _latency_mark("archive.error")
+                    if self.options.output is not None:
+                        print(
+                            f"[arena-api] could not archive the chat: {exc}",
+                            file=self.options.output,
                         )
-                    except Exception as exc:  # noqa: BLE001
-                        archived = False
-                        _latency_mark("archive.error")
-                        if self.options.output is not None:
-                            print(f"[arena-api] could not archive the chat: {exc}", file=self.options.output)
-                    _latency_mark("archive.done" if archived else "archive.missed")
-                    if archived:
-                        archived_any = True
-                    elif wanted:
-                        retry_later.append(wanted)
-                    wanted = None
-            finally:
-                # Cancellation can interrupt archive_conversation at any await.
-                # Put both the in-flight target and unprocessed IDs back first.
-                remaining = retry_later + ([wanted] if wanted else []) + [x for x in archive_queue if x]
-                for item in remaining:
-                    if item not in state.pending_archive_ids:
-                        state.pending_archive_ids.append(item)
+                _latency_mark("archive.done" if archived else "archive.missed")
+                if archived:
+                    archived_any = True
+                    continue
+                if wanted:
+                    # Keep the debt for the next turn instead of losing the
+                    # chat: it is filed away by id, not by "whatever is open".
+                    retry_later.append(wanted)
+            if retry_later:
+                merged = retry_later + [
+                    item
+                    for item in state.pending_archive_ids
+                    if item not in retry_later
+                ]
+                state.pending_archive_ids[:] = merged[-16:]
             if archived_any and can_prefetch and not state.cancel_archive:
                 # Radix closes [role="menu"] on the very next frame; give the
                 # archive fetch a brief beat in the background before

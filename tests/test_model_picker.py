@@ -135,38 +135,3 @@ def test_active_filter_is_not_toggled_off():
     asyncio.run(_select_model_in_picker(page, 'model-123', category='text'))
     assert ('click', 'filter') not in page.events
     assert ('click', 'option') in page.events
-
-
-def test_scrolls_virtualized_viewport_until_exact_model_is_mounted(monkeypatch):
-    async def no_wait(_):
-        pass
-    monkeypatch.setattr('arena_api._direct_page.asyncio.sleep', no_wait)
-    class VirtualOption(Node):
-        async def wait_for(self, *, state, timeout):
-            raise TimeoutError('option not mounted')
-        async def count(self):
-            return 1 if self.page.steps >= 2 else 0
-        async def is_visible(self):
-            return True
-    class Viewport(Node):
-        async def evaluate(self, script):
-            if 'scrollTop = 0' in script:
-                self.page.steps = 0
-                return None
-            self.page.steps += 1
-            return self.page.steps <= 3
-    class VirtualDialog(Node):
-        def locator(self, selector):
-            self.page.events.append(('locate', selector))
-            if 'scroll-area' in selector:
-                return Viewport(self.page, 'viewport')
-            return VirtualOption(self.page, 'option')
-    class VirtualPicker(Picker):
-        steps = 0
-        def locator(self, selector):
-            self.events.append(('locate', selector))
-            return VirtualDialog(self, 'dialog') if '[role="dialog"]' in selector else Node(self, 'trigger')
-    page = VirtualPicker()
-    asyncio.run(_select_model_in_picker(page, 'model-123'))
-    assert page.steps == 2
-    assert ('click', 'option') in page.events

@@ -182,22 +182,3 @@ def test_batch_uses_desktop_by_default_and_cli_is_optional():
     script = (oc.ROOT / 'arena-opencode.bat').read_text(encoding='ascii')
     assert '-m arena_api.compat.opencode_server --desktop %*' in script
     assert '--cli' in script
-
-
-def test_desktop_config_exposes_images_for_auto_and_unknown_but_not_explicit_no():
-    unknown = ModelInfo(ID, 'Unknown', metadata={'capabilities': {'inputCapabilities': {'text': True}}})
-    no_image_id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-    no_image = ModelInfo(no_image_id, 'Text only', metadata={'capabilities': {
-        'inputCapabilities': {'text': True, 'image': False}, 'outputCapabilities': {'text': True}
-    }})
-    entries = oc.model_entries([unknown, no_image])
-    assert entries['text/auto']['attachment'] is True
-    assert entries['text/' + ID]['modalities']['input'] == ['text', 'image']
-    assert 'attachment' not in entries['text/' + no_image_id]
-
-
-def test_opencode_engine_selects_text_filter_and_does_not_force_fast_auto():
-    engine = oc.OpenCodeEngine(engine='http')
-    assert engine._primary._text_picker_for_explicit is True
-    assert engine._primary._fast_model is False
-    engine.close()

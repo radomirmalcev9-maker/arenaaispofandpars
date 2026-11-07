@@ -846,7 +846,6 @@ class _HttpEngine:
         self._archive = bool(archive)
         self._fast_model = fast_model
         self._log = log
-        self._text_picker_for_explicit = False
         self._client: Any = None
         self._lock = threading.Lock()
 
@@ -864,8 +863,6 @@ class _HttpEngine:
         }
         if self._fast_model is not None:
             kwargs["fast_model"] = self._fast_model
-        if self._text_picker_for_explicit:
-            kwargs["text_picker_for_explicit"] = True
         return auto_direct_client(**kwargs)
 
     def _get_client(self) -> Any:
