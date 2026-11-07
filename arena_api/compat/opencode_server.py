@@ -58,7 +58,9 @@ def model_entries(models: Sequence[ModelInfo]) -> dict[str, dict[str, Any]]:
     return result
 
 
-def provider_config(models: Sequence[ModelInfo], port: int) -> dict[str, Any]:
+def provider_config(
+    models: Sequence[ModelInfo], port: int, *, api_key: str = "{env:ARENA_OPENCODE_API_KEY}"
+) -> dict[str, Any]:
     return {
         "$schema": "https://opencode.ai/config.json",
         "model": "arena-local/text/auto",
@@ -68,7 +70,7 @@ def provider_config(models: Sequence[ModelInfo], port: int) -> dict[str, Any]:
                 "name": "Arena Local",
                 "options": {
                     "baseURL": f"http://127.0.0.1:{port}/v1",
-                    "apiKey": "{env:ARENA_OPENCODE_API_KEY}",
+                    "apiKey": api_key,
                 },
                 "models": model_entries(models),
             }
@@ -140,13 +142,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--session", default="auto", help="browser cookie source (default: auto)")
     parser.add_argument("--no-archive", action="store_true", help="keep chats in the sidebar")
-    parser.add_argument("--server-only", action="store_true", help="serve without starting OpenCode")
+    parser.add_argument("--desktop", "--server-only", dest="mode", action="store_const", const="desktop", default="cli", help="serve for the OpenCode desktop app without starting the CLI")
+    parser.add_argument("--cli", dest="mode", action="store_const", const="cli", help="start the OpenCode CLI together with the server")
     parser.add_argument("--engine", choices=("http", "echo"), default="http", help=argparse.SUPPRESS)
     args, opencode_args = parser.parse_known_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
-    opencode = shutil.which("opencode") or shutil.which("opencode.cmd")
-    if not args.server_only and not opencode:
+    opencode = (shutil.which("opencode") or shutil.which("opencode.cmd")) if args.mode == "cli" else None
+    if args.mode == "cli" and not opencode:
         print("OpenCode not found in PATH. Install it first: https://opencode.ai/docs/", file=sys.stderr)
         return 1
     token = load_or_create_token(KEY_PATH)
@@ -164,12 +167,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception as exc:
             models = []
             print(f"Could not load the Arena catalog: {exc}\nOnly text/auto is listed; restart after signing in.", file=sys.stderr, flush=True)
-        _write_config(CONFIG_PATH, provider_config(models, args.port))
+        # The desktop app is a separate process and cannot inherit environment
+        # variables set by a batch file. Use an absolute file reference instead.
+        key_reference = (
+            "{file:" + KEY_PATH.resolve().as_posix() + "}"
+            if args.mode == "desktop" else "{env:ARENA_OPENCODE_API_KEY}"
+        )
+        _write_config(CONFIG_PATH, provider_config(models, args.port, api_key=key_reference))
         print(f"Local API: http://127.0.0.1:{args.port}/v1", flush=True)
         print(f"Generated OpenCode config: {CONFIG_PATH}", flush=True)
         print(f"Private API key file: {KEY_PATH} (keep it secret)", flush=True)
         print("Tools are emulated; image generation and web search are not implemented.", flush=True)
-        if args.server_only:
+        if args.mode == "desktop":
+            print("Desktop mode: copy the generated provider into your OpenCode config, then restart the app.", flush=True)
+            print("Keep this window open while using OpenCode. Press Ctrl+C to stop the API.", flush=True)
             server.serve_forever(poll_interval=0.2)
             return 0
         assert opencode is not None
