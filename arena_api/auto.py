@@ -167,6 +167,7 @@ from .exceptions import (
     ArenaError,
     AuthenticationError,
     ChallengeRequiredError,
+    ModelUnavailableError,
     ProtocolError,
     QueueTimeoutError,
     RateLimitError,
@@ -419,11 +420,10 @@ class AutoOptions:
     #: re-seeded from your browser anyway).
     reset_profile: bool = False
 
-    #: Archive the conversation once the answer has been fully received
-    #: (conversation row -> menu -> Archive). Off by default: it is a UI action
-    #: on the user's account, so the caller asks for it explicitly. A one-shot
-    #: request is the intended case -- a follow-up turn needs the chat open.
-    archive_after_answer: bool = False
+    #: Archive the conversation once the answer has been fully received via
+    #: the browser composer (conversation row -> menu -> Archive). Set False
+    #: to keep new chats in the sidebar, e.g. while working on a multi-turn chat.
+    archive_after_answer: bool = True
 
     #: ``True``/``False`` force challenge solving on or off; ``"auto"`` (the
     #: default) enables it when the solver dependencies are importable.
@@ -475,7 +475,13 @@ class AutoOptions:
     #: Set ``ARENA_FAST_MODEL=0`` or ``--no-fast-model`` to keep ``max``.
     fast_model: bool = field(default_factory=_default_fast_model)
 
+    #: Optional filter in Arena's model picker. Requires browser verification
+    #: and an explicit model name/UUID (or ``max``); it is not a generation mode.
+    model_picker_category: Literal["text", "code", "image", "search"] | None = None
+
     def __post_init__(self) -> None:
+        if self.model_picker_category not in (None, "text", "code", "image", "search"):
+            raise ValueError("model_picker_category must be text, code, image, search or None")
         if self.storage_path is not None:
             self.storage_path = Path(self.storage_path)
         if self.artifacts_dir is not None:
@@ -2934,6 +2940,11 @@ class DirectVerificationToken:
             else:
                 effective_model_override = model_id_override
                 use_auto_fast_model = False
+            picker_category = self.options.model_picker_category
+            if picker_category is not None and prompt is not None and (
+                model_id_override is None or model_id_override == FAST_MODEL_SENTINEL
+            ):
+                raise ValueError("model_picker_category requires an explicit model name, UUID or max")
             auto_picked_models: list[str] = []
             used_composer = False
             can_reuse_open_conversation = (
@@ -2941,7 +2952,6 @@ class DirectVerificationToken:
                 and follow_up
                 and state.has_active_conversation
                 and prompt is not None
-                and not effective_model_override
                 and not generation_params
                 and not _arena_auth_jwt_expired(raw_cookies)
             )
@@ -2952,7 +2962,9 @@ class DirectVerificationToken:
                 used_composer = await _submit_prompt_via_composer(
                     page,
                     prompt,
-                    model_id_override=None,
+                    model_id_override=effective_model_override,
+                    select_native_max=model_id_override == NATIVE_MAX_SENTINEL,
+                    model_picker_category=picker_category,
                     generation_params=None,
                     has_submitted=lambda: eval_request_seen,
                     install_legacy_tap_flags=not has_network_events,
@@ -3066,11 +3078,21 @@ class DirectVerificationToken:
                         install_legacy_tap_flags=not has_network_events,
                         fast_submit=fast_submit,
                         auto_fast_model=use_auto_fast_model,
+                        select_native_max=model_id_override == NATIVE_MAX_SENTINEL,
+                        model_picker_category=picker_category,
                         resolved_model_out=auto_picked_models,
                         attachments=attachments,
                         mark=_latency_mark,
                     )
 
+            if (
+                not used_composer
+                and prompt is not None
+                and (model_id_override == NATIVE_MAX_SENTINEL or picker_category is not None)
+            ):
+                raise ModelUnavailableError(
+                    "Cannot select the requested model: Arena's chat composer is unavailable."
+                )
             if not used_composer:
                 _latency_mark("page.prepare.end")
             _latency_mark("submit.start")
@@ -3448,7 +3470,6 @@ class DirectVerificationToken:
                     archive_allowed = True
             archive_wanted = (
                 self.options.archive_after_answer
-                and not follow_up
                 and bool(used_composer)
                 and _is_page_usable(page)
             )
@@ -3460,6 +3481,11 @@ class DirectVerificationToken:
                 last_eval_post_data,
                 getattr(page, "url", None),
             )
+            if should_archive and not turn_chat_id:
+                # An unknown target must never cause another sidebar chat to be
+                # archived by a heuristic fallback.
+                should_archive = False
+                _latency_mark("archive.missed")
             if archive_wanted and not archive_allowed:
                 # Another prompt is already queued: filing this chat away now
                 # would sit on the critical path of that prompt.  It becomes a
@@ -4091,6 +4117,10 @@ def auto_direct_client(
             session_manager=manager,
             cookie_source=_cookie_source_for_manager(manager),
         )
+    if options.model_picker_category is not None and (
+        not isinstance(verification_token, DirectVerificationToken) or options.http_transport is not None
+    ):
+        raise ValueError("model_picker_category requires verification_token='auto' and browser transport")
     client = DirectArenaClient(
         base_url=options.base_url,
         session_source=manager,
@@ -4135,6 +4165,10 @@ async def auto_async_direct_client(
             session_manager=manager,
             cookie_source=_cookie_source_for_manager(manager),
         )
+    if options.model_picker_category is not None and (
+        not isinstance(verification_token, DirectVerificationToken) or options.http_transport is not None
+    ):
+        raise ValueError("model_picker_category requires verification_token='auto' and browser transport")
     client = AsyncDirectArenaClient(
         base_url=options.base_url,
         session_source=manager,
@@ -4304,14 +4338,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "cookies are re-seeded from your browser)"
         ),
     )
-    parser.add_argument(
+    archive_group = parser.add_mutually_exclusive_group()
+    archive_group.add_argument(
         "--archive-after-answer",
+        dest="archive_after_answer",
         action="store_true",
-        default=False,
-        help=(
-            "move the conversation to the archive once the answer has been "
-            "fully received (one-shot requests only; needs the composer path)"
-        ),
+        default=True,
+        help="archive browser chats after their completed answer (default)",
+    )
+    archive_group.add_argument(
+        "--no-archive-after-answer",
+        dest="archive_after_answer",
+        action="store_false",
+        help="keep new chats in the Arena sidebar",
     )
     parser.add_argument(
         "--session",
@@ -4494,7 +4533,7 @@ def _options_from_args(args: argparse.Namespace) -> AutoOptions:
         impersonate=args.impersonate,
         proxy=args.proxy,
         session_source=getattr(args, "session", None),
-        archive_after_answer=bool(getattr(args, "archive_after_answer", False)),
+        archive_after_answer=bool(getattr(args, "archive_after_answer", True)),
         reset_profile=bool(getattr(args, "fresh_profile", False)),
         profiles_root=args.profile_root,
         profile_name=args.profile,

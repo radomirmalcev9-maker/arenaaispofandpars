@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .attachments import Attachment
+from .exceptions import ModelUnavailableError
 
 from .auth.captcha import RecaptchaToolkitSolver
 from .auth.firefox_session import FirefoxSessionManager
@@ -947,12 +948,17 @@ _ARCHIVE_MARK_TRIGGERS_TEMPLATE = r"""
   };
 
   const wanted = rowForId(targetId);
-  if (wanted) {
-    const scope = wanted.row.parentElement || wanted.row;
-    for (const el of wanted.row.querySelectorAll('[aria-haspopup="menu"]')) push(el, 200);
-    for (const el of (scope.querySelectorAll ? scope.querySelectorAll('[aria-haspopup="menu"]') : [])) {
-      push(el, 190);
+  if (targetId) {
+    // Never fall back to a different row when the requested chat is absent.
+    // Archiving a neighbour would be worse than leaving a pending archive.
+    if (wanted) {
+      for (const el of wanted.row.querySelectorAll('[aria-haspopup="menu"]')) push(el, 200);
     }
+    const chosen = ranked.slice(0, 4);
+    chosen.forEach((item, index) => {
+      item.el.setAttribute('data-arena-archive-trigger', String(index));
+    });
+    return { found: chosen.length, strategies: chosen.map((item) => item.score) };
   }
 
   const row = activeRow();
@@ -1454,6 +1460,73 @@ async def _replay_eval_with_v2_token(
         return False
 
 
+async def _select_model_in_picker(
+    page: Any, model_id: str | None = None, *, category: str | None = None
+) -> None:
+    """Select an exact model from Arena's picker and verify the trigger changed.
+
+    Model IDs are the picker option's data-value, not the transient Radix IDs.
+    Playwright scrolls the option into the Radix viewport before clicking it.
+    A missing/disabled option must never silently submit with another model.
+    """
+    trigger = page.locator('[data-perf-target="model_picker"] button[aria-haspopup="dialog"]').first
+    dialog = page.locator('[role="dialog"][data-perf-target="model_picker"]').first
+    try:
+        await _call_locator_fast(trigger.click, timeout_ms=5000)
+        await _call_locator_fast(dialog.wait_for, state="visible", timeout_ms=5000)
+        if category is not None:
+            labels = {"text": "Text", "code": "Code", "image": "Image", "search": "Search"}
+            if category not in labels:
+                raise ValueError(f"Unknown model picker category: {category!r}")
+            button = dialog.locator(
+                '[data-arena-buttons] button[aria-label=' + json.dumps(labels[category]) + ']'
+            ).first
+            await _call_locator_fast(button.wait_for, state="visible", timeout_ms=5000)
+            if await button.get_attribute("disabled") is not None or await button.get_attribute("aria-disabled") == "true":
+                raise ModelUnavailableError(f"Model category {category!r} is unavailable.")
+            # The current Arena markup uses background/text classes rather than
+            # aria-pressed to mark an active filter. Avoid toggling it off.
+            pressed = await button.get_attribute("aria-pressed")
+            classes = (await button.get_attribute("class") or "").split()
+            active = pressed == "true" or (pressed is None and "bg-surface-primary" in classes and "text-text-tertiary" in classes)
+            if not active:
+                await _call_locator_fast(button.click, timeout_ms=5000)
+                for _ in range(50):
+                    pressed = await button.get_attribute("aria-pressed")
+                    classes = (await button.get_attribute("class") or "").split()
+                    if pressed == "true" or (pressed is None and "bg-surface-primary" in classes and "text-text-tertiary" in classes):
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    raise ModelUnavailableError(f"Arena did not confirm category {category!r}.")
+        if model_id is None:
+            option = dialog.locator('[role="option"]:has(span:text-is("Max"))').first
+        else:
+            option = dialog.locator('[role="option"][data-value=' + json.dumps(model_id) + ']').first
+        await _call_locator_fast(option.wait_for, state="visible", timeout_ms=5000)
+        if await option.get_attribute("aria-disabled") == "true" or await option.get_attribute("data-disabled") == "true":
+            raise ModelUnavailableError(f"Model {model_id or 'Max'!r} is unavailable in the picker.")
+        name = (await option.locator('span.font-mono').first.text_content() or "").strip()
+        if not name:
+            raise ModelUnavailableError(f"Model {model_id or 'Max'!r} has no name in the picker.")
+        await _call_locator_fast(option.scroll_into_view_if_needed, timeout_ms=5000)
+        await _call_locator_fast(option.click, timeout_ms=5000)
+        # The dialog closing alone is not proof that the model was selected.
+        await _call_locator_fast(dialog.wait_for, state="hidden", timeout_ms=5000)
+        for _ in range(50):
+            selected = (await trigger.text_content() or "").strip()
+            if selected.casefold() == name.casefold():
+                return
+            await asyncio.sleep(0.1)
+        raise ModelUnavailableError(f"Arena did not confirm selection of model {name!r}.")
+    except ModelUnavailableError:
+        raise
+    except Exception as exc:
+        raise ModelUnavailableError(
+            f"Could not select model {model_id or 'Max'!r} in Arena's model picker."
+        ) from exc
+
+
 async def _submit_prompt_via_composer(
     page: Any,
     prompt: str,
@@ -1464,6 +1537,8 @@ async def _submit_prompt_via_composer(
     install_legacy_tap_flags: bool = False,
     fast_submit: bool = False,
     auto_fast_model: bool = False,
+    select_native_max: bool = False,
+    model_picker_category: str | None = None,
     resolved_model_out: list[str] | None = None,
     attachments: Sequence[Attachment] | None = None,
     mark: Callable[[str], None] | None = None,
@@ -1499,8 +1574,16 @@ async def _submit_prompt_via_composer(
         return False
     _mark("composer.visible")
 
-    effective_model_id = model_id_override
-    if effective_model_id is None and auto_fast_model:
+    if model_id_override or select_native_max:
+        if model_picker_category is None:
+            await _select_model_in_picker(page, model_id_override)
+        else:
+            await _select_model_in_picker(page, model_id_override, category=model_picker_category)
+
+    # Explicit models are selected by the UI; only the automatic fast-model
+    # optimization still uses a request override.
+    effective_model_id = None
+    if auto_fast_model and not model_id_override and not select_native_max:
         candidate_fast = info.get("fastModelId")
         if isinstance(candidate_fast, str) and candidate_fast.strip():
             effective_model_id = candidate_fast.strip()

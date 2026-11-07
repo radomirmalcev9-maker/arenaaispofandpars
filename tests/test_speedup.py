@@ -476,7 +476,7 @@ def test_auto_fast_model_self_heals_on_404_and_warm_archive_is_non_blocking(
             )
             patched_models.append(model_used)
             url = "https://arena.ai/nextjs-api/stream/create-evaluation"
-            req = type("Req", (), {"method": "POST", "url": url, "post_data": "{}"})()
+            req = type("Req", (), {"method": "POST", "url": url, "post_data": '{"id":"11111111-1111-7111-8111-111111111111"}'})()
             for cb in list(self._listeners.get("request", ())):
                 cb(req)
             if self._fail_fast_once and model_used == fast_uuid:
