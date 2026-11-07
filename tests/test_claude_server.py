@@ -1501,7 +1501,7 @@ def test_archive_env_variable_can_switch_it_off(monkeypatch: pytest.MonkeyPatch)
 
 def test_archive_flag_reaches_the_warm_daemon() -> None:
     assert "--archive-after-answer" in shim._session_argv(archive=True)
-    assert "--archive-after-answer" not in shim._session_argv(archive=False)
+    assert "--no-archive-after-answer" in shim._session_argv(archive=False)
     assert "--archive-after-answer" not in shim._session_argv()
 
 

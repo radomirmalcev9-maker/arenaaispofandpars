@@ -2054,8 +2054,11 @@ def fast_prompt_main(argv: Sequence[str]) -> int | None:
                 "state": state,
                 "model": wire_model,
             }
-            if parsed.archive_after_answer is not None:
-                ask_kwargs["archive"] = parsed.archive_after_answer
+            # Send the caller's policy for every turn: a reused daemon may
+            # have been started with a different archive default.
+            ask_kwargs["archive"] = (
+                True if parsed.archive_after_answer is None else parsed.archive_after_answer
+            )
             stream = ask_stream(parsed.prompt, **ask_kwargs)
             try:
                 first = next(stream)

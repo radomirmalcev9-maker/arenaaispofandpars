@@ -117,8 +117,10 @@ def _session_argv(
         argv.extend(["--profile", profile.strip()])
     if isinstance(profile_root, str) and profile_root.strip():
         argv.extend(["--profile-root", profile_root.strip()])
-    if archive:
+    if archive is True:
         argv.append("--archive-after-answer")
+    elif archive is False:
+        argv.append("--no-archive-after-answer")
     if fast_model is True:
         argv.append("--fast-model")
     elif fast_model is False:
@@ -1975,7 +1977,7 @@ def _serve_parser() -> Any:
         "--archive",
         dest="archive",
         action="store_true",
-        default=_env("ARENA_CLAUDE_ARCHIVE", "1") not in {"0", "false", "no", "off"},
+        default=_env("ARENA_CLAUDE_ARCHIVE", "1").strip().lower() not in {"0", "false", "no", "off"},
         help=(
             "archive each conversation once its answer is fully received "
             "(default, keeps Arena's sidebar clean; --no-archive keeps the chats)"

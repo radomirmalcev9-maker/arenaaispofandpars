@@ -5788,24 +5788,13 @@ def test_archive_conversation_needs_a_page() -> None:
     assert asyncio.run(auto_module.archive_conversation(object())) is False
 
 
-def test_archive_option_is_off_by_default_and_parsed_from_the_cli() -> None:
-    assert auto_module.AutoOptions().archive_after_answer is False
+def test_archive_option_defaults_on_and_cli_can_disable_it() -> None:
+    assert auto_module.AutoOptions().archive_after_answer is True
+    assert auto_module.AutoOptions(archive_after_answer=False).archive_after_answer is False
     parser = auto_module.build_arg_parser()
-    options = auto_module._options_from_args(
-        parser.parse_args(["--archive-after-answer"])
-    )
-    assert options.archive_after_answer is True
-
-
-def test_follow_ups_are_never_archived() -> None:
-    """A follow-up turn needs the conversation open, so it must be excluded.
-
-    The guard sits inline in the browser attempt; this test pins the option it
-    reads so a rename cannot silently enable archiving for chat sessions.
-    """
-    options = auto_module.AutoOptions(archive_after_answer=True)
-    assert options.archive_after_answer is True
-    assert auto_module.AutoOptions().archive_after_answer is False
+    for args, expected in [([], True), (["--archive-after-answer"], True),
+                           (["--no-archive-after-answer"], False)]:
+        assert auto_module._options_from_args(parser.parse_args(args)).archive_after_answer is expected
 
 
 # --------------------------------------------------------------------------- #
@@ -6085,13 +6074,12 @@ def test_the_debt_list_is_capped() -> None:
     assert state.pending_archive_ids[-1] == "chat-39"
 
 
-def test_the_launcher_always_archives() -> None:
-    """arena-claude.bat must not leave an opt-out: chats are always filed."""
+def test_launcher_respects_archive_environment() -> None:
     text = pathlib.Path(__file__).resolve().parents[1].joinpath("arena-claude.bat")
     body = text.read_text(encoding="ascii")
-    assert "--archive" in body
-    assert "--no-archive" not in body
-    assert 'set "ARENA_CLAUDE_ARCHIVE=1"' in body
+    assert 'if "%ARENA_CLAUDE_ARCHIVE%"=="" set "ARENA_CLAUDE_ARCHIVE=1"' in body
+    assert 'set "EXTRA=%EXTRA% --archive"' not in body
+    assert 'ARENA_CLAUDE_ARCHIVE=0' in body
 
 
 def test_older_debts_are_paid_on_a_turn_that_skips_archiving(monkeypatch) -> None:
@@ -6135,3 +6123,47 @@ def test_nothing_to_do_means_no_background_task() -> None:
         assert state.prefetch_task is None
 
     asyncio.run(run())
+
+
+def test_explicit_model_is_selected_before_submit_without_body_override(monkeypatch) -> None:
+    from arena_api import _direct_page
+
+    page, events = _composer_page(enter_submits=False)
+    calls = []
+    original_evaluate = page.evaluate
+
+    async def select(actual_page, model_id):
+        assert actual_page is page
+        assert not events['submitted']
+        calls.append(model_id)
+
+    async def evaluate(script):
+        calls.append(script)
+        return await original_evaluate(script)
+
+    monkeypatch.setattr(_direct_page, '_select_model_in_picker', select)
+    monkeypatch.setattr(page, 'evaluate', evaluate)
+    assert asyncio.run(_direct_page._submit_prompt_via_composer(
+        page, 'hello', model_id_override='model-123',
+        has_submitted=lambda: events['submitted'] == 1,
+    ))
+    assert 'model-123' in calls
+    assert not any('"modelAId": "model-123"' in call for call in calls)
+
+
+def test_composer_passes_category_to_model_picker(monkeypatch) -> None:
+    from arena_api import _direct_page
+
+    page, events = _composer_page(enter_submits=False)
+    selected = []
+
+    async def select(actual_page, model_id, *, category=None):
+        assert not events['submitted']
+        selected.append((model_id, category))
+
+    monkeypatch.setattr(_direct_page, '_select_model_in_picker', select)
+    assert asyncio.run(_direct_page._submit_prompt_via_composer(
+        page, 'hello', model_id_override='model-123', model_picker_category='code',
+        has_submitted=lambda: events['submitted'] == 1,
+    ))
+    assert selected == [('model-123', 'code')]

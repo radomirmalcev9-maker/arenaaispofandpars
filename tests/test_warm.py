@@ -728,3 +728,20 @@ def test_old_daemon_does_not_silently_drop_screenshot(server: ServerThread) -> N
     with pytest.raises(warm.WarmDaemonUnavailable, match="does not support attachments"):
         list(warm.ask_stream("look", state=server.published, attachments=[image]))
     assert server.session.prompts == []
+
+
+@pytest.mark.parametrize('args,expected', [
+    ([], True),
+    (['--archive-after-answer'], True),
+    (['--no-archive-after-answer'], False),
+])
+def test_cli_sends_archive_policy_even_to_reused_daemon(monkeypatch, args, expected):
+    state = warm.DaemonState(pid=1, port=2, token='t')
+    seen = []
+    monkeypatch.setattr(warm, 'ensure_daemon', lambda **_: state)
+    def ask(*_args, **kwargs):
+        seen.append(kwargs['archive'])
+        return iter(['ok'])
+    monkeypatch.setattr(warm, 'ask_stream', ask)
+    assert warm.fast_prompt_main(['--prompt', 'hi', *args]) == 0
+    assert seen == [expected]
