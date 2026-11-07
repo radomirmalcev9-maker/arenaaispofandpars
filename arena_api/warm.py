@@ -54,9 +54,11 @@ from .attachments import Attachment, from_base64
 from .constants import DEFAULT_BASE_URL
 from .exceptions import AuthenticationError
 
-#: Bumped whenever the wire protocol changes; a daemon of another version is
-#: replaced instead of being talked to.
-PROTOCOL_VERSION = 3
+#: Bumped whenever the wire protocol or the daemon's request behaviour changes.
+#: An older daemon is replaced instead of being reused: otherwise it would keep
+#: answering OpenCode image turns with the pre-signed-upload/picker code (or
+#: with no attachments at all) even after the package was updated.
+PROTOCOL_VERSION = 4
 
 # A single authenticated JSON line may contain a compressed screenshot.
 # Keep the frame bounded, including base64 and a normal text prompt.

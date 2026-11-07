@@ -16,6 +16,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/019b24bb-5caf-71c3-b854-37d0c7086f21": {
@@ -24,6 +34,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a141d8-c8f9-710a-bdf4-983605ae330c": {
@@ -32,6 +52,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a0681c-b561-76b6-b338-a44ff0cff460": {
@@ -40,6 +70,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a0dc86-c4b7-7c3e-812f-891aba9574d1": {
@@ -48,6 +88,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a03a3b-64e3-790c-bdba-bd0e1c04b0f5": {
@@ -56,6 +106,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a0c5d1-9000-71c6-9c2c-b1b958c71006": {
@@ -64,6 +124,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a0ca93-91d0-7bb4-843e-02dc64ca64f6": {
@@ -72,6 +142,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a01326-36b7-7b0d-8af1-ccba21cf001f": {
@@ -80,6 +160,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a117ba-842b-76c6-bffb-9ca7bc4a6e45": {
@@ -88,6 +178,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/019f722d-f655-7a00-8eb3-24d9be72a104": {
@@ -96,6 +196,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a17964-d631-70ad-99d5-54f60ed1b6cd": {
@@ -104,6 +214,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a14c4a-9269-761f-843d-f047a26d1d6c": {
@@ -112,6 +232,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/019f7cb6-9dc5-70ef-aadb-e1287c3384e3": {
@@ -120,6 +250,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a0e982-1984-7919-9dec-0fef46824d29": {
@@ -128,6 +268,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a063c1-adb1-73e2-9c02-10b6e7cfb1eb": {
@@ -136,6 +286,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/01a14ae7-0d76-74af-80ac-33cf2b2322aa": {
@@ -144,6 +304,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         },
         "text/019ff69d-0234-7d00-a218-8fefcc9b7a9d": {
@@ -152,6 +322,16 @@
           "limit": {
             "context": 32768,
             "output": 4096
+          },
+          "attachment": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           }
         }
       }
